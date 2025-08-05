@@ -4,7 +4,7 @@
     "version": "1.0",
     "experts": [
       {
-        "id": "oncologist_001",
+        "id": "oncologist",
         "specialty": "medical_oncology",
         "name": "Dr. Sarah Chen",
         "experience_years": 15,
@@ -27,7 +27,7 @@
         "reasoning_style": "evidence-based, protocol-driven, considers long-term cancer outcomes"
       },
       {
-        "id": "nephrologist_001",
+        "id": "nephrologist",
         "specialty": "nephrology",
         "name": "Dr. Robert Martinez",
         "experience_years": 18,
@@ -51,7 +51,7 @@
         "reasoning_style": "systematic exclusion of causes, biopsy-correlation focused"
       },
       {
-        "id": "pathologist_001",
+        "id": "pathologist",
         "specialty": "renal_pathology",
         "name": "Dr. Maria Rodriguez",
         "experience_years": 20,
@@ -75,7 +75,7 @@
         "reasoning_style": "morphology-based, pattern recognition, tissue-clinical correlation"
       },
       {
-        "id": "pharmacist_001",
+        "id": "pharmacist",
         "specialty": "clinical_pharmacy",
         "name": "Dr. James Wilson",
         "experience_years": 12,
@@ -99,31 +99,7 @@
         "reasoning_style": "pharmacologic mechanism-focused, drug timeline analysis"
       },
       {
-        "id": "informatician_001",
-        "specialty": "clinical_informatics",
-        "name": "Dr. Lisa Zhang",
-        "experience_years": 10,
-        "credentials": "MD, MS (Clinical Informatics)",
-        "institution": "Digital Health Institute",
-        "expertise": [
-          "clinical decision support systems",
-          "predictive analytics in healthcare",
-          "electronic health record optimization",
-          "clinical data mining",
-          "AI in medicine"
-        ],
-        "focus_areas": [
-          "pattern recognition in clinical data",
-          "temporal sequence analysis",
-          "biomarker integration",
-          "risk stratification algorithms",
-          "evidence synthesis from multiple sources"
-        ],
-        "clinical_experience": "Healthcare informatics, clinical prediction models, EHR data analysis",
-        "reasoning_style": "data-driven, pattern-based, probabilistic reasoning"
-      },
-      {
-        "id": "nurse_practitioner_001",
+        "id": "nurse_practitioner",
         "specialty": "oncology_nursing",
         "name": "Jennifer Taylor, NP",
         "experience_years": 16,
@@ -147,7 +123,7 @@
         "reasoning_style": "patient-centered, symptom-focused, practical clinical approach"
       },
       {
-        "id": "intensivist_001",
+        "id": "intensivist",
         "specialty": "critical_care",
         "name": "Dr. Michael Brown",
         "experience_years": 14,
@@ -171,7 +147,7 @@
         "reasoning_style": "acuity-focused, systematic organ assessment, supportive care oriented"
       },
       {
-        "id": "rheumatologist_001",
+        "id": "rheumatologist",
         "specialty": "rheumatology",
         "name": "Dr. Patricia Wong",
         "experience_years": 13,
@@ -195,31 +171,7 @@
         "reasoning_style": "immunologic mechanism-focused, systemic disease correlation"
       },
       {
-        "id": "hospitalist_001",
-        "specialty": "hospital_medicine",
-        "name": "Dr. David Garcia",
-        "experience_years": 11,
-        "credentials": "MD, FHM",
-        "institution": "Academic Medical Center",
-        "expertise": [
-          "inpatient medicine",
-          "medication reconciliation",
-          "clinical deterioration recognition",
-          "multidisciplinary care coordination",
-          "diagnostic reasoning"
-        ],
-        "focus_areas": [
-          "comprehensive medication review",
-          "clinical timeline reconstruction",
-          "integration of multiple specialist inputs",
-          "practical inpatient management",
-          "discharge planning considerations"
-        ],
-        "clinical_experience": "General internal medicine, complex inpatient cases, care coordination",
-        "reasoning_style": "broad differential, integrative approach, practical management focus"
-      },
-      {
-        "id": "emergency_physician_001",
+        "id": "emergency_physician",
         "specialty": "emergency_medicine",
         "name": "Dr. Steven Martinez",
         "experience_years": 9,
@@ -241,34 +193,79 @@
         ],
         "clinical_experience": "Emergency assessment of acute kidney injury, undifferentiated illness",
         "reasoning_style": "rapid assessment, broad differential, risk-stratification focused"
+      },
+      {
+        "id": "radiologist",
+        "specialty": "radiology",
+        "name": "Dr. Catherine Kim",
+        "experience_years": 14,
+        "credentials": "MD, ABR",
+        "institution": "Academic Medical Center",
+        "expertise": [
+          "genitourinary radiology",
+          "oncologic imaging",
+          "contrast-enhanced imaging",
+          "emergency radiology",
+          "interventional procedures"
+        ],
+        "focus_areas": [
+          "obstructive uropathy assessment",
+          "renal vein thrombosis detection",
+          "kidney size and asymmetry evaluation",
+          "hydronephrosis identification",
+          "peri-renal inflammation assessment"
+        ],
+        "clinical_experience": "Genitourinary imaging, oncology imaging, emergency radiology",
+        "reasoning_style": "image-pattern recognition, anatomical correlation, temporal analysis"
+      },
+      {
+        "id": "infectious_disease",
+        "specialty": "infectious_disease",
+        "name": "Dr. Ahmad Hassan",
+        "experience_years": 13,
+        "credentials": "MD, FIDSA",
+        "institution": "Academic Medical Center",
+        "expertise": [
+          "sepsis and septic shock",
+          "opportunistic infections",
+          "antibiotic stewardship",
+          "immunocompromised host infections",
+          "healthcare-associated infections"
+        ],
+        "focus_areas": [
+          "sepsis-associated AKI differentiation",
+          "blood culture and urinalysis interpretation",
+          "infection-driven vs immune-mediated AKI",
+          "antimicrobial therapy optimization",
+          "immunosuppression infection risk"
+        ],
+        "clinical_experience": "Sepsis management, immunocompromised patients, antimicrobial optimization",
+        "reasoning_style": "infection-focused, culture-correlation based, antimicrobial stewardship"
+      },
+      {
+        "id": "geriatrician",
+        "specialty": "geriatric_medicine",
+        "name": "Dr. Margaret Chen",
+        "experience_years": 16,
+        "credentials": "MD, CMD",
+        "institution": "Academic Medical Center",
+        "expertise": [
+          "geriatric oncology",
+          "polypharmacy management",
+          "frailty assessment",
+          "age-related physiologic changes",
+          "geriatric syndromes"
+        ],
+        "focus_areas": [
+          "age-related renal reserve assessment",
+          "competing nephrotoxic risk evaluation",
+          "polypharmacy-induced AKI",
+          "patient-centered goal setting",
+          "frailty indicators in treatment decisions"
+        ],
+        "clinical_experience": "Geriatric oncology, complex medication management, frailty assessment",
+        "reasoning_style": "age-adjusted risk assessment, patient-centered care, functional status focus"
       }
     ]
-  },
-  "panel_composition": {
-    "primary_experts": [
-      "oncologist_001",
-      "nephrologist_001",
-      "pathologist_001"
-    ],
-    "supporting_experts": [
-      "pharmacist_001",
-      "informatician_001",
-      "nurse_practitioner_001",
-      "intensivist_001"
-    ],
-    "consulting_experts": [
-      "rheumatologist_001",
-      "hospitalist_001",
-      "emergency_physician_001"
-    ]
-  },
-  "expertise_mapping": {
-    "temporal_analysis": ["oncologist_001", "pharmacist_001", "informatician_001"],
-    "differential_diagnosis": ["nephrologist_001", "intensivist_001", "hospitalist_001"],
-    "pathologic_correlation": ["pathologist_001", "nephrologist_001"],
-    "drug_interactions": ["pharmacist_001", "oncologist_001"],
-    "clinical_patterns": ["nurse_practitioner_001", "emergency_physician_001"],
-    "immune_mechanisms": ["rheumatologist_001", "pathologist_001", "oncologist_001"],
-    "data_integration": ["informatician_001", "hospitalist_001"]
   }
 }
