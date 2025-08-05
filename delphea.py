@@ -79,29 +79,22 @@ irAKI Classification Focus
 
 """
 
+import argparse
 import asyncio
 import json
 import logging
-import re
 import time
-import argparse
-from typing import Dict, List, Optional, Any, Set, Callable
+from collections import defaultdict, deque
 from dataclasses import dataclass
-from collections import deque, defaultdict
-from pydantic import BaseModel, Field, ConfigDict
+from typing import Any, Dict, List, Optional, Set
+
 import httpx
 import numpy as np
-
-from autogen_core import (
-    SingleThreadedAgentRuntime,
-    MessageContext,
-    TopicId,
-    AgentId,
-    RoutedAgent,
-    message_handler,
-    type_subscription,
-    rpc
-)
+from autogen_core import (AgentId, MessageContext, RoutedAgent,
+                          SingleThreadedAgentRuntime, TopicId, message_handler,
+                          rpc, type_subscription)
+from pydantic import BaseModel, ConfigDict, Field
+from scipy.stats import beta
 
 # Configure logging
 logging.basicConfig(
@@ -179,19 +172,21 @@ class QuestionnaireMsg(BaseModel):
     round_phase: str = "round1"
 
 class ExpertRound1Reply(BaseModel):
-    """Round 1: individual expert irAKI assessment"""
+    """Round1: individual expert irAKI assessment (now with 95% CI)"""
     model_config = ConfigDict(strict=True)
 
     case_id: str
     expert_id: str
-    scores: Dict[str, int]  # question_id → 1-9 (9-point Likert)
-    evidence: Dict[str, str]  # question_id → clinical reasoning
-    p_iraki: float = Field(ge=0.0, le=1.0)  # probability of irAKI
-    confidence: float = Field(ge=0.0, le=1.0)
-    differential_diagnosis: List[str]  # alternative AKI etiologies considered
+    scores: Dict[str, int]              # question_id → 1‑9 Likert
+    evidence: Dict[str, str]            # question_id → free‑text reasoning
+    p_iraki: float = Field(ge=0.0, le=1.0)
+    ci_iraki: List[float]               # [lower, upper] bounds; enforced in prompt
+    confidence: float = Field(ge=0.0, le=1.0)  # calibration self‑rating
+    differential_diagnosis: List[str]
+
 
 class ExpertRound3Reply(BaseModel):
-    """Round 3: final expert irAKI assessment"""
+    """Round3: final expert assessment (95% CI retained)"""
     model_config = ConfigDict(strict=True)
 
     case_id: str
@@ -199,11 +194,12 @@ class ExpertRound3Reply(BaseModel):
     scores: Dict[str, int]
     evidence: Dict[str, str]
     p_iraki: float = Field(ge=0.0, le=1.0)
+    ci_iraki: List[float]
     confidence: float = Field(ge=0.0, le=1.0)
     changes_from_round1: Dict[str, str]
-    verdict: bool  # final binary decision: irAKI vs other AKI
-    final_diagnosis: str  # most likely specific etiology
-    recommendations: List[str]  # clinical recommendations
+    verdict: bool
+    final_diagnosis: str
+    recommendations: List[str]
 
 class DebatePrompt(BaseModel):
     """Round 2: initiate debate for specific question"""
@@ -259,6 +255,61 @@ class ExpertKey:
 
     def __str__(self) -> str:
         return f"{self.expert_id}({self.specialty})@{self.case_id}"
+
+
+def beta_pool_confidence(p_vec: np.ndarray,
+                         ci_mat: np.ndarray,
+                         weight_vec: np.ndarray | None = None) -> dict:
+    """Return pooled mean, 95 % CI, and a consensus‑confidence ∈ [0,1].
+
+    * p_vec       – shape (k,)          float64
+    * ci_mat      – shape (k,2)         [[lo, hi], …]
+    * weight_vec  – shape (k,) optional confidence weights
+    """
+
+    lo = ci_mat[:, 0]
+    hi = ci_mat[:, 1]
+
+    # --------------------------------------------
+    # 2‑a  Between‑expert variance (max 0.25)
+    # --------------------------------------------
+    var_between = np.var(p_vec, ddof=1) if p_vec.size > 1 else 0.0
+    between_score = 1.0 - (var_between / 0.25)
+    between_score = np.clip(between_score, 0.0, 1.0)
+
+    # --------------------------------------------
+    # 2‑b  Within‑expert CI width (max half‑width 0.5)
+    # --------------------------------------------
+    half_widths = (hi - lo) / 2.0
+    mean_half = half_widths.mean()
+    within_score = 1.0 - (mean_half / 0.5)
+    within_score = np.clip(within_score, 0.0, 1.0)
+
+    # --------------------------------------------
+    # 2‑c  Harmonic‑mean panel confidence
+    # --------------------------------------------
+    if between_score == 0 or within_score == 0:
+        consensus_conf = 0.0
+    else:
+        consensus_conf = 2.0 / (1.0 / between_score + 1.0 / within_score)
+
+    # --------------------------------------------
+    # 2‑d  Beta opinion pool
+    # --------------------------------------------
+    w = weight_vec if weight_vec is not None else np.ones_like(p_vec)
+    a_post = 1.0 + np.sum(w * p_vec)
+    b_post = 1.0 + np.sum(w * (1.0 - p_vec))
+
+    post_mean = a_post / (a_post + b_post)
+    post_ci_95 = beta.ppf([0.025, 0.975], a_post, b_post).tolist()
+
+    return {
+        "pooled_mean": post_mean,
+        "pooled_ci": post_ci_95,
+        "var_between": var_between,
+        "mean_halfwidth": mean_half,
+        "consensus_conf": consensus_conf,
+    }
 
 # =============================================================================
 # vLLM CLIENT (unchanged from original)
@@ -428,58 +479,52 @@ class irAKIExpertAgent(RoutedAgent):
         self.logger = logging.getLogger(f"expert.{expert_key.expert_id}")
 
         # load irAKI-focused clinical persona
-        self._persona = self._load_iraki_expert_persona(expert_key.specialty)
+        self._persona = self._load_expert_profile(expert_key.specialty)
 
-    def _load_iraki_expert_persona(self, specialty: str) -> Dict:
-        """Load expert persona with irAKI-specific expertise"""
-        personas = {
-            "oncology": {
-                "name": "Dr. Sarah Chen",
-                "experience": "15 years medical oncology",
-                "focus": "immune checkpoint inhibitor toxicities, irAE management, cancer immunotherapy"
-            },
-            "nephrology": {
-                "name": "Dr. Robert Martinez",
-                "experience": "18 years nephrology",
-                "focus": "immune-mediated kidney disease, drug-induced AKI, glomerulonephritis"
-            },
-            "rheumatology": {
-                "name": "Dr. Maria Rodriguez",
-                "experience": "12 years rheumatology",
-                "focus": "autoimmune kidney disease, lupus nephritis, immune complex diseases"
-            },
-            "immunology": {
-                "name": "Dr. James Wilson",
-                "experience": "14 years clinical immunology",
-                "focus": "immune-mediated organ dysfunction, autoantibody-mediated disease"
-            },
-            "critical_care": {
-                "name": "Dr. Lisa Zhang",
-                "experience": "16 years critical care",
-                "focus": "ICU-based AKI, immune-related complications in critically ill"
-            },
-            "clinical_pharmacology": {
-                "name": "Dr. Michael Brown",
-                "experience": "12 years clinical pharmacology",
-                "focus": "drug-induced kidney injury, immunosuppressive drug interactions"
-            },
-            "pathology": {
-                "name": "Dr. Jennifer Taylor",
-                "experience": "20 years renal pathology",
-                "focus": "immune-mediated kidney pathology, drug-induced nephritis"
-            },
-            "informatics": {
-                "name": "Dr. David Wong",
-                "experience": "10 years clinical informatics",
-                "focus": "clinical decision support for immune-related adverse events"
+    def _load_expert_profile(self, specialty: str) -> Dict:
+        """Load expert persona from configuration file"""
+        # Load expert panel configuration
+        config_path = Path("config/panel.json")
+        if not config_path.exists():
+            self.logger.warning(f"Expert panel config not found at {config_path}, using defaults")
+            return {
+                "name": f"Dr. {self._expert_id.title()}",
+                "experience": f"10+ years {specialty}",
+                "focus": f"clinical expertise in {specialty} and immune-related complications"
             }
-        }
 
-        return personas.get(specialty, {
-            "name": f"Dr. {self._expert_id.title()}",
-            "experience": f"10+ years {specialty}",
-            "focus": f"clinical expertise in {specialty} and immune-related complications"
-        })
+        try:
+            with open(config_path, 'r') as f:
+                panel_config = json.load(f)
+
+            # Find expert by specialty
+            experts = panel_config.get("expert_panel", {}).get("experts", [])
+            for expert in experts:
+                if expert.get("specialty") == specialty:
+                    return {
+                        "name": expert.get("name", f"Dr. {self._expert_id.title()}"),
+                        "experience": f"{expert.get('experience_years', 10)} years {specialty}",
+                        "focus": ", ".join(expert.get("expertise", [])),
+                        "credentials": expert.get("credentials", ""),
+                        "institution": expert.get("institution", ""),
+                        "clinical_experience": expert.get("clinical_experience", ""),
+                        "reasoning_style": expert.get("reasoning_style", "")
+                    }
+
+            # Default if specialty not found
+            return {
+                "name": f"Dr. {self._expert_id.title()}",
+                "experience": f"10+ years {specialty}",
+                "focus": f"clinical expertise in {specialty} and immune-related complications"
+            }
+
+        except Exception as e:
+            self.logger.error(f"Error loading expert config: {e}")
+            return {
+                "name": f"Dr. {self._expert_id.title()}",
+                "experience": f"10+ years {specialty}",
+                "focus": f"clinical expertise in {specialty} and immune-related complications"
+            }
 
     @message_handler
     async def handle_questionnaire(self, message: QuestionnaireMsg, ctx: MessageContext) -> None:
@@ -673,7 +718,7 @@ class irAKIModeratorAgent(RoutedAgent):
         """Execute Round 1: individual irAKI assessments"""
         self.logger.info("=== ROUND 1: Individual irAKI Assessments ===")
 
-        questions = self._generate_iraki_questions()
+        questions = self._load_assessment_questions()
 
         # initialize pending tracking
         self._pending_round1 = {
@@ -699,7 +744,7 @@ class irAKIModeratorAgent(RoutedAgent):
 
         await self._wait_for_round_completion("round1")
 
-    def _generate_iraki_questions(self) -> List[str]:
+    def _load_assessment_questions(self) -> List[str]:
         """Generate 12 irAKI-specific assessment questions"""
         return [
             "Temporal relationship supports irAKI (1=no temporal relationship, 9=clear temporal association)",
@@ -963,7 +1008,7 @@ class irAKIModeratorAgent(RoutedAgent):
         self.logger.info("=== ROUND 3: Final irAKI Consensus ===")
 
         patient_data = self._data_loader.load_patient_case(self._case_id)
-        questions = self._generate_iraki_questions()
+        questions = self._load_assessment_questions()
 
         self._pending_round3 = {
             self._generate_expert_key(i, self._case_id)
@@ -1006,28 +1051,28 @@ class irAKIModeratorAgent(RoutedAgent):
         for r in self._round3_replies:
             all_recommendations.extend(r.recommendations)
 
-        # compute confidence metrics
-        confidence_scores = [r.confidence for r in self._round3_replies]
-        mean_confidence = sum(confidence_scores) / len(confidence_scores)
-        confidence_agreement = len([c for c in confidence_scores if c >= config.confidence_threshold]) / len(confidence_scores)
+        # compute confidence metrics using mathematically grounded aggregation
+        p_vec  = np.array([r.p_iraki for r in self._round3_replies])
+        ci_mat = np.array([r.ci_iraki    for r in self._round3_replies])
+        w_vec  = np.array([r.confidence  for r in self._round3_replies])  # optional
 
-        # log final results for human review
+        stats = beta_pool_confidence(p_vec, ci_mat, w_vec)
+
+        consensus_verdict = sum(r.verdict for r in self._round3_replies) > len(self._round3_replies) / 2
+
+        # logging
         self.logger.info("=" * 70)
         self.logger.info(f"CASE {self._case_id} irAKI CONSENSUS RESULTS:")
-        self.logger.info(f"Mean irAKI Probability: {mean_probability:.3f}")
-        self.logger.info(f"Consensus Verdict: {'irAKI' if consensus_verdict else 'Other AKI'}")
-        self.logger.info(f"Expert Verdicts: {[r.verdict for r in self._round3_replies]}")
-        self.logger.info(f"Expert Confidences: {[f'{c:.2f}' for c in confidence_scores]}")
-        self.logger.info(f"Mean Confidence: {mean_confidence:.3f}")
-        self.logger.info(f"High Confidence Rate: {confidence_agreement:.1%}")
-        self.logger.info(f"Proposed Diagnoses: {set(all_diagnoses)}")
-        self.logger.info(f"All Recommendations: {len(set(all_recommendations))} unique recommendations")
-        self.logger.info(f"Equal Weighting Applied (No ARN Learning)")
+        self.logger.info(f"Pooled P(irAKI):     {stats['pooled_mean']:.3f}")
+        self.logger.info(f"95 % Credible Int.:  {stats['pooled_ci'][0]:.3f} – {stats['pooled_ci'][1]:.3f}")
+        self.logger.info(f"Consensus Conf.:     {stats['consensus_conf']:.2f}")
+        self.logger.info(f"Between‑expert σ²:   {stats['var_between']:.4f}")
+        self.logger.info(f"Mean CI half‑width:  {stats['mean_halfwidth']:.3f}")
+        self.logger.info(f"Majority Verdict:    {'irAKI' if consensus_verdict else 'Other AKI'}")
         self.logger.info("=" * 70)
 
-        # export for human review
-        if config.export_full_transcripts:
-            await self._export_for_human_review(mean_probability, consensus_verdict, mean_confidence)
+        # export (pass stats dict)
+        await self._export_for_human_review(stats, consensus_verdict)
 
     async def _export_for_human_review(self, final_prob: float, final_verdict: bool, confidence: float) -> None:
         """Export complete case for human expert chart review"""
