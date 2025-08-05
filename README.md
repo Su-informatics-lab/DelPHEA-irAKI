@@ -66,6 +66,43 @@ updated Delphi panel.
 This structured matrix ensures every plausible mechanism—immune or otherwise—is weighed, maximising diagnostic accuracy 
 and safeguarding both oncologic and renal outcomes.
 
+## Expert Panel Specialties
+
+1. Oncologist
+2. Nephrologist
+3. Pathologist
+4. Pharmacist
+5. Intensivist
+6. Rheumatologist
+7. Emergency Physician
+8. Radiologist
+9. Infectious Disease Specialist
+10. Geriatrician
+11. Nurse Practitioner
+
+
+## Clinical Assessment Questions
+
+The irAKI classification system uses 16 evidence-based questions (enhanced with peer review):
+
+1. **Temporal Relationship**: ICI exposure timing vs. AKI onset (combination vs monotherapy patterns)
+2. **Prerenal Exclusion**: Volume status, hypotension, medication effects  
+3. **Postrenal Exclusion**: Obstruction, structural abnormalities
+4. **Other Intrinsic Exclusion**: ATN, contrast nephropathy, other drugs
+5. **Urinalysis Pattern**: Proteinuria, hematuria, cellular casts (excluding ATN patterns)
+6. **Immune Activation**: Systemic inflammatory markers
+7. **Concomitant Medications**: PPI, NSAID, antibiotic assessment
+8. **Other irAE Correlation**: Multi-organ immune manifestations
+9. **Biopsy Indication**: Expected immune-mediated pathology
+10. **Treatment Response**: Clinical course and steroid response
+11. **Alternative Diagnosis Exclusion**: Systematic differential assessment  
+12. **Clinical Gestalt**: Overall irAKI likelihood
+13. **Infection Exclusion**: Sepsis, pyelonephritis, occult infections in immunocompromised
+14. **Imaging Evidence**: Radiologic patterns supporting immune vs structural causes
+15. **Baseline Risk Factors**: CKD, age-related changes, frailty considerations
+16. **Rechallenge Assessment**: Risk-benefit analysis for restarting ICI therapy
+
+
 ## System Architecture
 
 ### Modular Components
@@ -128,41 +165,6 @@ python delphea.py \
   --questionnaire-config my_questions.json \
   --case-id my_case_001
 ```
-
-## Clinical Assessment Questions
-
-The irAKI classification system uses 12 evidence-based questions:
-
-1. **Temporal Relationship**: ICI exposure timing vs. AKI onset
-2. **Prerenal Exclusion**: Volume status, hypotension, medication effects  
-3. **Postrenal Exclusion**: Obstruction, structural abnormalities
-4. **Other Intrinsic Exclusion**: ATN, contrast nephropathy, other drugs
-5. **Urinalysis Pattern**: Proteinuria, hematuria, cellular casts
-6. **Immune Activation**: Systemic inflammatory markers
-7. **Concomitant Medications**: PPI, NSAID, antibiotic assessment
-8. **Other irAE Correlation**: Multi-organ immune manifestations
-9. **Biopsy Indication**: Expected immune-mediated pathology
-10. **Treatment Response**: Clinical course and steroid response
-11. **Alternative Diagnosis Exclusion**: Systematic differential assessment  
-12. **Clinical Gestalt**: Overall irAKI likelihood
-
-## Expert Panel Specialties
-
-### Primary Experts
-- **Medical Oncology**: ICI treatment expertise, irAE management
-- **Nephrology**: AKI differential diagnosis, kidney function assessment
-- **Renal Pathology**: Histologic pattern recognition, biopsy interpretation
-
-### Supporting Experts  
-- **Clinical Pharmacy**: Drug interaction analysis, medication safety
-- **Clinical Informatics**: Data pattern recognition, evidence synthesis
-- **Oncology Nursing**: Patient monitoring, symptom assessment
-- **Critical Care**: ICU-based AKI management, acute care
-
-### Consulting Experts
-- **Rheumatology**: Autoimmune mechanisms, immune complex disease
-- **Hospital Medicine**: Comprehensive assessment, care coordination
-- **Emergency Medicine**: Acute presentation patterns, rapid assessment
 
 ## Literature Search Integration
 
