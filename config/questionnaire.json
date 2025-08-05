@@ -1,9 +1,9 @@
 {
   "questionnaire": {
-    "title": "irAKI vs Other AKI Classification Assessment",
+    "title": "irAKI vs Other AKI Classification Assessment (Enhanced)",
     "description": "Comprehensive clinical assessment to distinguish immune-related acute kidney injury from other AKI etiologies",
-    "version": "1.0",
-    "reference": "Based on Sprangers et al. Nature Reviews Nephrology 2022 and clinical guidelines",
+    "version": "1.1",
+    "reference": "Based on Sprangers et al. Nature Reviews Nephrology 2022 and clinical guidelines with peer-review enhancements",
     "scale": {
       "type": "9-point Likert",
       "range": "1-9",
@@ -18,10 +18,11 @@
         "id": "Q1",
         "category": "temporal_relationship",
         "question": "The temporal relationship between immune checkpoint inhibitor (ICI) exposure and AKI onset strongly supports irAKI diagnosis",
-        "description": "Assess the timing of AKI development in relation to ICI therapy initiation/continuation",
+        "description": "Assess the timing of AKI development in relation to ICI therapy initiation/continuation. Note: combination ICI regimens typically have shorter median time-to-irAKI (4-8 weeks) vs monotherapy (≥12 weeks)",
         "clinical_context": {
           "supportive_evidence": [
-            "AKI onset 2-5 months after ICI initiation",
+            "AKI onset 2-5 months after ICI initiation (monotherapy)",
+            "AKI onset 4-8 weeks after combination ICI initiation",
             "Clear temporal sequence without other explanations",
             "AKI development during active ICI treatment",
             "No alternative temporal associations"
@@ -130,7 +131,8 @@
             "Pyuria without bacterial infection",
             "White blood cell casts",
             "Eosinophiluria (if present)",
-            "Granular casts"
+            "Granular casts",
+            "Absence of muddy-brown casts (excludes ATN)"
           ],
           "atypical_findings": [
             "Massive proteinuria (>3g/day)",
@@ -260,6 +262,7 @@
           "typical_course": [
             "Subacute onset over days to weeks",
             "Progressive worsening without intervention",
+            "Non-response to fluid resuscitation",
             "Response to corticosteroid therapy",
             "Improvement with ICI discontinuation",
             "Potential for recurrence with rechallenge"
@@ -280,8 +283,8 @@
       {
         "id": "Q11",
         "category": "alternative_diagnosis_exclusion",
-        "question": "Alternative specific diagnoses for AKI have been systematically excluded",
-        "description": "Comprehensive assessment excluding other specific causes of AKI in this clinical context",
+        "question": "Alternative systemic diagnoses for AKI have been systematically excluded",
+        "description": "Comprehensive assessment excluding systemic and cancer-related specific causes of AKI in this clinical context",
         "clinical_context": {
           "specific_alternatives": [
             "Cancer-related AKI (tumor lysis, obstruction)",
@@ -332,6 +335,112 @@
           "clinical_informatics": "Evidence synthesis and pattern recognition",
           "hospitalist": "Comprehensive case assessment"
         }
+      },
+      {
+        "id": "Q13",
+        "category": "infection_exclusion",
+        "question": "Infection-related AKI (septic ATN, pyelonephritis, other infectious causes) has been systematically excluded",
+        "description": "Systematic exclusion of infection-mediated AKI in immunosuppressed cancer patients",
+        "clinical_context": {
+          "exclusion_criteria": [
+            "Negative blood and urine cultures",
+            "Absence of fever or systemic inflammatory response",
+            "No evidence of pyelonephritis or other renal infections",
+            "Adequate MAP without septic physiology",
+            "No occult infections (imaging, biomarkers)"
+          ],
+          "high_risk_factors": [
+            "Immunosuppressed state from cancer/treatment",
+            "Recent invasive procedures or hospitalizations",
+            "Indwelling devices or catheters",
+            "Atypical presentations in immunocompromised patients"
+          ]
+        },
+        "specialty_focus": {
+          "infectious_disease": "Occult infection identification in immunocompromised",
+          "critical_care": "Sepsis-associated AKI vs other causes",
+          "emergency_medicine": "Rapid infection screening and risk assessment"
+        }
+      },
+      {
+        "id": "Q14",
+        "category": "imaging_evidence",
+        "question": "Radiologic findings support immune-mediated kidney injury or exclude alternative structural causes",
+        "description": "Assessment of imaging evidence for intrinsic parenchymal injury patterns consistent with or contradicting irAKI",
+        "clinical_context": {
+          "supportive_findings": [
+            "Increased renal cortical echogenicity",
+            "Peri-renal inflammatory changes",
+            "Bilateral symmetric kidney involvement",
+            "No evidence of cortical necrosis or infarcts",
+            "Normal collecting system"
+          ],
+          "contradictory_findings": [
+            "Renal vein thrombosis",
+            "Cortical necrosis patterns",
+            "Asymmetric involvement suggesting vascular cause",
+            "Evidence of renal infarction",
+            "Structural abnormalities explaining AKI"
+          ]
+        },
+        "specialty_focus": {
+          "radiology": "Imaging pattern recognition for immune vs other causes",
+          "nephrology": "Correlation of imaging with clinical presentation",
+          "emergency_medicine": "Rapid imaging interpretation for alternative causes"
+        }
+      },
+      {
+        "id": "Q15",
+        "category": "baseline_risk_factors",
+        "question": "Baseline renal reserve, age-related changes, and frailty have been appropriately considered in AKI assessment",
+        "description": "Assessment accounts for baseline CKD, geriatric factors, and individual patient vulnerability",
+        "clinical_context": {
+          "risk_modifiers": [
+            "Baseline eGFR and CKD stage",
+            "Age-related nephron loss and reserve",
+            "Frailty indices and functional status",
+            "Polypharmacy and drug interactions",
+            "Comorbidity burden affecting recovery"
+          ],
+          "assessment_considerations": [
+            "Lower threshold for significant AKI in CKD patients",
+            "Age-adjusted expectations for recovery",
+            "Medication adjustment for renal function",
+            "Frailty impact on treatment tolerance"
+          ]
+        },
+        "specialty_focus": {
+          "geriatric_medicine": "Age and frailty impact on AKI presentation and recovery",
+          "clinical_pharmacy": "Medication adjustments for baseline renal function",
+          "nephrology": "Baseline CKD impact on AKI severity and prognosis"
+        }
+      },
+      {
+        "id": "Q16",
+        "category": "rechallenge_assessment",
+        "question": "The risk-benefit profile supports rechallenge with ICI therapy after AKI recovery",
+        "description": "Assessment of whether restarting ICI is appropriate based on AKI severity, recovery, and cancer prognosis",
+        "clinical_context": {
+          "favorable_factors": [
+            "Complete or near-complete renal recovery",
+            "KDIGO stage 1-2 initial AKI severity",
+            "Clear alternative cause identified and addressed",
+            "Excellent cancer response to ICI therapy",
+            "No other viable treatment options available"
+          ],
+          "unfavorable_factors": [
+            "Incomplete renal recovery or CKD progression",
+            "KDIGO stage 3 AKI with prolonged course",
+            "Biopsy-proven severe tubulointerstitial nephritis",
+            "Multiple concurrent irAEs",
+            "Alternative effective cancer treatments available"
+          ]
+        },
+        "specialty_focus": {
+          "medical_oncology": "Cancer prognosis and alternative treatment options",
+          "nephrology": "Renal recovery assessment and rechallenge risk",
+          "renal_pathology": "Histologic severity predicting rechallenge risk"
+        }
       }
     ],
     "scoring_guidelines": {
@@ -341,7 +450,7 @@
         "7-9": "Evidence strongly supports irAKI / High probability diagnosis"
       },
       "confidence_thresholds": {
-        "high_confidence": "≥7 on ≥8 questions with no major contradictions",
+        "high_confidence": "≥7 on ≥12 questions with no major contradictions",
         "moderate_confidence": "≥6 on most questions with some uncertainty",
         "low_confidence": "Mixed scores or insufficient evidence"
       },
@@ -359,7 +468,8 @@
           "Initiate corticosteroid therapy",
           "Hold or discontinue ICI therapy",
           "Monitor for other irAEs",
-          "Nephrology consultation"
+          "Nephrology consultation",
+          "Assess rechallenge potential after recovery"
         ]
       },
       "moderate_probability_iraki": {
@@ -369,7 +479,8 @@
           "Exclude alternative causes more thoroughly",
           "Consider empiric steroid trial",
           "Multidisciplinary discussion",
-          "Close monitoring with serial assessments"
+          "Close monitoring with serial assessments",
+          "Systematic infection workup in immunocompromised"
         ]
       },
       "low_probability_iraki": {
@@ -379,15 +490,17 @@
           "Standard AKI management",
           "Continue ICI if oncologically appropriate",
           "Consider irAKI if clinical course changes",
-          "Document reasoning for alternative diagnosis"
+          "Document reasoning for alternative diagnosis",
+          "Address baseline CKD and frailty factors"
         ]
       }
     }
   },
   "validation": {
-    "content_validity": "Reviewed by multidisciplinary expert panel",
-    "clinical_correlation": "Based on published irAKI case series and guidelines",
-    "inter_rater_reliability": "Target >0.8 agreement among expert reviewers",
-    "sensitivity_analysis": "Question weighting validation against clinical outcomes"
+    "content_validity": "Reviewed by multidisciplinary expert panel with peer-review feedback integration",
+    "clinical_correlation": "Based on published irAKI case series, guidelines, and expert consensus (Sprangers et al. 2022)",
+    "inter_rater_reliability": "Target >0.8 agreement among expert reviewers across 16-question assessment",
+    "sensitivity_analysis": "Question weighting validation against clinical outcomes and rechallenge decisions",
+    "expert_coverage": "Comprehensive specialty representation including infection disease, radiology, and geriatrics"
   }
 }
