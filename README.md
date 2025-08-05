@@ -1,48 +1,70 @@
-# DelPHEA-irAKI
+# DelPHEA for immune-related AKI (irAKI)
 
-**Del**phi **P**ersonalized **H**ealth **E**xplainable **A**gents for **i**mmune-**r**elated **AKI** Classification: 
-A agent-simulated Delphi clinical decision support system for distinguishing immune-related AKI from other AKI etiologies 
-using clinical notes and structured data.
+**Del**phi **P**ersonalized **H**ealth **E**xplainable **A**gents for distinguishing immune-related AKI from AKI induced 
+by alternative reasons
+DelPHEA simulates a diverse virtual panel of medical experts conducting a modified Delphi consensus process using 
+clinical notes and structured data. 
 
-## Overview
 
-DelPHEA-irAKI implements a novel approach to immune-related AKI classification by simulating a virtual panel of medical 
-experts conducting a modified Delphi consensus process. The system combines multiple LLM agents, each representing 
-different medical specialties relevant to immune-mediated kidney injury, to collaboratively assess whether AKI cases 
-are immune-related through iterative discussion and evidence-based reasoning.
+## Differential Diagnosis of AKI in Immune‑Checkpoint Inhibitor (ICI)–Treated Patients
 
-## Key Features
+A meaningful fraction of kidney biopsies carried out in patients on ICIs reveal lesions **unrelated to immune 
+toxicity**. Misclassification exposes patients to unnecessary high‑dose steroids and interrupts life‑prolonging therapy. 
+Conversely, failure to recognise **true immune‑related AKI (irAKI)** risks permanent renal damage and relapse upon 
+rechallenge. The tables below summarise both sides of the ledger and map each diagnostic domain to members of our 
+updated Delphi panel.
 
-### 🏥 **Modular Expert Panel Configuration**
-- **JSON-based expert definitions** with detailed clinical personas
-- **Configurable specialties**: Oncology, Nephrology, Pathology, Pharmacy, Informatics, Nursing, Critical Care, Rheumatology, Hospital Medicine, Emergency Medicine, Geriatric etc
-- **Specialty-specific expertise** and reasoning styles
-- **Flexible panel composition** for different clinical contexts
+---
 
-### 📚 **Literature Integration (Optional)**
-- **PubMed API integration** for evidence-based reasoning
-- **bioRxiv preprint search** for cutting-edge research
-- **Specialty-specific literature queries** tailored to expert focus areas
-- **Citation integration** in clinical reasoning and debates
-- **Relevance scoring** and key sentence extraction
+### 1. Alternative (Non‑immune) Causes of AKI
 
-### 🔬 **Clinical Assessment Framework**
-- **12 irAKI-specific questions** based on published literature (Sprangers et al. Nature Reviews Nephrology 2022)
-- **9-point Likert scale** assessment with detailed clinical context
-- **Configurable questionnaire** via JSON for easy updates
-- **Evidence-based question design** with clinical decision support integration
+| Aetiology                                                       | Key bedside / laboratory clues                                                 | Panel experts with primary insight                   |
+| --------------------------------------------------------------- |--------------------------------------------------------------------------------|------------------------------------------------------|
+| **Pre‑renal or haemodynamic AKI**                               | Hypotension, volume depletion, low FeNa < 1 %, creatinine improves with fluids | *Nephrologist*, *Intensivist*                        |
+| **Ischaemic / toxic ATN** (contrast, cisplatin, aminoglycoside) | Recent IV contrast / nephrotoxin; granular casts; bland sediment               | *Nephrologist*, *Pharmacist*, *Radiologist*          |
+| **Classic drug‑induced ATIN** (PPI, NSAID, β‑lactam)            | Eosinophiluria, rash, fever; recovery after culprit stopped                    | *Nephrologist*, *Pharmacist*                         |
+| **Glomerular disease & vasculitides**                           | Heavy proteinuria, dysmorphic haematuria; positive ANA/ANCA/complements        | *Pathologist*, *Rheumatologist*, *Nephrologist*      |
+| **Rhabdomyolysis / pigment nephropathy**                        | CK ≫ 5 000 U L‑¹, myalgia, dark urine                                          | *Intensivist*, *Emergency Physician*, *Nephrologist* |
+| **Obstructive (post‑renal) AKI**                                | Hydronephrosis or mass on imaging; relief after decompression                  | *Radiologist*, *Emergency Physician*                 |
+| **Sepsis‑associated / infection‑driven AKI**                    | Fever, positive cultures, rising creatinine despite adequate MAP               | *Infectious‑Disease Specialist*, *Intensivist*       |
+| **Age‑related vulnerability & polypharmacy**                    | eGFR < 45, ≥ 5 nephrotoxic meds, frailty indices, orthostatic BP drop          | *Geriatrician*, *Pharmacist*                         |
 
-### 🤖 **Multi-Agent Architecture**
-- **vLLM Backend Integration**: High-performance inference with AWS H100/A100 deployment
-- **3-Round Delphi Process**: Individual assessment → Conflict resolution → Final consensus
-- **Equal Expert Weighting**: Transparent consensus without ground truth dependency
-- **Automated Debate Facilitation**: Structured discussions for complex disagreements
+*Key takeaway → Before declaring irAKI, the panel must document volume status, recent nephrotoxin exposure, imaging, infection screen, and urinalysis findings.*
 
-### 📊 **Human Expert Validation**
-- **Complete transcript export** for real physician validation
-- **Detailed reasoning chains** from each expert specialty
-- **Clinical timeline analysis** and evidence synthesis
-- **Literature citation tracking** (when enabled)
+---
+
+### 2. Immune‑Related AKI (irAKI) Attributable to ICIs
+
+| Pathologic pattern                                                                                | Typical timing & clinical clues                                                                                                                                   | Panel experts with primary insight                    |
+|---------------------------------------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------|-------------------------------------------------------|
+| **Acute tubulo‑interstitial nephritis (ATIN)**<br>*(≈ 70 % of biopsy‑confirmed irAKI)*            | Appears ≥ 2–16 weeks after ICI start; sterile pyuria, mild proteinuria (< 1 g day‑¹), WBC casts, eosinophiluria; often co‑occurs with other irAEs (rash, colitis) | *Oncologist*, *Nephrologist*, *Pathologist*           |
+| **Glomerular lesions**<br>(MCD, membranous GN, IgA GN)                                            | Nephrotic‑range proteinuria or haematuria; biopsy shows podocytopathy or immune deposits; may lag behind other irAEs                                              | *Pathologist*, *Nephrologist*, *Rheumatologist*       |
+| **Thrombotic micro‑angiopathy (TMA)**                                                             | MAHA, thrombocytopenia, rising LDH; biopsy shows endothelial swelling, double contours                                                                            | *Pathologist*, *Intensivist*, *Oncologist*            |
+| **C4d‑negative antibody‑mediated rejection–like pattern** (in prior kidney‑transplant recipients) | Sudden creatinine spike in allograft, donor‑specific Ab negative; biopsy with peritubular capillaritis                                                            | *Transplant Nephrologist* (consulting), *Pathologist* |
+| **Granulomatous interstitial nephritis**                                                          | Non‑caseating granulomas on biopsy; consider sarcoid‑like irAE; imaging may show mediastinal nodes                                                                | *Pathologist*, *Radiologist*, *Rheumatologist*        |
+| **Immune complex tubulo‑interstitial nephritis**                                                  | Low complements, sub‑nephrotic proteinuria; biopsy with immune complex deposition                                                                                 | *Pathologist*, *Rheumatologist*                       |
+
+**Diagnostic anchors for irAKI**
+
+* Biopsy confirmation whenever feasible (KDIGO stage ≥ 2 or unclear aetiology).
+* Association with other irAEs and ICI exposure timeline strengthens causality.
+* Prompt response to high‑dose corticosteroids (1 mg kg‑¹ prednisone equiv.) supports immune aetiology, but beware of confounders (e.g., ATIN from PPI also steroid‑responsive).
+
+---
+
+### 3. Why the Panel Composition Matters
+
+| Diagnostic task                                      | Critical expertise                                   |
+| ---------------------------------------------------- |------------------------------------------------------|
+| Exclude haemodynamic, toxic, or obstructive causes   | *Nephrologist*, *Radiologist*, *Intensivist*         |
+| Interpret kidney biopsy patterns                     | *Pathologist*, *Nephrologist*                        |
+| Correlate ICI dosing & timing with creatinine rise   | *Oncologist*, *Pharmacist*, *Informatician*          |
+| Identify immune signatures & systemic irAEs          | *Oncologist*, *Rheumatologist*, *Nurse Practitioner* |
+| Balance cancer control with renal recovery & frailty | *Oncologist*, *Geriatrician*                         |
+| Rule out infection‑related AKI before steroids       | *Infectious‑Disease Specialist*, *Intensivist*       |
+
+This structured matrix ensures every plausible mechanism—immune or otherwise—is weighed, maximising diagnostic accuracy 
+and safeguarding both oncologic and renal outcomes.
 
 ## System Architecture
 
@@ -58,50 +80,6 @@ DelPHEA-irAKI/
 ├── output/                    # results and transcripts
 ├── demo.py                    # examples
 └── requirements.txt           # dependencies
-```
-
-### Expert Panel Configuration
-
-The system uses JSON configuration files to define expert panels:
-
-```json
-{
-  "expert_panel": {
-    "experts": [
-      {
-        "id": "oncologist_001",
-        "specialty": "medical_oncology",
-        "name": "Dr. Sarah Chen",
-        "experience_years": 15,
-        "expertise": ["immune checkpoint inhibitor toxicities", "irAEs"],
-        "focus_areas": ["temporal relationship analysis", "irAE correlation"],
-        "reasoning_style": "evidence-based, protocol-driven"
-      }
-    ]
-  }
-}
-```
-
-### Clinical Questionnaire
-
-The assessment questions are also configurable via JSON:
-
-```json
-{
-  "questionnaire": {
-    "questions": [
-      {
-        "id": "Q1", 
-        "category": "temporal_relationship",
-        "question": "The temporal relationship between ICI exposure and AKI onset strongly supports irAKI diagnosis",
-        "clinical_context": {
-          "supportive_evidence": ["AKI onset 2-5 months after ICI initiation"],
-          "contradictory_evidence": ["AKI onset before ICI therapy"]
-        }
-      }
-    ]
-  }
-}
 ```
 
 ## Quick Start
