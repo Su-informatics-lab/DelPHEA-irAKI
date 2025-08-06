@@ -13,6 +13,7 @@
 # ignore anything in ~/.local/lib/python…/site-packages
 export PYTHONNOUSERSITE=1
 
+module purge
 module restore py312
 source .venv-py312/bin/activate
 
