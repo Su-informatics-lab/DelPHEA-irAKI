@@ -2,8 +2,6 @@
 DelPHEA-irAKI: Delphi Personalized Health Explainable Agents for immune-related AKI classification
 =================================================================================================
 
-High-level
-----------
 * Multi-agent Delphi workflow (Moderator + N LLM-backed experts) for irAKI vs. other AKI classification
 * Three structured rounds → consensus & confidence-weighted probability of irAKI diagnosis
 * Beta opinion pooling aggregates expert probabilities with 95 % credible interval
@@ -77,17 +75,17 @@ import asyncio
 import json
 import logging
 import time
-from collections import defaultdict, deque
+from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional
 
 import httpx
 import numpy as np
 from autogen_core import (AgentId, MessageContext, RoutedAgent,
                           SingleThreadedAgentRuntime, TopicId, message_handler,
                           rpc, type_subscription)
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from scipy.stats import beta
 
 logging.basicConfig(
@@ -100,30 +98,32 @@ logging.basicConfig(
 # =============================================================================
 
 @dataclass
-class DelPHEAirAKIConfig:
-    """Configuration for DelPHEA irAKI classification system"""
-    # vLLM Server Configuration
+class RuntimeConfig:
+    """Infrastructure settings"""
     vllm_endpoint: str = "http://172.31.11.192:8000"
-    model_name: str = "meta-llama/Llama-3.1-8B-Instruct"
+    model_name: str = "openai/gpt-oss-120b"
     api_key: Optional[str] = None
 
-    # Inference Parameters
+    # Inference parameters
     temperature: float = 0.7
     top_p: float = 0.9
     max_tokens: int = 3072
     timeout: float = 120.0
 
-    # Delphi Process Configuration
-    conflict_threshold: int = 3
-    max_debate_rounds: int = 6
-    max_debate_participants: int = 8
-
-    # Configuration File Paths
+    # Configuration file paths
     expert_panel_config: str = "config/panel.json"
     questionnaire_config: str = "config/questionnaire.json"
     prompts_dir: str = "prompts"
 
-    # Consensus Configuration
+@dataclass
+class DelphiConfig:
+    """Methodology parameters"""
+    conflict_threshold: int = 3
+    max_debate_rounds: int = 6
+    max_debate_participants: int = 8
+    expert_count: int = 8
+
+    # Consensus configuration
     consensus_threshold: float = 0.8
     confidence_threshold: float = 0.7
 
@@ -132,7 +132,49 @@ class DelPHEAirAKIConfig:
     round3_timeout: int = 600
     debate_timeout: int = 240
 
-    # Export Configuration
+    # Export configuration
+    export_full_transcripts: bool = True
+    include_reasoning_chains: bool = True
+
+# Global instances
+runtime_config = RuntimeConfig()
+delphi_config = DelphiConfig()
+
+@dataclass
+class DelPHEAirAKIConfig:
+    """Configuration for DelPHEA irAKI classification system"""
+    # vLLM server configuration
+    vllm_endpoint: str = "http://172.31.11.192:8000"
+    model_name: str = "openai/gpt-oss-120b"
+    api_key: Optional[str] = None
+
+    # inference parameters
+    temperature: float = 0.7
+    top_p: float = 0.9
+    max_tokens: int = 3072  # fixme: to increase
+    timeout: float = 120.0
+
+    # Delphi process configuration
+    conflict_threshold: int = 3
+    max_debate_rounds: int = 6
+    max_debate_participants: int = 8
+    expert_count: int = 8
+
+    # configuration file paths
+    expert_panel_config: str = "config/panel.json"
+    questionnaire_config: str = "config/questionnaire.json"
+    prompts_dir: str = "prompts"
+
+    # consensus configuration
+    consensus_threshold: float = 0.8
+    confidence_threshold: float = 0.7
+
+    # timeouts (seconds)
+    round1_timeout: int = 900
+    round3_timeout: int = 600
+    debate_timeout: int = 240
+
+    # export configuration
     export_full_transcripts: bool = True
     include_reasoning_chains: bool = True
 
@@ -143,7 +185,7 @@ config = DelPHEAirAKIConfig()
 # =============================================================================
 
 class QuestionnaireMsg(BaseModel):
-    model_config = ConfigDict(strict=True)
+    model_config = ConfigDict(strict=True, extra='forbid')
     case_id: str
     patient_info: dict
     icu_summary: str
@@ -154,7 +196,7 @@ class QuestionnaireMsg(BaseModel):
     round_phase: str = "round1"
 
 class ExpertRound1Reply(BaseModel):
-    model_config = ConfigDict(strict=True)
+    model_config = ConfigDict(strict=True, extra='forbid')
     case_id: str
     expert_id: str
     scores: Dict[str, int]
@@ -164,8 +206,14 @@ class ExpertRound1Reply(BaseModel):
     confidence: float = Field(ge=0.0, le=1.0)
     differential_diagnosis: List[str]
 
+    @field_validator('ci_iraki')
+    def validate_ci_length(cls, v):
+        if len(v) != 2:
+            raise ValueError('ci_iraki must have exactly 2 values [lower, upper]')
+        return v
+
 class ExpertRound3Reply(BaseModel):
-    model_config = ConfigDict(strict=True)
+    model_config = ConfigDict(strict=True, extra='forbid')
     case_id: str
     expert_id: str
     scores: Dict[str, int]
@@ -178,36 +226,45 @@ class ExpertRound3Reply(BaseModel):
     final_diagnosis: str
     recommendations: List[str]
 
+    @field_validator('ci_iraki')
+    def validate_ci_length(cls, v):
+        if len(v) != 2:
+            raise ValueError('ci_iraki must have exactly 2 values [lower, upper]')
+        return v
+
 class DebatePrompt(BaseModel):
-    model_config = ConfigDict(strict=True)
+    model_config = ConfigDict(strict=True, extra='forbid')
     case_id: str
     q_id: str
     minority_view: str
     round_no: int
     participating_experts: List[str]
-    clinical_context: str
 
 class DebateComment(BaseModel):
+    model_config = ConfigDict(strict=True, extra='forbid')
     q_id: str
     author: str
     text: str
-    citations: List[str] = []
+    citations: List[str] = Field(default_factory=list)  # Fix mutable default
     satisfied: bool = False
 
 class TerminateDebate(BaseModel):
-    model_config = ConfigDict(strict=True)
+    model_config = ConfigDict(strict=True, extra='forbid')
     case_id: str
     q_id: str
     reason: str
 
 class StartCase(BaseModel):
+    model_config = ConfigDict(strict=True, extra='forbid')
     case_id: str
 
 class AckMsg(BaseModel):
+    model_config = ConfigDict(strict=True, extra='forbid')
     ok: bool
     message: Optional[str] = None
 
 class HumanReviewExport(BaseModel):
+    model_config = ConfigDict(strict=True, extra='forbid')
     case_id: str
     final_consensus: Dict[str, Any]
     expert_assessments: List[Dict[str, Any]]
@@ -226,27 +283,36 @@ def beta_pool_confidence(p_vec: np.ndarray,
     lo = ci_mat[:, 0]
     hi = ci_mat[:, 1]
 
-    # Between-expert variance
+    # between-expert variance
     var_between = np.var(p_vec, ddof=1) if p_vec.size > 1 else 0.0
     between_score = 1.0 - (var_between / 0.25)
     between_score = np.clip(between_score, 0.0, 1.0)
 
-    # Within-expert CI width
+    # within-expert CI width
     half_widths = (hi - lo) / 2.0
     mean_half = half_widths.mean()
     within_score = 1.0 - (mean_half / 0.5)
     within_score = np.clip(within_score, 0.0, 1.0)
 
-    # Harmonic-mean panel confidence
+    # harmonic-mean panel confidence
     if between_score == 0 or within_score == 0:
         consensus_conf = 0.0
     else:
         consensus_conf = 2.0 / (1.0 / between_score + 1.0 / within_score)
 
-    # Beta opinion pool
+    # normalize weights to sum to N for predictable scaling
     w = weight_vec if weight_vec is not None else np.ones_like(p_vec)
-    a_post = 1.0 + np.sum(w * p_vec)
-    b_post = 1.0 + np.sum(w * (1.0 - p_vec))
+
+    # Fix: Check for zero weights to avoid division by zero
+    total_weight = w.sum()
+    if total_weight == 0:
+        raise ValueError("All expert confidences are zero – cannot pool.")
+
+    w_normalized = w * len(p_vec) / total_weight
+
+    # beta opinion pool
+    a_post = 1.0 + np.sum(w_normalized * p_vec)
+    b_post = 1.0 + np.sum(w_normalized * (1.0 - p_vec))
 
     post_mean = a_post / (a_post + b_post)
     post_ci_95 = beta.ppf([0.025, 0.975], a_post, b_post).tolist()
@@ -266,21 +332,33 @@ def beta_pool_confidence(p_vec: np.ndarray,
 # =============================================================================
 
 class VLLMClient:
-    """Production vLLM client with OpenAI-compatible API"""
+    """Simplified vLLM client with shared HTTP connection pool"""
 
-    def __init__(self, config: DelPHEAirAKIConfig):
-        self.config = config
+    def __init__(self, runtime_config: RuntimeConfig, http_client: httpx.AsyncClient = None):
+        """Initialize vLLM client with configuration and optional shared HTTP client."""
+        self.config = runtime_config
         self.logger = logging.getLogger(f"{__name__}.VLLMClient")
 
-        timeout = httpx.Timeout(config.timeout)
-        self.client = httpx.AsyncClient(timeout=timeout)
+        # Use provided client or create new one
+        if http_client:
+            self.client = http_client
+            self._owns_client = False
+        else:
+            timeout = httpx.Timeout(
+                connect=30.0,
+                read=runtime_config.timeout,
+                write=10.0,
+                pool=5.0
+            )
+            self.client = httpx.AsyncClient(timeout=timeout)
+            self._owns_client = True
 
         self.headers = {"Content-Type": "application/json"}
-        if config.api_key:
-            self.headers["Authorization"] = f"Bearer {config.api_key}"
+        if runtime_config.api_key:
+            self.headers["Authorization"] = f"Bearer {runtime_config.api_key}"
 
     async def generate_structured_response(self, prompt: str, response_format: Dict) -> Dict:
-        """Generate structured JSON response using vLLM"""
+        """Generate structured JSON response using external vLLM deployment."""
         request_data = {
             "model": self.config.model_name,
             "messages": [{"role": "user", "content": prompt}],
@@ -316,9 +394,9 @@ class VLLMClient:
             raise
 
     async def health_check(self) -> bool:
-        """Check if vLLM server is healthy"""
+        """Check if external vLLM server is healthy."""
         try:
-            for endpoint in ["/health", "/healthz"]:
+            for endpoint in ["/health", "/healthz", "/v1/models"]:
                 try:
                     response = await self.client.get(f"{self.config.vllm_endpoint}{endpoint}")
                     if response.status_code == 200:
@@ -331,7 +409,9 @@ class VLLMClient:
             return False
 
     async def close(self):
-        await self.client.aclose()
+        """Clean up HTTP client only if we own it."""
+        if self._owns_client:
+            await self.client.aclose()
 
 # =============================================================================
 # CONFIGURATION LOADERS
@@ -340,8 +420,9 @@ class VLLMClient:
 class ConfigurationLoader:
     """Centralized configuration loading with fail-fast validation"""
 
-    def __init__(self, config: DelPHEAirAKIConfig):
-        self.config = config
+    def __init__(self, runtime_config: RuntimeConfig):
+        """Initialize configuration loader with validation."""
+        self.config = runtime_config  # Now takes RuntimeConfig instead of DelPHEAirAKIConfig
         self.logger = logging.getLogger(f"{__name__}.ConfigurationLoader")
 
         # Load and validate all configurations at startup
@@ -433,7 +514,7 @@ class ConfigurationLoader:
         return prompts
 
     def get_expert_profile(self, expert_id: str) -> Dict:
-        """Get expert profile by ID"""
+        """Get expert profile by ID."""
         experts = self._expert_panel["expert_panel"]["experts"]
         for expert in experts:
             if expert["id"] == expert_id:
@@ -441,15 +522,15 @@ class ConfigurationLoader:
         raise ValueError(f"Expert not found: {expert_id}")
 
     def get_available_expert_ids(self) -> List[str]:
-        """Get list of all available expert IDs"""
+        """Get list of all available expert IDs."""
         return [expert["id"] for expert in self._expert_panel["expert_panel"]["experts"]]
 
     def get_questions(self) -> List[Dict]:
-        """Get all questions with full context"""
+        """Get all questions with full context."""
         return self._questionnaire["questionnaire"]["questions"]
 
     def get_question_by_id(self, q_id: str) -> Dict:
-        """Get specific question by ID"""
+        """Get specific question by ID."""
         questions = self.get_questions()
         for question in questions:
             if question["id"] == q_id:
@@ -457,7 +538,7 @@ class ConfigurationLoader:
         raise ValueError(f"Question not found: {q_id}")
 
     def get_prompt_template(self, template_name: str) -> Dict:
-        """Get prompt template by name"""
+        """Get prompt template by name."""
         if template_name not in self._prompts:
             raise ValueError(f"Prompt template not found: {template_name}")
         return self._prompts[template_name]
@@ -544,65 +625,79 @@ class irAKIDataLoader:
 class irAKIExpertAgent(RoutedAgent):
     """Clinical expert agent for irAKI assessment"""
 
-    def __init__(self, expert_id: str, case_id: str, config_loader: ConfigurationLoader) -> None:
+    def __init__(self, expert_id: str, case_id: str, config_loader: ConfigurationLoader,
+                 vllm_client: VLLMClient = None) -> None:
+        """Initialize expert agent with specialty configuration."""
         super().__init__(f"irAKI Expert {expert_id}")
         self._expert_id = expert_id
         self._case_id = case_id
         self._config_loader = config_loader
-        self._vllm_client = VLLMClient(config)
+
+        # Handle shared vs owned VLLMClient
+        if vllm_client:
+            self._vllm_client = vllm_client
+            self._owns_vllm_client = False
+        else:
+            self._vllm_client = VLLMClient(config)
+            self._owns_vllm_client = True
+
         self.logger = logging.getLogger(f"expert.{expert_id}")
 
-        # Load expert profile - fail fast if not found
+        # load expert profile - fail fast if not found
         self._expert_profile = self._config_loader.get_expert_profile(expert_id)
         self.logger.info(f"Initialized expert: {self._expert_profile['name']} ({self._expert_profile['specialty']})")
 
+    @type_subscription(topic_name=lambda self: f"case/{self._case_id}")
     @message_handler
     async def handle_questionnaire(self, message: QuestionnaireMsg, ctx: MessageContext) -> None:
         """Handle Round 1 & 3 irAKI assessment"""
-        # Get prompt template
-        prompt_template = self._config_loader.get_prompt_template("iraki_assessment")
-
-        # Build prompt with expert profile and case data
-        prompt = self._build_assessment_prompt(message, prompt_template)
-
         try:
+            # get prompt template
+            prompt_template = self._config_loader.get_prompt_template("iraki_assessment")
+
+            # build prompt with expert profile and case data
+            prompt = self._build_assessment_prompt(message, prompt_template)
+
             llm_response = await self._vllm_client.generate_structured_response(
                 prompt=prompt,
                 response_format={"type": "json_object"}
             )
 
-            # Validate CI bounds
+            # clean CI bounds before creating Pydantic model
             if "ci_iraki" in llm_response:
                 ci_lower, ci_upper = llm_response["ci_iraki"]
                 ci_lower = max(0.0, min(ci_lower, llm_response["p_iraki"]))
                 ci_upper = min(1.0, max(ci_upper, llm_response["p_iraki"]))
-                llm_response["ci_iraki"] = [ci_lower, ci_upper]
             else:
                 p = llm_response["p_iraki"]
-                width = 0.1  # Default ±10% uncertainty
-                llm_response["ci_iraki"] = [max(0.0, p - width), min(1.0, p + width)]
+                width = 0.1  # default ±10% uncertainty
+                ci_lower, ci_upper = max(0.0, p - width), min(1.0, p + width)
 
-            # Create reply object
+            # create reply object
             if message.round_phase == "round1":
-                required_fields = ["scores", "evidence", "p_iraki", "ci_iraki", "confidence", "differential_diagnosis"]
+                required_fields = ["scores", "evidence", "p_iraki", "confidence", "differential_diagnosis"]
                 reply_class = ExpertRound1Reply
             else:  # round3
-                required_fields = ["scores", "evidence", "p_iraki", "ci_iraki", "confidence",
+                required_fields = ["scores", "evidence", "p_iraki", "confidence",
                                    "changes_from_round1", "verdict", "final_diagnosis", "recommendations"]
                 reply_class = ExpertRound3Reply
 
-            # Validate required fields
+            # validate required fields
             missing = [f for f in required_fields if f not in llm_response]
             if missing:
                 raise ValueError(f"Missing required fields: {missing}")
 
-            reply = reply_class(
+            # create clean dict with corrected CI bounds
+            clean_response = {
                 **llm_response,
-                expert_id=self._expert_id,
-                case_id=message.case_id
-            )
+                "ci_iraki": [ci_lower, ci_upper],
+                "expert_id": self._expert_id,
+                "case_id": message.case_id
+            }
 
-            # Send via RPC to moderator
+            reply = reply_class(**clean_response)
+
+            # send via RPC to moderator
             ack_response = await self.send_message(reply, AgentId("Moderator", message.case_id))
 
             if not ack_response.ok:
@@ -611,16 +706,33 @@ class irAKIExpertAgent(RoutedAgent):
                 self.logger.info(f"Successfully submitted {message.round_phase} assessment")
 
         except Exception as e:
+            # don't crash the agent  # todo: is this good?
             self.logger.error(f"Failed to generate {message.round_phase} response: {e}")
-            raise
+            # send error response to moderator
+            try:
+                error_reply = reply_class(
+                    case_id=message.case_id,
+                    expert_id=self._expert_id,
+                    scores={},
+                    evidence={},
+                    p_iraki=0.5,
+                    ci_iraki=[0.4, 0.6],
+                    confidence=0.1,
+                    **({"differential_diagnosis": []} if message.round_phase == "round1"
+                       else {"changes_from_round1": {}, "verdict": False,
+                             "final_diagnosis": "Error in assessment", "recommendations": []})
+                )
+                await self.send_message(error_reply, AgentId("Moderator", message.case_id))
+            except:
+                pass  # if we can't send error, just log
 
     @message_handler
     async def handle_debate_prompt(self, message: DebatePrompt, ctx: MessageContext) -> None:
         """Handle Round 2 debate"""
-        prompt_template = self._config_loader.get_prompt_template("debate")
-        prompt = self._build_debate_prompt(message, prompt_template)
-
         try:
+            prompt_template = self._config_loader.get_prompt_template("debate")
+            prompt = self._build_debate_prompt(message, prompt_template)
+
             llm_response = await self._vllm_client.generate_structured_response(
                 prompt=prompt,
                 response_format={"type": "json_object"}
@@ -634,12 +746,18 @@ class irAKIExpertAgent(RoutedAgent):
                 satisfied=llm_response.get("satisfied", False)
             )
 
-            await self.publish_message(comment, ctx.topic_id)
-            self.logger.info(f"Posted debate comment for {message.q_id}")
+            # Note: Since we're using direct messaging, we don't publish the comment
+            # The moderator already knows which experts are debating
+            self.logger.info(f"Generated debate comment for {message.q_id}")
 
         except Exception as e:
             self.logger.error(f"Failed to generate debate response: {e}")
-            raise
+
+    async def aclose(self):
+        """Clean up resources."""
+        # Only close if we own the client (not shared)
+        if hasattr(self, '_owns_vllm_client') and self._owns_vllm_client:
+            await self._vllm_client.close()
 
     @message_handler
     async def handle_terminate_debate(self, message: TerminateDebate, ctx: MessageContext) -> None:
@@ -647,8 +765,8 @@ class irAKIExpertAgent(RoutedAgent):
         self.logger.info(f"Exiting debate for {message.case_id}:{message.q_id}")
 
     def _build_assessment_prompt(self, message: QuestionnaireMsg, template: Dict) -> str:
-        """Build irAKI assessment prompt from template"""
-        # Format questions with their contexts
+        """Build irAKI assessment prompt from template."""
+        # format questions with their contexts
         formatted_questions = []
         for i, question_obj in enumerate(message.questions):
             q_text = question_obj["question"]
@@ -663,10 +781,10 @@ class irAKIExpertAgent(RoutedAgent):
 
             formatted_questions.append(q_formatted)
 
-        # Get confidence instructions
+        # get confidence instructions
         confidence_template = self._config_loader.get_prompt_template("confidence_instructions")
 
-        # Build prompt from template
+        # build prompt from template
         prompt = template["base_template"].format(
             expert_name=self._expert_profile["name"],
             expert_experience=f"{self._expert_profile['experience_years']} years {self._expert_profile['specialty']}",
@@ -686,7 +804,7 @@ class irAKIExpertAgent(RoutedAgent):
         return prompt
 
     def _build_debate_prompt(self, message: DebatePrompt, template: Dict) -> str:
-        """Build debate prompt from template"""
+        """Build debate prompt from template."""
         return template["base_template"].format(
             expert_name=self._expert_profile["name"],
             specialty=self._expert_profile["specialty"],
@@ -714,25 +832,26 @@ class irAKIModeratorAgent(RoutedAgent):
     """Master agent coordinating irAKI Delphi process"""
 
     def __init__(self, case_id: str) -> None:
+        """Initialize moderator for case coordination."""
         super().__init__(f"irAKI Moderator for case {case_id}")
         self._case_id = case_id
         self._config_loader = get_config_loader()
         self._data_loader = irAKIDataLoader()
 
-        # Get available expert IDs from configuration
-        self._expert_ids = self._config_loader.get_available_expert_ids()[:config.expert_count if hasattr(config, 'expert_count') else 8]
+        # use expert_count from config
+        self._expert_ids = self._config_loader.get_available_expert_ids()[:config.expert_count]
 
-        # Round tracking
+        # round tracking
         self._round1_replies: List[ExpertRound1Reply] = []
         self._round3_replies: List[ExpertRound3Reply] = []
         self._chat_logs: Dict[str, List[Dict]] = defaultdict(list)
 
-        # Debate management
-        self._active_debates: Dict[str, Dict] = {}
+        # debate management
+        self._active_debates: dict[str, dict] = {}
 
-        # Synchronization
-        self._pending_round1: Set[str] = set()
-        self._pending_round3: Set[str] = set()
+        # synchronization
+        self._pending_round1: set = set()
+        self._pending_round3: set = set()
         self._round1_done = asyncio.Event()
         self._round3_done = asyncio.Event()
 
@@ -747,17 +866,17 @@ class irAKIModeratorAgent(RoutedAgent):
         await self._run_round1(patient_data)
 
     async def _run_round1(self, patient_data: Dict) -> None:
-        """Execute Round 1: individual irAKI assessments"""
+        """Execute Round 1: individual irAKI assessments."""
         self.logger.info("=== ROUND 1: Individual irAKI Assessments ===")
 
-        # Load questions with full context from configuration
+        # load questions with full context from configuration
         questions = self._config_loader.get_questions()
 
-        # Initialize pending tracking with actual expert IDs
+        # initialize pending tracking with actual expert IDs
         self._pending_round1 = set(self._expert_ids)
         self._round1_done.clear()
 
-        # Create questionnaire message
+        # create questionnaire message
         questionnaire = QuestionnaireMsg(
             case_id=self._case_id,
             patient_info=patient_data["patient_info"],
@@ -844,7 +963,7 @@ class irAKIModeratorAgent(RoutedAgent):
                 await self._compute_final_consensus()
 
     async def _run_round2(self) -> None:
-        """Execute Round 2: debate conflicts"""
+        """Execute Round 2: debate conflicts with responsive timeout"""
         self.logger.info("=== ROUND 2: Conflict Resolution ===")
 
         conflicts = self._detect_conflicts()
@@ -855,11 +974,48 @@ class irAKIModeratorAgent(RoutedAgent):
             return
 
         self.logger.info(f"Detected conflicts in {len(conflicts)} questions")
-        # Simplified debate implementation - could be expanded
+
+        # Start debates for all conflicts
+        debate_tasks = {}
+        for q_id, meta in conflicts.items():
+            prompt = DebatePrompt(
+                case_id=self._case_id,
+                q_id=q_id,
+                minority_view=f"Score range: {meta['score_range']}",
+                round_no=2,
+                participating_experts=self._expert_ids
+            )
+
+            # Send debate prompt to each expert
+            for expert_id in self._expert_ids:
+                try:
+                    await self.send_message(prompt, AgentId(f"Expert_{expert_id}", self._case_id))
+                except Exception as e:
+                    self.logger.warning(f"Failed to send debate prompt to {expert_id}: {e}")
+
+            # Create task to wait for debate completion on this question
+            debate_tasks[q_id] = asyncio.create_task(
+                self._await_debate_completion(q_id, delphi_config.debate_timeout)
+            )
+
+        # Wait for all debates to complete or timeout
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*debate_tasks.values(), return_exceptions=True),
+                timeout=delphi_config.debate_timeout
+            )
+            self.logger.info("All debates completed")
+        except asyncio.TimeoutError:
+            self.logger.info("Debate window expired, proceeding to Round 3")
+            # Cancel remaining tasks
+            for task in debate_tasks.values():
+                if not task.done():
+                    task.cancel()
+
         await self._run_round3()
 
     def _detect_conflicts(self) -> Dict[str, Dict]:
-        """Detect questions with significant disagreement"""
+        """Detect questions with significant disagreement."""
         conflicts = {}
         questions = self._config_loader.get_questions()
 
@@ -907,25 +1063,25 @@ class irAKIModeratorAgent(RoutedAgent):
         await self._wait_for_round_completion("round3")
 
     async def _compute_final_consensus(self) -> None:
-        """Compute beta pooling consensus for irAKI classification"""
+        """Compute beta pooling consensus for irAKI classification."""
         self.logger.info("=== COMPUTING FINAL CONSENSUS ===")
 
         if not self._round3_replies:
             self.logger.error("No Round 3 replies received")
             return
 
-        # Extract data for beta pooling
+        # extract data for beta pooling
         p_vec = np.array([r.p_iraki for r in self._round3_replies])
         ci_mat = np.array([r.ci_iraki for r in self._round3_replies])
         w_vec = np.array([r.confidence for r in self._round3_replies])
 
-        # Compute beta pooling with confidence estimation
+        # compute beta pooling with confidence estimation
         stats = beta_pool_confidence(p_vec, ci_mat, w_vec)
 
-        # Traditional majority vote for comparison
+        # traditional majority vote for comparison
         consensus_verdict = sum(r.verdict for r in self._round3_replies) > len(self._round3_replies) / 2
 
-        # Log results
+        # log results
         self.logger.info("=" * 80)
         self.logger.info(f"CASE {self._case_id} irAKI CONSENSUS RESULTS:")
         self.logger.info("-" * 80)
@@ -936,7 +1092,7 @@ class irAKIModeratorAgent(RoutedAgent):
         self.logger.info(f"Expert Count:            {len(self._round3_replies)}")
         self.logger.info("=" * 80)
 
-        # Export for human review
+        # export for human review
         if config.export_full_transcripts:
             await self._export_for_human_review(stats, consensus_verdict)
 
@@ -960,27 +1116,38 @@ async def main():
     parser.add_argument("--questionnaire-config", default="config/questionnaire.json", help="Questionnaire config")
     parser.add_argument("--prompts-dir", default="prompts", help="Prompts directory")
 
+    # vLLM configuration
+    parser.add_argument("--vllm-endpoint", default="http://172.31.11.192:8000", help="vLLM server endpoint")
+    parser.add_argument("--model-name", help="Model name for inference")
+
     # System options
     parser.add_argument("--health-check", action="store_true", help="Health check and exit")
     parser.add_argument("--verbose", "-v", action="store_true", help="Verbose logging")
 
     args = parser.parse_args()
 
+    if args.health_check and not args.model_name:
+        args.model_name = runtime_config.model_name
+    elif not args.health_check and not args.model_name:
+        parser.error("--model-name is required for running (not needed for --health-check)")
+
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
 
-    # Update configuration
-    config.expert_panel_config = args.expert_panel_config
-    config.questionnaire_config = args.questionnaire_config
-    config.prompts_dir = args.prompts_dir
+    # Update configurations with command line args
+    runtime_config.expert_panel_config = args.expert_panel_config
+    runtime_config.questionnaire_config = args.questionnaire_config
+    runtime_config.prompts_dir = args.prompts_dir
+    runtime_config.vllm_endpoint = args.vllm_endpoint
+    runtime_config.model_name = args.model_name
 
     try:
         if args.health_check:
             # Initialize configuration loader to validate configs
-            config_loader = ConfigurationLoader(config)
+            config_loader = ConfigurationLoader(runtime_config)
 
             # Check vLLM
-            vllm_client = VLLMClient(config)
+            vllm_client = VLLMClient(runtime_config)
             healthy = await vllm_client.health_check()
             await vllm_client.close()
 
@@ -988,15 +1155,19 @@ async def main():
                 print("✓ DelPHEA-irAKI system healthy")
                 print(f"✓ Loaded {len(config_loader.get_available_expert_ids())} experts")
                 print(f"✓ Loaded {len(config_loader.get_questions())} questions")
+                print(f"✓ vLLM endpoint: {runtime_config.vllm_endpoint}")
+                print(f"✓ Model: {runtime_config.model_name}")
                 return 0
             else:
-                print("✗ vLLM health check failed")
+                print(f"✗ vLLM health check failed for {runtime_config.vllm_endpoint}")
                 return 1
         else:
             print(f"Starting DelPHEA-irAKI for case: {args.case_id}")
+            print(f"vLLM endpoint: {runtime_config.vllm_endpoint}")
+            print(f"Model: {runtime_config.model_name}")
 
             # Initialize configuration (this will fail fast if configs are invalid)
-            config_loader = get_config_loader()
+            config_loader = ConfigurationLoader(runtime_config)
 
             print(f"✓ Loaded {len(config_loader.get_available_expert_ids())} experts")
             print(f"✓ Loaded {len(config_loader.get_questions())} questions")
@@ -1005,14 +1176,28 @@ async def main():
             # Create runtime
             runtime = SingleThreadedAgentRuntime()
 
-            # Register agents
-            await runtime.register("Moderator", lambda key: irAKIModeratorAgent(key))
+            # Create shared HTTP client for all vLLM requests
+            shared_http_client = httpx.AsyncClient(timeout=httpx.Timeout(
+                connect=30.0,
+                read=runtime_config.timeout,
+                write=10.0,
+                pool=5.0
+            ))
 
-            # Register expert agents
+            # Create shared VLLMClient
+            shared_vllm_client = VLLMClient(runtime_config, shared_http_client)
+
+            # Register agents
+            await runtime.register(
+                "Moderator",
+                lambda _: irAKIModeratorAgent(args.case_id)
+            )
+
+            # Register expert agents with shared VLLMClient
             for expert_id in config_loader.get_available_expert_ids():
                 await runtime.register(
                     f"Expert_{expert_id}",
-                    lambda key, eid=expert_id: irAKIExpertAgent(eid, key, config_loader)
+                    lambda _, eid=expert_id: irAKIExpertAgent(eid, args.case_id, config_loader, shared_vllm_client)
                 )
 
             # Start runtime
@@ -1026,6 +1211,10 @@ async def main():
 
             # Wait for completion
             await runtime.stop_when_idle()
+
+            # Clean up shared resources
+            await shared_vllm_client.close()
+            await shared_http_client.aclose()
             await runtime.stop()
 
             print("\n✓ DelPHEA-irAKI completed successfully!")
@@ -1043,6 +1232,7 @@ async def main():
     except Exception as e:
         print(f"\n✗ Error: {e}")
         return 1
+
 
 if __name__ == "__main__":
     exit(asyncio.run(main()))
