@@ -10,13 +10,24 @@
 #SBATCH --mail-user=haining.wang@montana.edu
 #SBATCH --mail-type=BEGIN,END,FAIL
 
-# ignore anything in ~/.local/lib/python…/site-packages
-export PYTHONNOUSERSITE=1
+set -e                       # fail fast
+
+export PYTHONNOUSERSITE=1    # never import from ~/.local/…
 
 module purge
-module restore py312
-source .venv-py312/bin/activate
+module restore py312         # loads GCC 13.3 + Python 3.12 + CUDA 12.3
 
+# --- ABSOLUTE path so activation never fails -------------
+source /home/g91p721/DelPHEA-irAKI/.venv-py312/bin/activate
+
+# optional sanity check
+python - <<'PY'
+import vllm, sys, platform, os
+print("Using vllm from:", vllm.__file__)
+print("glibc:", platform.libc_ver())
+PY
+
+# --- launch ------------------------------------------------
 python -m vllm.entrypoints.openai.api_server \
        --model openai/gpt-oss-120b \
        --host 0.0.0.0 \
