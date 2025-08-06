@@ -1,35 +1,36 @@
 #!/bin/bash
-#SBATCH --job-name=gptoss-vllm          # shown by squeue
+#SBATCH --job-name=gptoss_server
 #SBATCH --partition=nextgen-gpu
-#SBATCH --nodes=1                       # stay on a single host
-#SBATCH --gres=gpu:h100:2               # 2× H100
-#SBATCH --cpus-per-gpu=4                # 8 logical cores total
+#SBATCH --nodes=1
+#SBATCH --gres=gpu:h100:2
+#SBATCH --cpus-per-gpu=4
 #SBATCH --mem=128G
 #SBATCH --time=1-00:00:00
-#SBATCH --ntasks=1                      # one task → one Apptainer process
+#SBATCH --ntasks=1
 #SBATCH --output=logs/%j.out
 #SBATCH --error=logs/%j.err
-#SBATCH --signal=USR1@120               # 2-min pre-emtion notice
+#SBATCH --signal=USR1@120
 
-set -euo pipefail                       # safer bash
+set -euo pipefail
 
-# paths
-export HF_HOME="$HOME/hf-cache"         # HuggingFace cache (host)
+# host-side caches & images
+export HF_HOME="$HOME/hf-cache"
 export IMG_DIR="$HOME/containers"
 export IMG_FILE="$IMG_DIR/vllm-gptoss.sif"
 
-# per-job scratch for Flash-infer / torch.compile caches
-export JOB_SCRATCH="/scratch/$USER/vllm-cache/$SLURM_JOB_ID"
-mkdir -p "$HF_HOME" "$JOB_SCRATCH"
+mkdir -p "$HF_HOME" "$IMG_DIR" logs
 
-# CUDA tool-chain inside the container
+# per-job temporary area (inside project folder)
+export JOB_SCRATCH="$HOME/DelPHEA-irAKI/tmp/$SLURM_JOB_ID"
+mkdir -p "$JOB_SCRATCH"
+
+# CUDA tool-chain inside container
 export CUDA_HOME=/usr/local/cuda
 export PATH=$CUDA_HOME/bin:$PATH
 
-# (optional) Skip Flash-infer JIT if you don’t want compilation
-# export FLASHINFER_DISABLE_JIT=1
+# export FLASHINFER_DISABLE_JIT=1  # only for debug
 
-# launch
+# launch vLLM inside Apptainer container
 apptainer exec --nv \
   --bind "$HF_HOME":/root/.cache/huggingface \
   --bind /mnt/shared/moduleapps/eb/CUDA/12.3.0:/mnt/shared/moduleapps/eb/CUDA/12.3.0 \
