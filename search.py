@@ -25,21 +25,23 @@ Usage:
 """
 
 import asyncio
-import aiohttp
-import xml.etree.ElementTree as ET
-from typing import List, Dict, Optional, Any
 import logging
+import re
+import time
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-import re
-import json
-import time
+from typing import Dict, List, Optional
+
+import aiohttp
 
 logger = logging.getLogger(__name__)
+
 
 @dataclass
 class LiteratureResult:
     """Structure for literature search results"""
+
     title: str
     authors: List[str]
     journal: str
@@ -53,6 +55,7 @@ class LiteratureResult:
     url: str
     citation: str
 
+
 class LiteratureSearcher:
     """Search and retrieve relevant medical literature for irAKI assessment"""
 
@@ -65,40 +68,82 @@ class LiteratureSearcher:
         # Specialty-specific keywords for query enhancement
         self.specialty_keywords = {
             "medical_oncology": [
-                "immune checkpoint inhibitor", "immunotherapy", "cancer immunotherapy",
-                "nivolumab", "pembrolizumab", "ipilimumab", "atezolizumab", "durvalumab",
-                "immune-related adverse events", "irAE", "oncology toxicity"
+                "immune checkpoint inhibitor",
+                "immunotherapy",
+                "cancer immunotherapy",
+                "nivolumab",
+                "pembrolizumab",
+                "ipilimumab",
+                "atezolizumab",
+                "durvalumab",
+                "immune-related adverse events",
+                "irAE",
+                "oncology toxicity",
             ],
             "nephrology": [
-                "acute kidney injury", "acute tubular necrosis", "tubulointerstitial nephritis",
-                "drug-induced nephrotoxicity", "AKI", "renal function", "creatinine",
-                "proteinuria", "hematuria", "kidney biopsy"
+                "acute kidney injury",
+                "acute tubular necrosis",
+                "tubulointerstitial nephritis",
+                "drug-induced nephrotoxicity",
+                "AKI",
+                "renal function",
+                "creatinine",
+                "proteinuria",
+                "hematuria",
+                "kidney biopsy",
             ],
             "renal_pathology": [
-                "kidney biopsy", "renal pathology", "tubulointerstitial nephritis",
-                "acute tubular necrosis", "immune infiltrate", "pathologic findings",
-                "histology", "electron microscopy", "immunofluorescence"
+                "kidney biopsy",
+                "renal pathology",
+                "tubulointerstitial nephritis",
+                "acute tubular necrosis",
+                "immune infiltrate",
+                "pathologic findings",
+                "histology",
+                "electron microscopy",
+                "immunofluorescence",
             ],
             "clinical_pharmacy": [
-                "drug interactions", "pharmacokinetics", "medication safety",
-                "adverse drug reactions", "drug-induced", "pharmacovigilance",
-                "concomitant medications", "dose adjustment"
+                "drug interactions",
+                "pharmacokinetics",
+                "medication safety",
+                "adverse drug reactions",
+                "drug-induced",
+                "pharmacovigilance",
+                "concomitant medications",
+                "dose adjustment",
             ],
             "clinical_informatics": [
-                "clinical decision support", "predictive modeling", "biomarkers",
-                "machine learning", "clinical prediction", "risk stratification",
-                "electronic health records", "data mining"
+                "clinical decision support",
+                "predictive modeling",
+                "biomarkers",
+                "machine learning",
+                "clinical prediction",
+                "risk stratification",
+                "electronic health records",
+                "data mining",
             ],
             "critical_care": [
-                "intensive care", "critical illness", "sepsis", "hemodynamic",
-                "multi-organ failure", "renal replacement therapy", "CRRT",
-                "acute care", "ICU"
+                "intensive care",
+                "critical illness",
+                "sepsis",
+                "hemodynamic",
+                "multi-organ failure",
+                "renal replacement therapy",
+                "CRRT",
+                "acute care",
+                "ICU",
             ],
             "rheumatology": [
-                "autoimmune", "lupus nephritis", "vasculitis", "immune complex",
-                "complement", "autoantibodies", "immunosuppression",
-                "systemic autoimmune disease"
-            ]
+                "autoimmune",
+                "lupus nephritis",
+                "vasculitis",
+                "immune complex",
+                "complement",
+                "autoantibodies",
+                "immunosuppression",
+                "systemic autoimmune disease",
+            ],
         }
 
         # irAKI-specific query templates
@@ -109,7 +154,7 @@ class LiteratureSearcher:
             "management": "immune checkpoint inhibitor AKI treatment corticosteroid",
             "rechallenge": "checkpoint inhibitor rechallenge after nephrotoxicity",
             "biomarkers": "biomarkers immune related acute kidney injury",
-            "temporal": "temporal relationship immunotherapy acute kidney injury"
+            "temporal": "temporal relationship immunotherapy acute kidney injury",
         }
 
     async def __aenter__(self):
@@ -140,8 +185,9 @@ class LiteratureSearcher:
             return enhanced_query
         return base_query
 
-    async def search_pubmed(self, query: str, max_results: int = 10,
-                            recent_years: int = 5) -> List[LiteratureResult]:
+    async def search_pubmed(
+        self, query: str, max_results: int = 10, recent_years: int = 5
+    ) -> List[LiteratureResult]:
         """Search PubMed for relevant literature"""
         if not self.session:
             self.session = aiohttp.ClientSession()
@@ -161,7 +207,7 @@ class LiteratureSearcher:
                 "term": f"({query}) AND {date_filter}",
                 "retmax": max_results,
                 "email": self.email,
-                "tool": "delphea_iraki"
+                "tool": "delphea_iraki",
             }
 
             async with self.session.get(search_url, params=search_params) as response:
@@ -187,7 +233,7 @@ class LiteratureSearcher:
                 "id": ",".join(pmids),
                 "retmode": "xml",
                 "email": self.email,
-                "tool": "delphea_iraki"
+                "tool": "delphea_iraki",
             }
 
             async with self.session.get(fetch_url, params=fetch_params) as response:
@@ -210,7 +256,9 @@ class LiteratureSearcher:
             logger.error(f"PubMed search error: {e}")
             return []
 
-    def _parse_pubmed_article(self, article_elem, original_query: str) -> Optional[LiteratureResult]:
+    def _parse_pubmed_article(
+        self, article_elem, original_query: str
+    ) -> Optional[LiteratureResult]:
         """Parse PubMed article XML into LiteratureResult"""
         try:
             # Extract basic information
@@ -236,7 +284,9 @@ class LiteratureSearcher:
 
             # Extract journal
             journal_elem = article.find(".//Journal/Title")
-            journal = journal_elem.text if journal_elem is not None else "Unknown journal"
+            journal = (
+                journal_elem.text if journal_elem is not None else "Unknown journal"
+            )
 
             # Extract publication date
             pub_date = article.find(".//PubDate")
@@ -263,10 +313,16 @@ class LiteratureSearcher:
 
             # Extract abstract
             abstract_elem = article.find(".//Abstract/AbstractText")
-            abstract = abstract_elem.text if abstract_elem is not None else "No abstract available"
+            abstract = (
+                abstract_elem.text
+                if abstract_elem is not None
+                else "No abstract available"
+            )
 
             # Calculate relevance score and extract key sentences
-            relevance_score = self._calculate_relevance_score(title, abstract, original_query)
+            relevance_score = self._calculate_relevance_score(
+                title, abstract, original_query
+            )
             key_sentences = self._extract_key_sentences(abstract, original_query)
 
             # Create citation
@@ -290,14 +346,16 @@ class LiteratureSearcher:
                 key_sentences=key_sentences,
                 source="pubmed",
                 url=url,
-                citation=citation
+                citation=citation,
             )
 
         except Exception as e:
             logger.error(f"Error parsing PubMed article: {e}")
             return None
 
-    async def search_biorxiv(self, query: str, max_results: int = 5) -> List[LiteratureResult]:
+    async def search_biorxiv(
+        self, query: str, max_results: int = 5
+    ) -> List[LiteratureResult]:
         """Search bioRxiv for relevant preprints"""
         if not self.session:
             self.session = aiohttp.ClientSession()
@@ -319,7 +377,7 @@ class LiteratureSearcher:
                 "server": "biorxiv",
                 "format": "json",
                 "cursor": "0",
-                "count": max_results * 3  # Get more to filter
+                "count": max_results * 3,  # Get more to filter
             }
 
             # Construct URL for date range search
@@ -350,14 +408,18 @@ class LiteratureSearcher:
             logger.error(f"bioRxiv search error: {e}")
             return []
 
-    def _parse_biorxiv_article(self, article_data: Dict, original_query: str) -> Optional[LiteratureResult]:
+    def _parse_biorxiv_article(
+        self, article_data: Dict, original_query: str
+    ) -> Optional[LiteratureResult]:
         """Parse bioRxiv article data into LiteratureResult"""
         try:
             title = article_data.get("title", "No title")
             abstract = article_data.get("abstract", "No abstract available")
 
             # Check relevance before processing
-            relevance_score = self._calculate_relevance_score(title, abstract, original_query)
+            relevance_score = self._calculate_relevance_score(
+                title, abstract, original_query
+            )
             if relevance_score < 0.3:  # Skip irrelevant articles
                 return None
 
@@ -391,14 +453,16 @@ class LiteratureSearcher:
                 key_sentences=key_sentences,
                 source="biorxiv",
                 url=url,
-                citation=citation
+                citation=citation,
             )
 
         except Exception as e:
             logger.error(f"Error parsing bioRxiv article: {e}")
             return None
 
-    def _calculate_relevance_score(self, title: str, abstract: str, query: str) -> float:
+    def _calculate_relevance_score(
+        self, title: str, abstract: str, query: str
+    ) -> float:
         """Calculate relevance score based on keyword matching"""
         # Define high-value irAKI keywords
         iraki_keywords = {
@@ -415,7 +479,7 @@ class LiteratureSearcher:
             "renal toxicity": 1.5,
             "kidney biopsy": 1.5,
             "creatinine": 1.0,
-            "proteinuria": 1.0
+            "proteinuria": 1.0,
         }
 
         text = f"{title} {abstract}".lower()
@@ -431,13 +495,15 @@ class LiteratureSearcher:
 
         return normalized_score
 
-    def _extract_key_sentences(self, abstract: str, query: str, max_sentences: int = 3) -> List[str]:
+    def _extract_key_sentences(
+        self, abstract: str, query: str, max_sentences: int = 3
+    ) -> List[str]:
         """Extract key sentences from abstract relevant to the query"""
         if not abstract or abstract == "No abstract available":
             return []
 
         # Split into sentences
-        sentences = re.split(r'[.!?]+', abstract)
+        sentences = re.split(r"[.!?]+", abstract)
         sentences = [s.strip() for s in sentences if s.strip()]
 
         # Score sentences based on keyword relevance
@@ -445,9 +511,21 @@ class LiteratureSearcher:
         query_words = set(query.lower().split())
 
         iraki_keywords = [
-            "immune", "checkpoint", "inhibitor", "acute", "kidney", "injury",
-            "nephritis", "toxicity", "renal", "immunotherapy", "adverse",
-            "creatinine", "biopsy", "treatment", "corticosteroid"
+            "immune",
+            "checkpoint",
+            "inhibitor",
+            "acute",
+            "kidney",
+            "injury",
+            "nephritis",
+            "toxicity",
+            "renal",
+            "immunotherapy",
+            "adverse",
+            "creatinine",
+            "biopsy",
+            "treatment",
+            "corticosteroid",
         ]
 
         for sentence in sentences:
@@ -471,8 +549,9 @@ class LiteratureSearcher:
         scored_sentences.sort(key=lambda x: x[1], reverse=True)
         return [sent[0] for sent in scored_sentences[:max_sentences]]
 
-    async def search_iraki_literature(self, query: str, specialty: str,
-                                      max_results: int = 8) -> List[LiteratureResult]:
+    async def search_iraki_literature(
+        self, query: str, specialty: str, max_results: int = 8
+    ) -> List[LiteratureResult]:
         """
         Main search function for irAKI-relevant literature
 
@@ -491,14 +570,11 @@ class LiteratureSearcher:
 
         # Search both PubMed and bioRxiv
         pubmed_results = await self.search_pubmed(
-            enhanced_query,
-            max_results=max_results,
-            recent_years=5
+            enhanced_query, max_results=max_results, recent_years=5
         )
 
         biorxiv_results = await self.search_biorxiv(
-            enhanced_query,
-            max_results=max(2, max_results // 4)  # Fewer preprints
+            enhanced_query, max_results=max(2, max_results // 4)  # Fewer preprints
         )
 
         # Combine and sort results
@@ -511,8 +587,9 @@ class LiteratureSearcher:
         logger.info(f"Found {len(final_results)} relevant literature results")
         return final_results
 
-    async def search_by_iraki_topic(self, topic: str, specialty: str,
-                                    max_results: int = 5) -> List[LiteratureResult]:
+    async def search_by_iraki_topic(
+        self, topic: str, specialty: str, max_results: int = 5
+    ) -> List[LiteratureResult]:
         """Search for literature by specific irAKI topic"""
         if topic in self.iraki_queries:
             base_query = self.iraki_queries[topic]
@@ -542,22 +619,27 @@ class LiteratureSearcher:
 
         return formatted
 
+
 # Async factory function for easy import
-async def create_literature_searcher(email: str = "delphea@example.com") -> LiteratureSearcher:
+async def create_literature_searcher(
+    email: str = "delphea@example.com",
+) -> LiteratureSearcher:
     """Create and initialize a LiteratureSearcher instance"""
     searcher = LiteratureSearcher(email)
     await searcher.__aenter__()
     return searcher
 
+
 # Example usage and testing
 if __name__ == "__main__":
+
     async def test_literature_search():
         async with LiteratureSearcher() as searcher:
             # Test irAKI search
             results = await searcher.search_iraki_literature(
                 query="immune checkpoint inhibitor acute kidney injury",
                 specialty="nephrology",
-                max_results=5
+                max_results=5,
             )
 
             print(f"Found {len(results)} results:")
