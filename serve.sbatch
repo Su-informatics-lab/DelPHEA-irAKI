@@ -1,3 +1,4 @@
+#!/bin/sh
 #SBATCH --job-name=vllm-oss120b
 #SBATCH --partition=nextgen-gpu
 #SBATCH --gres=gpu:h100:2
