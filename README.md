@@ -1,8 +1,7 @@
 # DelPHEA for immune-related AKI (irAKI)
 
 **Del**phi **P**ersonalized **H**ealth **E**xplainable **A**gents for distinguishing immune-related AKI from AKI induced 
-by alternative reasons
-DelPHEA simulates a diverse virtual panel of medical experts conducting a modified Delphi consensus process using 
+by alternative reasons. DelPHEA simulates a diverse virtual panel of medical experts conducting a modified Delphi consensus process using 
 clinical notes and structured data. 
 
 
@@ -124,6 +123,10 @@ DelPHEA-irAKI/
 ### 1. **Installation**
 ```bash
 # clone repository and install dependencies
+uv pip install --pre vllm==0.10.1+gptoss \
+    --extra-index-url https://wheels.vllm.ai/gpt-oss/ \
+    --extra-index-url https://download.pytorch.org/whl/nightly/cu128 \
+    --index-strategy unsafe-best-match
 pip install -r requirements.txt
 
 # ensure AWS vLLM infrastructure is configured
