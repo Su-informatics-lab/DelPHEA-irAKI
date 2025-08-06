@@ -245,7 +245,7 @@ class DebateComment(BaseModel):
     q_id: str
     author: str
     text: str
-    citations: List[str] = Field(default_factory=list)  # Fix mutable default
+    citations: List[str] = Field(default_factory=list)
     satisfied: bool = False
 
 class TerminateDebate(BaseModel):
@@ -303,7 +303,7 @@ def beta_pool_confidence(p_vec: np.ndarray,
     # normalize weights to sum to N for predictable scaling
     w = weight_vec if weight_vec is not None else np.ones_like(p_vec)
 
-    # Fix: Check for zero weights to avoid division by zero
+    # check for zero weights to avoid division by zero
     total_weight = w.sum()
     if total_weight == 0:
         raise ValueError("All expert confidences are zero – cannot pool.")
@@ -825,7 +825,7 @@ def get_config_loader() -> ConfigurationLoader:
     return _config_loader
 
 # =============================================================================
-# MODERATOR AGENT (simplified, focusing on key fixes)
+# MODERATOR
 # =============================================================================
 
 class irAKIModeratorAgent(RoutedAgent):
