@@ -10,6 +10,7 @@ CSV Processing Details:
    - Currently stored as parquet file in 'clinical_notes_version3' directory
    - Loaded using pd.read_parquet() for efficient reading
    - Column names are standardized to uppercase for consistency
+   - OBFUSCATED_GLOBAL_PERSON_ID is converted to int64 to match person table
    - PHYSIOLOGIC_TIME column is converted to datetime format
    - Contains fields: OBFUSCATED_GLOBAL_PERSON_ID, ENCOUNTER_ID, SERVICE_NAME,
      PHYSIOLOGIC_TIME, REPORT_TEXT
@@ -17,7 +18,8 @@ CSV Processing Details:
 
 2. Person Demographics (r6335_person.csv):
    - Standard CSV format with patient demographic information
-   - Loaded using pd.read_csv() with automatic type inference
+   - Loaded using pd.read_csv() with explicit dtype={'person_id': 'int64'}
+   - person_id is set as DataFrame index for O(1) lookup performance
    - Column names are standardized to lowercase for this dataset
    - Contains fields: person_id, year_of_birth, gender_concept_id,
      race_source_value, ethnicity_source_value
@@ -36,8 +38,17 @@ Data Integration:
 -----------------
 - Patient IDs are cross-referenced between clinical notes (OBFUSCATED_GLOBAL_PERSON_ID)
   and person table (person_id) to ensure data completeness
+- Both ID fields are converted to int64 for consistent data types
+- person_df uses person_id as index for efficient lookups
 - Only patients with both clinical notes AND demographics are included in final cohort
+- Missing demographics are tracked and can be investigated via investigate_missing_demographics()
 - Data is cached in memory using dictionary storage for repeated access
+
+Known Issues:
+-------------
+- ~106 patients have clinical notes but no demographics record (completely missing from person table)
+- ~57,300 patients have demographics but no clinical notes (broader hospital population)
+- Future migration from CSV to parquet format is planned for all structured data
 """
 
 import pandas as pd
@@ -166,13 +177,15 @@ class irAKIDataLoader:
         8570: 'Ambiguous'
     }
 
-    def __init__(self, data_dir: str = "irAKI_data", cache_dir: Optional[str] = None):
+    def __init__(self, data_dir: str = "irAKI_data", cache_dir: Optional[str] = None,
+                 run_sanity_check: bool = True):
         """
         Initialize the data loader.
 
         Args:
             data_dir: Path to the data directory
             cache_dir: Optional directory for caching processed data
+            run_sanity_check: Whether to run sanity check on initialization
         """
         self.data_dir = Path(data_dir)
         self.cache_dir = Path(cache_dir) if cache_dir else self.data_dir / '.cache'
@@ -188,6 +201,15 @@ class irAKIDataLoader:
 
         # load data
         self._load_all_data()
+
+        # run sanity check if requested
+        if run_sanity_check:
+            sanity_results = self.sanity_check_patient_ids()
+            if not sanity_results['is_notes_subset_of_person']:
+                logger.warning(
+                    f"⚠️ Sanity check failed: {sanity_results['missing_from_person_count']} "
+                    f"patient IDs from notes are not in person table"
+                )
 
     def _load_all_data(self) -> None:
         """Load all available data files"""
@@ -221,6 +243,11 @@ class irAKIDataLoader:
         # standardize column names to uppercase
         self.clinical_notes_df.columns = [col.upper() for col in self.clinical_notes_df.columns]
 
+        # convert patient ID to int64 to match person table
+        self.clinical_notes_df['OBFUSCATED_GLOBAL_PERSON_ID'] = (
+            self.clinical_notes_df['OBFUSCATED_GLOBAL_PERSON_ID'].astype('int64')
+        )
+
         # convert timestamps
         if 'PHYSIOLOGIC_TIME' in self.clinical_notes_df.columns:
             self.clinical_notes_df['PHYSIOLOGIC_TIME'] = pd.to_datetime(
@@ -238,10 +265,14 @@ class irAKIDataLoader:
             raise FileNotFoundError(f"Person data file not found: {person_path}")
 
         logger.info("Loading person demographics...")
-        self.person_df = pd.read_csv(person_path)
+        # read with explicit dtype for person_id to avoid float64
+        self.person_df = pd.read_csv(person_path, dtype={'person_id': 'int64'})
 
         # standardize column names to lowercase for this dataset
         self.person_df.columns = [col.lower() for col in self.person_df.columns]
+
+        # set person_id as index for efficient lookups
+        self.person_df.set_index('person_id', inplace=True)
 
         logger.info(f"Loaded {len(self.person_df)} person records")
 
@@ -259,19 +290,27 @@ class irAKIDataLoader:
         """Build index of all unique patient IDs"""
         logger.info("Building patient index...")
 
-        # get unique patient IDs from clinical notes
+        # get unique patient IDs from clinical notes (now int64)
         notes_patients = set(self.clinical_notes_df['OBFUSCATED_GLOBAL_PERSON_ID'].unique())
 
-        # get unique patient IDs from person table
-        person_patients = set(self.person_df['person_id'].unique())
+        # get unique patient IDs from person table (from index)
+        person_patients = set(self.person_df.index.unique())
 
         # use intersection to ensure we have both notes and demographics
         self.patient_ids = sorted(list(notes_patients & person_patients))
 
         logger.info(f"Found {len(self.patient_ids)} patients with both notes and demographics")
 
-        if len(notes_patients - person_patients) > 0:
-            logger.warning(f"{len(notes_patients - person_patients)} patients have notes but no demographics")
+        # analyze missing demographics in detail
+        missing_demographics = notes_patients - person_patients
+        if missing_demographics:
+            logger.warning(
+                f"{len(missing_demographics)} patients have notes but no demographics record. "
+                f"These patients are completely missing from person table."
+            )
+            # optionally log first few missing IDs for investigation
+            sample_missing = list(missing_demographics)[:5]
+            logger.debug(f"Sample missing patient IDs: {sample_missing}")
 
         if len(person_patients - notes_patients) > 0:
             logger.warning(f"{len(person_patients - notes_patients)} patients have demographics but no notes")
@@ -286,13 +325,12 @@ class irAKIDataLoader:
         Returns:
             PatientDemographics object or None if not found
         """
-        person_row = self.person_df[self.person_df['person_id'] == person_id]
-
-        if person_row.empty:
+        # use index-based lookup for efficiency
+        if person_id not in self.person_df.index:
             logger.warning(f"No demographics found for patient {person_id}")
             return None
 
-        person = person_row.iloc[0]
+        person = self.person_df.loc[person_id]
 
         # calculate age
         current_year = datetime.now().year
@@ -490,6 +528,238 @@ class irAKIDataLoader:
 
         return sample
 
+    def investigate_missing_demographics(self) -> Dict:
+        """
+        Investigate patients with notes but missing demographics.
+
+        Returns:
+            Dictionary with analysis of missing demographic data
+        """
+        # get patient IDs from both sources
+        notes_patients = set(self.clinical_notes_df['OBFUSCATED_GLOBAL_PERSON_ID'].unique())
+        person_patients = set(self.person_df.index.unique())
+
+        # find missing demographics
+        missing_demographics = notes_patients - person_patients
+
+        if not missing_demographics:
+            return {"status": "No missing demographics found"}
+
+        # analyze notes for patients with missing demographics
+        missing_df = self.clinical_notes_df[
+            self.clinical_notes_df['OBFUSCATED_GLOBAL_PERSON_ID'].isin(missing_demographics)
+        ]
+
+        analysis = {
+            "total_missing": len(missing_demographics),
+            "missing_patient_ids": sorted(list(missing_demographics))[:10],  # first 10
+            "notes_count_for_missing": len(missing_df),
+            "services_for_missing": missing_df['SERVICE_NAME'].value_counts().to_dict(),
+            "date_range_for_missing": {
+                "earliest": missing_df['PHYSIOLOGIC_TIME'].min(),
+                "latest": missing_df['PHYSIOLOGIC_TIME'].max()
+            }
+        }
+
+        return analysis
+
+    def debug_id_mismatch(self, sample_size: int = 5) -> None:
+        """
+        Debug helper to understand ID mismatch issues.
+
+        Args:
+            sample_size: Number of sample IDs to display
+        """
+        print("\n" + "="*60)
+        print("DEBUG: Patient ID Mismatch Analysis")
+        print("="*60)
+
+        # get raw IDs
+        notes_ids = self.clinical_notes_df['OBFUSCATED_GLOBAL_PERSON_ID'].unique()
+        person_ids = self.person_df.index.unique()
+
+        print(f"\nData types:")
+        print(f"  Notes ID dtype: {self.clinical_notes_df['OBFUSCATED_GLOBAL_PERSON_ID'].dtype}")
+        print(f"  Person ID dtype: {self.person_df.index.dtype}")
+
+        print(f"\nCounts:")
+        print(f"  Unique notes patients: {len(notes_ids)}")
+        print(f"  Unique person records: {len(person_ids)}")
+
+        # sample IDs for comparison
+        print(f"\nSample Notes IDs (first {sample_size}):")
+        for i, nid in enumerate(notes_ids[:sample_size]):
+            print(f"  [{i}] Value: {nid}, Type: {type(nid).__name__}, As int: {int(nid)}")
+
+        print(f"\nSample Person IDs (first {sample_size}):")
+        for i, pid in enumerate(person_ids[:sample_size]):
+            print(f"  [{i}] Value: {pid}, Type: {type(pid).__name__}")
+
+        # check for overlap
+        notes_set = set(int(n) for n in notes_ids)
+        person_set = set(int(p) for p in person_ids)
+
+        print(f"\nSet operations (after int conversion):")
+        print(f"  Intersection size: {len(notes_set & person_set)}")
+        print(f"  Notes - Person: {len(notes_set - person_set)}")
+        print(f"  Person - Notes: {len(person_set - notes_set)}")
+
+        # show missing examples
+        missing = notes_set - person_set
+        if missing:
+            print(f"\nExample IDs in notes but not in person (first {sample_size}):")
+            for mid in list(missing)[:sample_size]:
+                print(f"  {mid}")
+
+        print("="*60 + "\n")
+        """
+        Perform comprehensive sanity check on patient ID alignment.
+        
+        Returns:
+            Dictionary with detailed analysis of ID relationships
+        """
+        logger.info("Running patient ID sanity check...")
+
+        # get raw IDs before any processing
+        notes_ids_raw = self.clinical_notes_df['OBFUSCATED_GLOBAL_PERSON_ID'].unique()
+        person_ids_raw = self.person_df.index.unique()
+
+        # convert both to same type for comparison
+        notes_ids_int = set()
+        notes_ids_float = set()
+        conversion_errors = []
+
+        for nid in notes_ids_raw:
+            try:
+                # try to convert to int
+                notes_ids_int.add(int(nid))
+                # also store as float for comparison
+                notes_ids_float.add(float(nid))
+            except (ValueError, TypeError) as e:
+                conversion_errors.append({
+                    'id': str(nid),
+                    'type': type(nid).__name__,
+                    'error': str(e)
+                })
+
+        person_ids_int = set()
+        for pid in person_ids_raw:
+            try:
+                person_ids_int.add(int(pid))
+            except (ValueError, TypeError) as e:
+                conversion_errors.append({
+                    'id': str(pid),
+                    'type': type(pid).__name__,
+                    'error': str(e)
+                })
+
+        # check subset relationships
+        is_subset_int = notes_ids_int.issubset(person_ids_int)
+        is_subset_float = notes_ids_float.issubset(set(float(p) for p in person_ids_int))
+
+        # find differences
+        missing_from_person = notes_ids_int - person_ids_int
+        extra_in_person = person_ids_int - notes_ids_int
+
+        # sample ID analysis
+        sample_notes_ids = list(notes_ids_raw)[:5]
+        sample_person_ids = list(person_ids_raw)[:5]
+
+        sanity_results = {
+            "notes_id_count": len(notes_ids_raw),
+            "person_id_count": len(person_ids_raw),
+            "notes_ids_unique_int": len(notes_ids_int),
+            "person_ids_unique_int": len(person_ids_int),
+            "is_notes_subset_of_person": is_subset_int,
+            "is_notes_subset_of_person_float": is_subset_float,
+            "intersection_count": len(notes_ids_int & person_ids_int),
+            "missing_from_person_count": len(missing_from_person),
+            "extra_in_person_count": len(extra_in_person),
+            "conversion_errors": conversion_errors[:5] if conversion_errors else [],
+            "sample_analysis": {
+                "notes_ids_sample": [
+                    {
+                        "raw": str(nid),
+                        "type": type(nid).__name__,
+                        "as_int": int(nid) if not pd.isna(nid) else None
+                    }
+                    for nid in sample_notes_ids
+                ],
+                "person_ids_sample": [
+                    {
+                        "raw": str(pid),
+                        "type": type(pid).__name__,
+                        "as_int": int(pid)
+                    }
+                    for pid in sample_person_ids
+                ]
+            },
+            "missing_ids_sample": list(missing_from_person)[:10] if missing_from_person else [],
+            "data_type_info": {
+                "notes_id_dtype": str(self.clinical_notes_df['OBFUSCATED_GLOBAL_PERSON_ID'].dtype),
+                "person_id_dtype": str(self.person_df.index.dtype)
+            }
+        }
+
+        # log key findings
+        if is_subset_int:
+            logger.info("✅ PASS: All clinical note patient IDs exist in person table")
+        else:
+            logger.warning(f"⚠️ FAIL: {len(missing_from_person)} patient IDs from notes are missing in person table")
+            logger.warning(f"Sample missing IDs: {list(missing_from_person)[:5]}")
+
+        return sanity_results
+
+    def debug_id_mismatch(self, sample_size: int = 5) -> None:
+        """
+        Debug helper to understand ID mismatch issues.
+
+        Args:
+            sample_size: Number of sample IDs to display
+        """
+        print("\n" + "="*60)
+        print("DEBUG: Patient ID Mismatch Analysis")
+        print("="*60)
+
+        # get raw IDs
+        notes_ids = self.clinical_notes_df['OBFUSCATED_GLOBAL_PERSON_ID'].unique()
+        person_ids = self.person_df.index.unique()
+
+        print(f"\nData types:")
+        print(f"  Notes ID dtype: {self.clinical_notes_df['OBFUSCATED_GLOBAL_PERSON_ID'].dtype}")
+        print(f"  Person ID dtype: {self.person_df.index.dtype}")
+
+        print(f"\nCounts:")
+        print(f"  Unique notes patients: {len(notes_ids)}")
+        print(f"  Unique person records: {len(person_ids)}")
+
+        # sample IDs for comparison
+        print(f"\nSample Notes IDs (first {sample_size}):")
+        for i, nid in enumerate(notes_ids[:sample_size]):
+            print(f"  [{i}] Value: {nid}, Type: {type(nid).__name__}, As int: {int(nid)}")
+
+        print(f"\nSample Person IDs (first {sample_size}):")
+        for i, pid in enumerate(person_ids[:sample_size]):
+            print(f"  [{i}] Value: {pid}, Type: {type(pid).__name__}")
+
+        # check for overlap
+        notes_set = set(int(n) for n in notes_ids)
+        person_set = set(int(p) for p in person_ids)
+
+        print(f"\nSet operations (after int conversion):")
+        print(f"  Intersection size: {len(notes_set & person_set)}")
+        print(f"  Notes - Person: {len(notes_set - person_set)}")
+        print(f"  Person - Notes: {len(person_set - notes_set)}")
+
+        # show missing examples
+        missing = notes_set - person_set
+        if missing:
+            print(f"\nExample IDs in notes but not in person (first {sample_size}):")
+            for mid in list(missing)[:sample_size]:
+                print(f"  {mid}")
+
+        print("="*60 + "\n")
+
 
 def main():
     """Main execution function for standalone testing"""
@@ -498,28 +768,50 @@ def main():
     print("=" * 80)
 
     try:
-        # initialize loader
+        # initialize loader (sanity check runs automatically)
         print("\n📁 Initializing data loader...")
-        loader = irAKIDataLoader(data_dir="irAKI_data")
+        loader = irAKIDataLoader(data_dir="irAKI_data", run_sanity_check=True)
+
+        # run detailed sanity check
+        print("\n🔍 Running detailed patient ID sanity check...")
+        sanity_results = loader.sanity_check_patient_ids()
+        print(f"Notes patients: {sanity_results['notes_id_count']}")
+        print(f"Person table patients: {sanity_results['person_id_count']}")
+        print(f"Is notes subset of person? {sanity_results['is_notes_subset_of_person']}")
+        print(f"Intersection count: {sanity_results['intersection_count']}")
+        print(f"Missing from person table: {sanity_results['missing_from_person_count']}")
+
+        if sanity_results['missing_from_person_count'] > 0:
+            print(f"Sample missing IDs: {sanity_results['missing_ids_sample'][:5]}")
+
+            # optionally run debug analysis
+            print("\n🐛 Running debug analysis...")
+            loader.debug_id_mismatch(sample_size=3)
 
         # get sample output
         print("\n📊 Loading sample patient data...")
         sample = loader.get_sample_output()
 
-        # display results
-        print("\n✅ Sample Output:")
+        # display results (abbreviated)
+        print("\n✅ Sample Output Summary:")
         print("-" * 40)
-        print(json.dumps(sample, indent=2, default=str))
+        print(f"Patient ID: {sample['patient_summary']['person_id']}")
+        print(f"Age: {sample['demographics']['age']}")
+        print(f"Gender: {sample['demographics']['gender']}")
+        print(f"Total Notes: {sample['total_notes']}")
+        print(f"Date Range: {sample['patient_summary']['date_range']['days_span']} days")
+        print(f"Data Completeness: {sample['patient_summary']['data_completeness']}")
 
-        # show available patients
+        # show available patients (now properly typed as int64)
         print(f"\n📈 Total patients available: {len(loader.patient_ids)}")
         print(f"First 5 patient IDs: {loader.patient_ids[:5]}")
 
-        # export first patient (optional)
-        if loader.patient_ids:
-            print("\n💾 Exporting first patient data...")
-            export_path = loader.export_patient_data(loader.patient_ids[0])
-            print(f"Exported to: {export_path}")
+        # export sanity check results
+        sanity_file = Path("exported_data") / "sanity_check_results.json"
+        sanity_file.parent.mkdir(exist_ok=True)
+        with open(sanity_file, 'w') as f:
+            json.dump(sanity_results, f, indent=2, default=str)
+        print(f"\n📄 Sanity check results exported to: {sanity_file}")
 
         print("\n✨ Data loader test completed successfully!")
 
