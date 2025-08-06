@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/bash
 #SBATCH --job-name=vllm-oss120b
 #SBATCH --partition=nextgen-gpu
 #SBATCH --gres=gpu:h100:2
@@ -9,6 +9,9 @@
 #SBATCH --error=logs/%j.err
 #SBATCH --mail-user=haining.wang@montana.edu
 #SBATCH --mail-type=BEGIN,END,FAIL
+
+# ignore anything in ~/.local/lib/python…/site-packages
+export PYTHONNOUSERSITE=1
 
 module restore py312
 source .venv-py312/bin/activate
