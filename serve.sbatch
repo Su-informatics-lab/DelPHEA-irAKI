@@ -36,8 +36,8 @@ apptainer exec --nv \
   --bind "$HF_HOME":/root/.cache/huggingface \
   --bind /mnt/shared/moduleapps/eb/CUDA/12.3.0:/mnt/shared/moduleapps/eb/CUDA/12.3.0 \
   --bind "$JOB_SCRATCH":/tmp \
-  --env CUDA_HOME \
-  --env PATH \
+  --env CUDA_HOME="$CUDA_HOME" \
+  --env PATH="$PATH" \
   "$IMG_FILE" \
   python3 -m vllm.entrypoints.openai.api_server \
     --model openai/gpt-oss-120b \
