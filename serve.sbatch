@@ -10,9 +10,8 @@
 #SBATCH --mail-user=haining.wang@montana.edu
 #SBATCH --mail-type=BEGIN,END,FAIL
 
-module load cuda/12.3.0
-module load Python/3.10.8-GCCcore-12.2.0
-source .venv/bin/activate
+module restore py312
+source .venv-py312/bin/activate
 
 python -m vllm.entrypoints.openai.api_server \
        --model openai/gpt-oss-120b \
