@@ -528,6 +528,105 @@ class irAKIDataLoader:
 
         return sample
 
+    def sanity_check_patient_ids(self) -> Dict:
+        """
+        Perform comprehensive sanity check on patient ID alignment.
+
+        Returns:
+            Dictionary with detailed analysis of ID relationships
+        """
+        logger.info("Running patient ID sanity check...")
+
+        # get raw IDs before any processing
+        notes_ids_raw = self.clinical_notes_df['OBFUSCATED_GLOBAL_PERSON_ID'].unique()
+        person_ids_raw = self.person_df.index.unique()
+
+        # convert both to same type for comparison
+        notes_ids_int = set()
+        notes_ids_float = set()
+        conversion_errors = []
+
+        for nid in notes_ids_raw:
+            try:
+                # try to convert to int
+                notes_ids_int.add(int(nid))
+                # also store as float for comparison
+                notes_ids_float.add(float(nid))
+            except (ValueError, TypeError) as e:
+                conversion_errors.append({
+                    'id': str(nid),
+                    'type': type(nid).__name__,
+                    'error': str(e)
+                })
+
+        person_ids_int = set()
+        for pid in person_ids_raw:
+            try:
+                person_ids_int.add(int(pid))
+            except (ValueError, TypeError) as e:
+                conversion_errors.append({
+                    'id': str(pid),
+                    'type': type(pid).__name__,
+                    'error': str(e)
+                })
+
+        # check subset relationships
+        is_subset_int = notes_ids_int.issubset(person_ids_int)
+        is_subset_float = notes_ids_float.issubset(set(float(p) for p in person_ids_int))
+
+        # find differences
+        missing_from_person = notes_ids_int - person_ids_int
+        extra_in_person = person_ids_int - notes_ids_int
+
+        # sample ID analysis
+        sample_notes_ids = list(notes_ids_raw)[:5]
+        sample_person_ids = list(person_ids_raw)[:5]
+
+        sanity_results = {
+            "notes_id_count": len(notes_ids_raw),
+            "person_id_count": len(person_ids_raw),
+            "notes_ids_unique_int": len(notes_ids_int),
+            "person_ids_unique_int": len(person_ids_int),
+            "is_notes_subset_of_person": is_subset_int,
+            "is_notes_subset_of_person_float": is_subset_float,
+            "intersection_count": len(notes_ids_int & person_ids_int),
+            "missing_from_person_count": len(missing_from_person),
+            "extra_in_person_count": len(extra_in_person),
+            "conversion_errors": conversion_errors[:5] if conversion_errors else [],
+            "sample_analysis": {
+                "notes_ids_sample": [
+                    {
+                        "raw": str(nid),
+                        "type": type(nid).__name__,
+                        "as_int": int(nid) if not pd.isna(nid) else None
+                    }
+                    for nid in sample_notes_ids
+                ],
+                "person_ids_sample": [
+                    {
+                        "raw": str(pid),
+                        "type": type(pid).__name__,
+                        "as_int": int(pid)
+                    }
+                    for pid in sample_person_ids
+                ]
+            },
+            "missing_ids_sample": list(missing_from_person)[:10] if missing_from_person else [],
+            "data_type_info": {
+                "notes_id_dtype": str(self.clinical_notes_df['OBFUSCATED_GLOBAL_PERSON_ID'].dtype),
+                "person_id_dtype": str(self.person_df.index.dtype)
+            }
+        }
+
+        # log key findings
+        if is_subset_int:
+            logger.info("✅ PASS: All clinical note patient IDs exist in person table")
+        else:
+            logger.warning(f"⚠️ FAIL: {len(missing_from_person)} patient IDs from notes are missing in person table")
+            logger.warning(f"Sample missing IDs: {list(missing_from_person)[:5]}")
+
+        return sanity_results
+
     def investigate_missing_demographics(self) -> Dict:
         """
         Investigate patients with notes but missing demographics.
