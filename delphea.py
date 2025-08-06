@@ -151,7 +151,7 @@ class DelPHEAirAKIConfig:
     # inference parameters
     temperature: float = 0.7
     top_p: float = 0.9
-    max_tokens: int = 3072  # fixme: to increase
+    max_tokens: int = 16384
     timeout: float = 120.0
 
     # Delphi process configuration
