@@ -31,6 +31,7 @@ export PATH=$CUDA_HOME/bin:$PATH
 # export FLASHINFER_DISABLE_JIT=1  # only for debug
 
 # launch vLLM inside Apptainer container
+export TENSOR_PARALLEL=${SLURM_JOB_GPUS_PER_NODE:-2}
 apptainer exec --nv \
   --bind "$HF_HOME":/root/.cache/huggingface \
   --bind /mnt/shared/moduleapps/eb/CUDA/12.3.0:/mnt/shared/moduleapps/eb/CUDA/12.3.0 \
@@ -40,6 +41,6 @@ apptainer exec --nv \
   "$IMG_FILE" \
   python3 -m vllm.entrypoints.openai.api_server \
     --model openai/gpt-oss-120b \
-    --tensor-parallel-size "$SLURM_GPUS" \
+    --tensor-parallel-size "$TENSOR_PARALLEL" \
     --gpu-memory-utilization 0.90 \
     --host 0.0.0.0 --port 8000
