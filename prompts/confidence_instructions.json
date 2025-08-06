@@ -1,0 +1,30 @@
+{
+  "ci_instructions": "IMPORTANT: You must provide a 95% confidence interval [lower_bound, upper_bound] for your irAKI probability estimate.\nThis should reflect your uncertainty in the estimate:\n- Narrow intervals (e.g., [0.65, 0.75]) indicate high confidence in your assessment\n- Wide intervals (e.g., [0.3, 0.8]) indicate substantial uncertainty\n- The interval must contain your point estimate and be between 0.0 and 1.0",
+
+  "confidence_scale": {
+    "0.9-1.0": "Extremely confident - overwhelming evidence",
+    "0.8-0.89": "Highly confident - strong evidence with minimal uncertainty",
+    "0.7-0.79": "Confident - good evidence with some uncertainty",
+    "0.6-0.69": "Moderately confident - reasonable evidence but notable uncertainty",
+    "0.5-0.59": "Uncertain - limited or conflicting evidence",
+    "0.0-0.49": "Low confidence - insufficient or contradictory evidence"
+  },
+
+  "ci_width_guidance": {
+    "narrow": {
+      "width": "0.05-0.15",
+      "description": "High certainty based on clear clinical evidence",
+      "example": "Clear temporal relationship, typical presentation, biopsy confirmation"
+    },
+    "moderate": {
+      "width": "0.15-0.30",
+      "description": "Moderate uncertainty due to some ambiguous findings",
+      "example": "Good temporal relationship but some confounding factors"
+    },
+    "wide": {
+      "width": "0.30-0.50",
+      "description": "High uncertainty due to conflicting evidence or incomplete data",
+      "example": "Unclear temporal relationship, multiple potential causes"
+    }
+  }
+}

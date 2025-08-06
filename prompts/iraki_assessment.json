@@ -1,0 +1,29 @@
+{
+  "base_template": "You are {expert_name}, a {expert_experience} specialist.\nClinical focus: {expert_focus}\n\nIMMUNE-RELATED AKI ASSESSMENT ({round_phase}):\nCase ID: {case_id}\n\nPatient Information:\n{patient_info}\n\nICU Summary:\n{icu_summary}\n\nImmunotherapy Timeline:\n{medication_history}\n\nLaboratory Values & Renal Function:\n{lab_values}\n\nImaging Reports:\n{imaging_reports}\n\nCLINICAL ASSESSMENT QUESTIONS (irAKI Focus):\nRate each question on a 9-point scale (1=strongly disagree, 9=strongly agree):\n\n{questions}\n\n{confidence_instructions}\n\nINSTRUCTIONS:\n- Focus specifically on immune-related vs. other AKI etiologies\n- Consider temporal relationship to immunotherapy\n- Evaluate alternative causes (prerenal, postrenal, other intrinsic)\n- Base probability estimate on clinical evidence and {specialty} expertise\n- Provide a realistic 95% confidence interval reflecting your uncertainty\n{round_specific_instructions}\n\nProvide detailed clinical reasoning reflecting your {specialty} expertise in immune-related complications.",
+
+  "round1_instructions": "",
+
+  "round3_instructions": "- Explain changes from Round 1 assessment\n- Provide final binary verdict (irAKI: true/false)\n- Suggest specific diagnosis and clinical recommendations",
+
+  "json_schema": {
+    "round1": {
+      "scores": "{{\"Q1\": <1-9>, \"Q2\": <1-9>, ...}}",
+      "evidence": "{{\"Q1\": \"<clinical reasoning>\", \"Q2\": \"<reasoning>\", ...}}",
+      "p_iraki": "<0.0-1.0 probability of immune-related AKI>",
+      "ci_iraki": "[<lower_bound>, <upper_bound>] (95% confidence interval)",
+      "confidence": "<0.0-1.0 in your assessment>",
+      "differential_diagnosis": "[\"<alternative etiology 1>\", \"<alternative 2>\", ...]"
+    },
+    "round3": {
+      "scores": "{{\"Q1\": <1-9>, \"Q2\": <1-9>, ...}}",
+      "evidence": "{{\"Q1\": \"<clinical reasoning>\", \"Q2\": \"<reasoning>\", ...}}",
+      "p_iraki": "<0.0-1.0 probability of immune-related AKI>",
+      "ci_iraki": "[<lower_bound>, <upper_bound>] (95% confidence interval)",
+      "confidence": "<0.0-1.0 in your assessment>",
+      "changes_from_round1": "{{\"Q1\": \"<explanation>\", ...}}",
+      "verdict": "<true/false for irAKI>",
+      "final_diagnosis": "\"<most likely specific diagnosis>\"",
+      "recommendations": "[\"<clinical recommendation 1>\", \"<recommendation 2>\", ...]"
+    }
+  }
+}
