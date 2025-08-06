@@ -12,10 +12,10 @@ export HF_HOME=$HOME/hf-cache
 export IMG_DIR=$HOME/containers
 
 apptainer exec --nv \
-  --bind "$HF_HOME":/root/.cache/huggingface \
-  "$IMG_DIR/vllm-gptoss.sif" \
-  python -m vllm.entrypoints.openai.api_server \
-      --model openai/gpt-oss-120b \
-      --tensor-parallel-size 2 \
-      --gpu-memory-utilization 0.90 \
-      --host 0.0.0.0 --port 8000
+  --bind "${HOME}/hf-cache":/root/.cache/huggingface \
+  "${HOME}/containers/vllm-gptoss.sif" \
+  python3 -m vllm.entrypoints.openai.api_server \
+    --model openai/gpt-oss-120b \
+    --tensor-parallel-size 2 \
+    --gpu-memory-utilization 0.90 \
+    --host 0.0.0.0 --port 8000
