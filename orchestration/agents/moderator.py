@@ -8,16 +8,16 @@ Architecture:
 ------------
     Moderator (this module)
          │
-    ┌────┼──────┐
-    ▼    ▼      ▼
+    ┌────┼────┐
+    ▼    ▼    ▼
   Round1 Round2 Round3
     │     │     │
     │  Debates  │
     │     │     │
     └─────┴─────┘
-          │
-     Beta Pooling
-      Consensus
+         │
+    Beta Pooling
+    Consensus
 
 Delphi Process Flow:
 -------------------
@@ -249,7 +249,7 @@ class irAKIModeratorAgent(RoutedAgent):
         await self._run_round3()
 
     def _identify_conflicts(self) -> Dict[str, Dict]:
-        """Identify questions with significant disagreement.
+        """Identify questions with significant disagreement using category method.
 
         Returns:
             Dict mapping question IDs to conflict information
@@ -272,9 +272,51 @@ class irAKIModeratorAgent(RoutedAgent):
             if len(scores) < 2:
                 continue
 
-            # check if conflict threshold exceeded
-            score_range = max(scores) - min(scores)
-            if score_range >= self._delphi_config.conflict_threshold:
+            # use category-based conflict detection (more scientific for 9-point Likert)
+            # LOW: 1-3 (unlikely irAKI), NEUTRAL: 4-6 (uncertain), HIGH: 7-9 (likely irAKI)
+            low_scores = [s for s in scores if s <= 3]
+            neutral_scores = [s for s in scores if 4 <= s <= 6]
+            high_scores = [s for s in scores if s >= 7]
+
+            # trigger debate if experts are in opposite camps (low vs high)
+            has_conflict = False
+            conflict_severity = "moderate"
+
+            if low_scores and high_scores:
+                # clear disagreement: some think unlikely, others think likely
+                has_conflict = True
+                if len(low_scores) >= 2 and len(high_scores) >= 2:
+                    # multiple experts in each camp = severe conflict
+                    conflict_severity = "severe"
+            elif (
+                len(
+                    set(
+                        [s <= 3 for s in scores]
+                        + [4 <= s <= 6 for s in scores]
+                        + [s >= 7 for s in scores]
+                    )
+                )
+                >= 3
+            ):
+                # experts spread across all three categories
+                has_conflict = True
+                conflict_severity = "moderate"
+
+            # alternative: use standard deviation method if configured
+            if hasattr(self._delphi_config, "conflict_method"):
+                if self._delphi_config.conflict_method == "std":
+                    std_dev = np.std(scores)
+                    has_conflict = (
+                        std_dev > 2.0
+                    )  # >2 SD indicates significant disagreement
+                    conflict_severity = "severe" if std_dev > 2.5 else "moderate"
+                elif self._delphi_config.conflict_method == "range":
+                    # fallback to simple range method
+                    score_range = max(scores) - min(scores)
+                    has_conflict = score_range >= self._delphi_config.conflict_threshold
+                    conflict_severity = "severe" if score_range >= 5 else "moderate"
+
+            if has_conflict:
                 # collect evidence from conflicting experts
                 conflicting_evidence = {}
                 for reply in self._round1_replies:
@@ -285,12 +327,17 @@ class irAKIModeratorAgent(RoutedAgent):
                     "question": question,
                     "score_distribution": score_by_expert,
                     "score_range": f"{min(scores)}-{max(scores)}",
-                    "conflict_severity": "severe" if score_range >= 5 else "moderate",
+                    "conflict_severity": conflict_severity,
                     "conflicting_evidence": conflicting_evidence,
                     "clinical_importance": question.get("clinical_context", {}).get(
                         "importance",
                         "Assessment of this factor is important for irAKI diagnosis",
                     ),
+                    "category_distribution": {
+                        "low": len(low_scores),
+                        "neutral": len(neutral_scores),
+                        "high": len(high_scores),
+                    },
                 }
 
         return conflicts
