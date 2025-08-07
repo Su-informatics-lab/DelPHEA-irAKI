@@ -160,6 +160,18 @@ class DataLoader:
 
         Returns raw clinical notes and demographics for expert agents to analyze.
         """
+        # validate case ID format first
+        if not case_id.startswith("iraki_case_"):
+            raise ValueError(f"Invalid case ID format: {case_id}")
+
+        try:
+            person_id = int(case_id.replace("iraki_case_", ""))
+        except ValueError:
+            raise ValueError(
+                f"Invalid case ID: {case_id} - must contain a valid integer"
+            )
+
+        # handle dummy mode
         if self.use_dummy:
             if case_id != "iraki_case_001":
                 raise ValueError(
@@ -167,15 +179,6 @@ class DataLoader:
                     f"Only 'iraki_case_001' is available in dummy mode."
                 )
             return self._get_dummy_patient()
-
-        # validate and extract person_id from case_id
-        if not case_id.startswith("iraki_case_"):
-            raise ValueError(f"Invalid case ID format: {case_id}")
-
-        try:
-            person_id = int(case_id.replace("iraki_case_", ""))
-        except ValueError:
-            raise ValueError(f"Invalid case ID: {case_id}")
 
         # check cache first
         if person_id in self._patient_cache:
