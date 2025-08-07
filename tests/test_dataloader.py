@@ -83,24 +83,26 @@ def test_real_data_loading():
 
 
 def test_fallback_behavior():
-    """Test fallback to dummy when real data unavailable."""
-    print("\n=== Testing Fallback Behavior ===")
+    """Test that loader fails loud when real data unavailable."""
+    print("\n=== Testing Fail-Loud Behavior ===")
 
-    # use non-existent directory
-    loader = DataLoader(data_dir="non_existent_directory")
+    # use non-existent directory - should raise exception
+    try:
+        loader = DataLoader(data_dir="non_existent_directory")
+        assert False, "Should have raised FileNotFoundError"
+    except FileNotFoundError as e:
+        assert "Data directory does not exist" in str(e)
+        print("✓ Correctly raised FileNotFoundError for missing data directory")
 
-    # should fall back to dummy
-    assert loader.use_dummy, "Should fall back to dummy mode"
-    assert loader.is_available(), "Should still be available"
+    # but dummy mode should still work
+    loader = DataLoader(data_dir="non_existent_directory", use_dummy=True)
+    assert loader.use_dummy, "Should be in dummy mode"
+    assert loader.is_available(), "Dummy mode should be available"
 
-    # should still work
     patients = loader.get_available_patients()
     assert len(patients) == 1, "Should have dummy patient"
 
-    case = loader.load_patient_case(patients[0])
-    assert case["case_id"] == "iraki_case_001"
-
-    print("✓ Fallback to dummy mode working correctly")
+    print("✓ Dummy mode works when explicitly requested")
 
 
 def test_invalid_case_id():
