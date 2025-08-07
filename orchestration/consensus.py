@@ -18,7 +18,7 @@ conjugate beta distribution approach, weighted by expert confidence.
     │ p₁, CI₁, w₁ │             │ α = α₀ + Σ(wᵢαᵢ) │
     │ p₂, CI₂, w₂ │  ────────>  │ β = β₀ + Σ(wᵢβᵢ) │
     │     ...     │             │ αᵢ from CI width │
-    │ pₙ, CIₙ, wₙ  │             │ βᵢ from CI width │
+    │ pₙ, CIₙ, wₙ │              │ βᵢ from CI width │
     └─────────────┘             └──────────────────┘
           │                              ▼
           │                     ┌───────────────────┐
@@ -109,15 +109,10 @@ def beta_pool_confidence(
         >>> result = beta_pool_confidence(p_vec, ci_mat, weights)
         >>> print(f"Consensus P(irAKI): {result['pooled_mean']:.3f}")
     """
-    # ========================================================================
-    # INPUT VALIDATION - FAIL LOUDLY PER NATURE MEDICINE STANDARDS
-    # ========================================================================
-
-    # check for empty input
+    # validation - fail loudly per nature medicine standards
     if p_vec.size == 0:
         raise ValueError("Cannot compute consensus from empty expert assessments")
 
-    # validate array dimensions
     if p_vec.ndim != 1:
         raise ValueError(f"p_vec must be 1-dimensional, got shape {p_vec.shape}")
 
@@ -130,7 +125,7 @@ def beta_pool_confidence(
             f"ci_mat has {ci_mat.shape[0]} experts"
         )
 
-    # validate probability bounds - FAIL LOUD, NO AUTO-CORRECTION
+    # validate probability bounds
     if np.any((p_vec < 0) | (p_vec > 1)):
         invalid_idx = np.where((p_vec < 0) | (p_vec > 1))[0]
         invalid_vals = p_vec[invalid_idx]
@@ -139,7 +134,7 @@ def beta_pool_confidence(
             f"All probabilities must be in [0,1]."
         )
 
-    # validate CI bounds
+    # validate ci bounds
     lo = ci_mat[:, 0]
     hi = ci_mat[:, 1]
 
@@ -149,7 +144,6 @@ def beta_pool_confidence(
             f"Got lower bounds: {lo}, upper bounds: {hi}"
         )
 
-    # check CI ordering - FAIL LOUD, NO AUTO-CORRECTION
     if np.any(lo > hi):
         invalid_idx = np.where(lo > hi)[0]
         raise ValueError(
@@ -158,7 +152,7 @@ def beta_pool_confidence(
             f"Got intervals: {[list(ci_mat[i]) for i in invalid_idx]}"
         )
 
-    # validate weights if provided - FAIL LOUD
+    # validate weights if provided
     if weight_vec is not None:
         if weight_vec.shape != p_vec.shape:
             raise ValueError(
@@ -173,43 +167,27 @@ def beta_pool_confidence(
                 f"{list(weight_vec[invalid_idx])}. All weights must be non-negative."
             )
 
-        # check for zero total weight
         if np.sum(weight_vec) == 0:
             raise ValueError("Cannot compute consensus: all expert weights sum to zero")
 
         w = weight_vec
     else:
-        # uniform weights if not provided
         w = np.ones_like(p_vec)
         logger.debug("Using uniform weights for all experts")
 
-    # ========================================================================
-    # BETA POOLING COMPUTATION
-    # ========================================================================
-
-    # normalize weights to sum to 1 for interpretability
+    # normalize weights to sum to 1
     w_normalized = w / np.sum(w)
 
-    # compute strength parameters from CI widths
-    # tighter CI = higher strength/precision
+    # compute strength parameters from ci widths
     ci_widths = hi - lo
+    ci_widths = np.maximum(ci_widths, 1e-4)  # guard against division by zero
 
-    # avoid division by zero for point estimates (CI width = 0)
-    min_width = 1e-4  # CHANGED: use smaller guard to not inflate narrow CIs
-    ci_widths = np.maximum(ci_widths, min_width)
+    # base strength inversely proportional to ci width squared
+    strengths = np.clip(1.0 / (ci_widths**2), 2.0, 150.0)
 
-    # strength inversely proportional to CI width
-    # use quadratic relationship for more sensitivity
-    strengths = 1.0 / (ci_widths**2)
-
-    # CHANGED: clip strengths to reasonable range instead of rescaling
-    # this preserves the natural high precision when experts have tight CIs
-    strengths = np.clip(strengths, 2.0, 150.0)
-
-    # NEW: detect disagreement patterns for adaptive prior
+    # detect disagreement patterns
     var_between = np.var(p_vec)
 
-    # check for bimodal distribution (some experts high, some low)
     high_group = p_vec[p_vec > 0.65]
     low_group = p_vec[p_vec < 0.35]
     is_bimodal = (
@@ -218,15 +196,23 @@ def beta_pool_confidence(
         and len(high_group) + len(low_group) >= len(p_vec) * 0.6
     )
 
-    # NEW: detect outliers using IQR method
+    # variance-dependent information discount to handle disagreement
+    k = 8.0  # tuning parameter for how quickly strength drops with variance
+    discount = 1.0 / (1.0 + k * var_between)
+    strengths *= discount
+
+    # additional damping for bimodal distributions
+    if is_bimodal:
+        strengths *= 0.7
+
+    # detect outliers using iqr method
     outlier_mask = np.zeros_like(p_vec, dtype=bool)
     if len(p_vec) > 3:
         q1 = np.percentile(p_vec, 25)
         q3 = np.percentile(p_vec, 75)
         iqr = q3 - q1
-        if iqr > 0.05:  # only detect outliers if there's meaningful spread
+        if iqr > 0.05:
             outlier_mask = (p_vec < q1 - 1.5 * iqr) | (p_vec > q3 + 1.5 * iqr)
-            # reduce non-outlier strengths to preserve outlier influence
             if np.any(outlier_mask):
                 strengths[~outlier_mask] *= 0.7
 
@@ -234,14 +220,12 @@ def beta_pool_confidence(
     alpha_experts = p_vec * strengths
     beta_experts = (1.0 - p_vec) * strengths
 
-    # CHANGED: adaptive prior based on disagreement level
-    # stronger prior pulls toward 0.5 when experts disagree
+    # adaptive prior: stronger when disagreement exists
     if is_bimodal or var_between > 0.1:
         prior_alpha = 2.0
         prior_beta = 2.0
     else:
-        # Jeffrey's prior for agreement cases
-        prior_alpha = 0.5
+        prior_alpha = 0.5  # jeffrey's prior
         prior_beta = 0.5
 
     # posterior parameters
@@ -252,44 +236,34 @@ def beta_pool_confidence(
     post_mean = a_post / (a_post + b_post)
     post_ci_95 = beta.ppf([0.025, 0.975], a_post, b_post)
 
-    # ========================================================================
-    # CONFIDENCE ESTIMATION
-    # ========================================================================
-
-    # mean half-width of expert CIs
+    # confidence estimation
     mean_halfwidth = np.mean(ci_widths / 2)
 
-    # CHANGED: more conservative between-expert agreement score
-    if var_between < 0.01:  # very high agreement
+    # between-expert agreement score
+    if var_between < 0.01:
         between_score = 0.95
-    elif var_between < 0.05:  # moderate agreement
-        between_score = 0.7 - 3.5 * var_between  # CHANGED: drops faster
-    else:  # significant disagreement - use exponential decay
+    elif var_between < 0.05:
+        between_score = 0.7 - 3.5 * var_between
+    else:
         between_score = max(0.1, np.exp(-5.0 * var_between))
 
-    # CHANGED: adjusted within-expert certainty score scaling
-    # use 0.3 instead of 0.5 for tighter scaling
+    # within-expert certainty score
     within_score = 1.0 - min(mean_halfwidth / 0.3, 1.0)
 
     # overall confidence: harmonic mean of agreement and certainty
-    # harmonic mean penalizes if either component is low
     if between_score > 0 and within_score > 0:
         consensus_conf = 2.0 / (1.0 / between_score + 1.0 / within_score)
     else:
         consensus_conf = 0.0
 
-    # CHANGED: adjust confidence for specific scenarios
+    # adjust confidence for specific scenarios
     if len(p_vec) == 1:
-        # single expert: confidence based only on their CI width
-        consensus_conf = within_score * 0.5  # reduce confidence for single expert
+        consensus_conf = within_score * 0.5
     elif is_bimodal:
-        # bimodal distribution: cap confidence at 0.4
         consensus_conf = min(0.4, consensus_conf)
     elif np.any(outlier_mask) and len(p_vec) > 3:
-        # outliers present: apply penalty
         consensus_conf *= 0.8
     elif np.all(p_vec == p_vec[0]) and np.all(ci_widths < 0.1):
-        # perfect agreement with narrow CIs: very high confidence
         consensus_conf = 0.95
 
     logger.info(
@@ -331,7 +305,7 @@ def compute_binary_verdict(
     lower, upper = pooled_ci
 
     if require_ci_agreement:
-        # strict criterion: entire CI must agree
+        # strict criterion: entire ci must agree
         if upper < threshold:
             return (
                 False,
@@ -343,7 +317,7 @@ def compute_binary_verdict(
                 f"Strong consensus for irAKI (CI [{lower:.3f}, {upper:.3f}] > {threshold})",
             )
         else:
-            # CI straddles threshold - use mean but note uncertainty
+            # ci straddles threshold - use mean but note uncertainty
             is_iraki = pooled_mean >= threshold
             return (
                 is_iraki,
