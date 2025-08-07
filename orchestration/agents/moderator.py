@@ -8,16 +8,16 @@ Architecture:
 ------------
     Moderator (this module)
          │
-    ┌────┼────┐
-    ▼    ▼    ▼
+    ┌────┼──────┐
+    ▼    ▼      ▼
   Round1 Round2 Round3
     │     │     │
     │  Debates  │
     │     │     │
     └─────┴─────┘
-         │
-    Beta Pooling
-    Consensus
+          │
+     Beta Pooling
+      Consensus
 
 Delphi Process Flow:
 -------------------
