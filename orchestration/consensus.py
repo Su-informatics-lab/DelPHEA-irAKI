@@ -15,16 +15,16 @@ conjugate beta distribution approach, weighted by expert confidence.
 
     Expert Inputs:               Beta Distribution:
     ┌─────────────┐             ┌──────────────────┐
-    │ p₁, CI₁, w₁ │             │ α = 1 + Σ(wᵢpᵢ) │
-    │ p₂, CI₂, w₂ │  ────────>  │ β = 1 + Σ(wᵢqᵢ) │
+    │ p₁, CI₁, w₁ │             │ α = 1 + Σ(wᵢpᵢ)  │
+    │ p₂, CI₂, w₂ │  ────────>  │ β = 1 + Σ(wᵢqᵢ)  │
     │     ...     │             │   where qᵢ=1-pᵢ  │
-    │ pₙ, CIₙ, wₙ │             └──────────────────┘
+    │ pₙ, CIₙ, wₙ  │              └──────────────────┘
     └─────────────┘                      │
           │                              ▼
-          │                     ┌─────────────────┐
+          │                     ┌───────────────────┐
           ▼                     │ P(irAKI) = α/(α+β)│
-    ┌──────────────┐            │ 95% CI from beta │
-    │ Confidence   │            └─────────────────┘
+    ┌──────────────┐            │ 95% CI from beta  │
+    │ Confidence   │            └───────────────────┘
     │ Estimation   │
     └──────────────┘
           │
