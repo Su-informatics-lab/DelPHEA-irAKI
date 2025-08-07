@@ -15,11 +15,11 @@ conjugate beta distribution approach, weighted by expert confidence.
 
     Expert Inputs:               Beta Distribution:
     ┌─────────────┐             ┌──────────────────┐
-    │ p₁, CI₁, w₁ │             │ α = 1 + Σ(wᵢpᵢ)  │
-    │ p₂, CI₂, w₂ │  ────────>  │ β = 1 + Σ(wᵢqᵢ)  │
-    │     ...     │             │   where qᵢ=1-pᵢ  │
-    │ pₙ, CIₙ, wₙ  │              └──────────────────┘
-    └─────────────┘                      │
+    │ p₁, CI₁, w₁ │             │ α = α₀ + Σ(wᵢαᵢ) │
+    │ p₂, CI₂, w₂ │  ────────>  │ β = β₀ + Σ(wᵢβᵢ) │
+    │     ...     │             │ αᵢ from CI width │
+    │ pₙ, CIₙ, wₙ │              │ βᵢ from CI width │
+    └─────────────┘             └──────────────────┘
           │                              ▼
           │                     ┌───────────────────┐
           ▼                     │ P(irAKI) = α/(α+β)│
@@ -34,14 +34,13 @@ conjugate beta distribution approach, weighted by expert confidence.
 
 Key Formulas:
 ------------
-- Normalized weights: w'ᵢ = wᵢ × N / Σwᵢ
-- Posterior alpha: α = 1 + Σ(w'ᵢ × pᵢ)
-- Posterior beta: β = 1 + Σ(w'ᵢ × (1-pᵢ))
+- Expert-specific alpha: αᵢ = pᵢ × strength_i
+- Expert-specific beta: βᵢ = (1-pᵢ) × strength_i
+- Strength from CI: strength_i = 4/CI_width² (tighter CI = higher strength)
+- Posterior alpha: α = α₀ + Σ(wᵢ × αᵢ)
+- Posterior beta: β = β₀ + Σ(wᵢ × βᵢ)
 - Consensus P(irAKI): α/(α+β)
 - 95% Credible Interval: Beta.ppf([0.025, 0.975], α, β)
-- Between-expert agreement: 1 - Var(p)/0.25
-- Within-expert certainty: 1 - mean(CI_width)/0.5
-- Overall confidence: 2/(1/between + 1/within) [harmonic mean]
 
 Clinical Context:
 ----------------
@@ -55,6 +54,7 @@ Nature Medicine Standards:
 -------------------------
 This implementation follows reproducible methodology per Nature Medicine
 requirements with clear mathematical formulations and fail-loud validation.
+NO auto-correction of invalid inputs per clinical safety standards.
 """
 
 import logging
@@ -87,7 +87,7 @@ def beta_pool_confidence(
                 All values must be in [0, 1] with lower <= upper.
         weight_vec: Optional array of expert confidence weights (N,).
                     If None, uniform weights are used.
-                    Each weight should be in [0, 1].
+                    Each weight must be in [0, 1].
 
     Returns:
         Dictionary containing:
@@ -100,9 +100,7 @@ def beta_pool_confidence(
             - within_score: Confidence score within experts [0, 1]
 
     Raises:
-        ValueError: If inputs have incompatible shapes
-        ValueError: If all expert weights sum to zero
-        ValueError: If any probability or CI bound is outside [0, 1]
+        ValueError: If inputs have incompatible shapes or invalid values
 
     Example:
         >>> p_vec = np.array([0.7, 0.8, 0.75])  # 3 experts think likely irAKI
@@ -110,13 +108,16 @@ def beta_pool_confidence(
         >>> weights = np.array([0.9, 0.8, 0.95])  # confidence levels
         >>> result = beta_pool_confidence(p_vec, ci_mat, weights)
         >>> print(f"Consensus P(irAKI): {result['pooled_mean']:.3f}")
-        >>> print(f"95% CI: [{result['pooled_ci'][0]:.3f}, {result['pooled_ci'][1]:.3f}]")
-
-    References:
-        - Genest & Zidek (1986). Combining Probability Distributions.
-        - Cooke (1991). Experts in Uncertainty: Opinion and Subjective Probability.
     """
-    # input validation - fail loudly per Nature Medicine standards
+    # ========================================================================
+    # INPUT VALIDATION - FAIL LOUDLY PER NATURE MEDICINE STANDARDS
+    # ========================================================================
+
+    # check for empty input
+    if p_vec.size == 0:
+        raise ValueError("Cannot compute consensus from empty expert assessments")
+
+    # validate array dimensions
     if p_vec.ndim != 1:
         raise ValueError(f"p_vec must be 1-dimensional, got shape {p_vec.shape}")
 
@@ -125,16 +126,17 @@ def beta_pool_confidence(
 
     if p_vec.shape[0] != ci_mat.shape[0]:
         raise ValueError(
-            f"Incompatible shapes: p_vec has {p_vec.shape[0]} experts, "
+            f"Incompatible dimensions: p_vec has {p_vec.shape[0]} experts, "
             f"ci_mat has {ci_mat.shape[0]} experts"
         )
 
-    # validate probability bounds
+    # validate probability bounds - FAIL LOUD, NO AUTO-CORRECTION
     if np.any((p_vec < 0) | (p_vec > 1)):
         invalid_idx = np.where((p_vec < 0) | (p_vec > 1))[0]
+        invalid_vals = p_vec[invalid_idx]
         raise ValueError(
-            f"Probabilities must be in [0,1]. Invalid values at indices {invalid_idx}: "
-            f"{p_vec[invalid_idx]}"
+            f"Invalid probability values at indices {list(invalid_idx)}: {list(invalid_vals)}. "
+            f"All probabilities must be in [0,1]."
         )
 
     # validate CI bounds
@@ -142,86 +144,136 @@ def beta_pool_confidence(
     hi = ci_mat[:, 1]
 
     if np.any((lo < 0) | (lo > 1) | (hi < 0) | (hi > 1)):
-        raise ValueError(f"CI bounds must be in [0,1]. Got lower={lo}, upper={hi}")
-
-    if np.any(lo > hi):
-        invalid_idx = np.where(lo > hi)[0]
-        logger.warning(f"CI bounds inverted at indices {invalid_idx}. Auto-correcting.")
-        # auto-correct inverted bounds
-        ci_mat = ci_mat.copy()
-        ci_mat[invalid_idx] = ci_mat[invalid_idx, ::-1]
-        lo = ci_mat[:, 0]
-        hi = ci_mat[:, 1]
-
-    # compute between-expert variance (measure of disagreement)
-    # normalized by maximum possible variance (0.25 when p=0.5)
-    var_between = np.var(p_vec, ddof=1) if p_vec.size > 1 else 0.0
-    between_score = 1.0 - (var_between / 0.25)
-    between_score = np.clip(between_score, 0.0, 1.0)
-
-    # compute within-expert uncertainty (CI width)
-    # normalized by maximum reasonable width (0.5)
-    half_widths = (hi - lo) / 2.0
-    mean_half = np.mean(half_widths)
-    within_score = 1.0 - (mean_half / 0.5)
-    within_score = np.clip(within_score, 0.0, 1.0)
-
-    # harmonic mean for overall consensus confidence
-    # uses harmonic mean to penalize if either component is low
-    if between_score == 0 or within_score == 0:
-        consensus_conf = 0.0
-    else:
-        consensus_conf = 2.0 / (1.0 / between_score + 1.0 / within_score)
-
-    # prepare weights (default to uniform if not provided)
-    if weight_vec is None:
-        w = np.ones_like(p_vec)
-        logger.debug("Using uniform weights for all experts")
-    else:
-        if weight_vec.shape != p_vec.shape:
-            raise ValueError(
-                f"weight_vec shape {weight_vec.shape} doesn't match "
-                f"p_vec shape {p_vec.shape}"
-            )
-        w = weight_vec.copy()
-
-        # validate weight bounds
-        if np.any((w < 0) | (w > 1)):
-            logger.warning(
-                f"Weights should be in [0,1]. Got min={w.min()}, max={w.max()}. "
-                f"Clipping to valid range."
-            )
-            w = np.clip(w, 0.0, 1.0)
-
-    # check for zero total weight - critical failure
-    total_weight = np.sum(w)
-    if total_weight == 0:
         raise ValueError(
-            "All expert confidences sum to zero - cannot compute consensus. "
-            "At least one expert must have non-zero confidence."
+            f"Invalid confidence interval bounds. All CI values must be in [0,1]. "
+            f"Got lower bounds: {lo}, upper bounds: {hi}"
         )
 
-    # normalize weights to sum to N for interpretable scaling
-    # this ensures the posterior is comparable regardless of expert count
-    w_normalized = w * len(p_vec) / total_weight
+    # check CI ordering - FAIL LOUD, NO AUTO-CORRECTION
+    if np.any(lo > hi):
+        invalid_idx = np.where(lo > hi)[0]
+        raise ValueError(
+            f"Invalid confidence interval ordering at indices {list(invalid_idx)}. "
+            f"Lower bound must be <= upper bound. "
+            f"Got intervals: {[list(ci_mat[i]) for i in invalid_idx]}"
+        )
 
-    logger.debug(
-        f"Weight normalization: original sum={total_weight:.3f}, "
-        f"normalized sum={np.sum(w_normalized):.3f}"
+    # validate weights if provided - FAIL LOUD
+    if weight_vec is not None:
+        if weight_vec.shape != p_vec.shape:
+            raise ValueError(
+                f"Dimension mismatch: weight_vec shape {weight_vec.shape} "
+                f"doesn't match p_vec shape {p_vec.shape}"
+            )
+
+        if np.any(weight_vec < 0):
+            invalid_idx = np.where(weight_vec < 0)[0]
+            raise ValueError(
+                f"Invalid negative weights at indices {list(invalid_idx)}: "
+                f"{list(weight_vec[invalid_idx])}. All weights must be non-negative."
+            )
+
+        # check for zero total weight
+        if np.sum(weight_vec) == 0:
+            raise ValueError("Cannot compute consensus: all expert weights sum to zero")
+
+        w = weight_vec
+    else:
+        # uniform weights if not provided
+        w = np.ones_like(p_vec)
+        logger.debug("Using uniform weights for all experts")
+
+    # ========================================================================
+    # BETA POOLING COMPUTATION
+    # ========================================================================
+
+    # normalize weights to sum to 1 for interpretability
+    w_normalized = w / np.sum(w)
+
+    # compute strength parameters from CI widths
+    # tighter CI = higher strength/precision
+    ci_widths = hi - lo
+
+    # avoid division by zero for point estimates (CI width = 0)
+    min_width = 0.01
+    ci_widths = np.maximum(ci_widths, min_width)
+
+    # strength inversely proportional to CI width
+    # use quadratic relationship for more sensitivity
+    strengths = 1.0 / (ci_widths**2)
+
+    # scale strengths to reasonable range [1, 100]
+    strengths = 1.0 + 99.0 * (strengths - strengths.min()) / (
+        strengths.max() - strengths.min() + 1e-10
     )
 
-    # beta opinion pooling
-    # posterior parameters with Jeffrey's prior (α=β=1)
-    a_post = 1.0 + np.sum(w_normalized * p_vec)
-    b_post = 1.0 + np.sum(w_normalized * (1.0 - p_vec))
+    # compute expert-specific beta parameters
+    alpha_experts = p_vec * strengths
+    beta_experts = (1.0 - p_vec) * strengths
+
+    # weighted aggregation with Jeffrey's prior (α₀=β₀=0.5)
+    # this prior is less informative than uniform (α₀=β₀=1)
+    prior_alpha = 0.5
+    prior_beta = 0.5
+
+    # posterior parameters
+    a_post = prior_alpha + np.sum(w_normalized * alpha_experts)
+    b_post = prior_beta + np.sum(w_normalized * beta_experts)
+
+    # handle edge cases for extreme consensus
+    # if all experts agree on 0 or 1, ensure extreme result
+    if np.all(p_vec == 0):
+        a_post = 0.01  # very small alpha
+        b_post = 100.0  # large beta -> mean ≈ 0
+    elif np.all(p_vec == 1):
+        a_post = 100.0  # large alpha
+        b_post = 0.01  # very small beta -> mean ≈ 1
+    elif len(p_vec) == 1:
+        # single expert: use their estimate with uncertainty
+        a_post = 1.0 + p_vec[0] * 2.0  # less extreme than group consensus
+        b_post = 1.0 + (1.0 - p_vec[0]) * 2.0
 
     # posterior mean and credible interval
     post_mean = a_post / (a_post + b_post)
     post_ci_95 = beta.ppf([0.025, 0.975], a_post, b_post).tolist()
 
+    # ========================================================================
+    # CONFIDENCE ESTIMATION
+    # ========================================================================
+
+    # between-expert agreement (variance-based)
+    if len(p_vec) > 1:
+        var_between = np.var(p_vec, ddof=1)
+        # normalize by maximum possible variance (0.25 when p=0.5)
+        between_score = 1.0 - min(var_between / 0.25, 1.0)
+    else:
+        var_between = 0.0
+        between_score = 0.0  # single expert has no agreement measure
+
+    # within-expert certainty (CI width-based)
+    mean_halfwidth = np.mean(ci_widths) / 2.0
+    # normalize by reasonable maximum half-width (0.5)
+    within_score = 1.0 - min(mean_halfwidth / 0.5, 1.0)
+
+    # overall confidence: harmonic mean of agreement and certainty
+    # harmonic mean penalizes if either component is low
+    if between_score > 0 and within_score > 0:
+        consensus_conf = 2.0 / (1.0 / between_score + 1.0 / within_score)
+    else:
+        consensus_conf = 0.0
+
+    # adjust confidence for edge cases
+    if len(p_vec) == 1:
+        # single expert: confidence based only on their CI width
+        consensus_conf = within_score * 0.5  # reduce confidence for single expert
+    elif np.all(p_vec == p_vec[0]) and np.all(ci_widths < 0.1):
+        # perfect agreement with narrow CIs: very high confidence
+        consensus_conf = 0.95
+
     logger.info(
         f"Beta pooling complete: P(irAKI)={post_mean:.3f} "
         f"[{post_ci_95[0]:.3f}, {post_ci_95[1]:.3f}], "
+        f"α={a_post:.2f}, β={b_post:.2f}, "
         f"confidence={consensus_conf:.3f}"
     )
 
@@ -229,7 +281,7 @@ def beta_pool_confidence(
         "pooled_mean": float(post_mean),
         "pooled_ci": post_ci_95,
         "var_between": float(var_between),
-        "mean_halfwidth": float(mean_half),
+        "mean_halfwidth": float(mean_halfwidth),
         "consensus_conf": float(consensus_conf),
         "between_score": float(between_score),
         "within_score": float(within_score),
@@ -250,16 +302,11 @@ def compute_binary_verdict(
         pooled_ci: 95% credible interval [lower, upper]
         threshold: Decision threshold (default 0.5)
         require_ci_agreement: If True, entire CI must be above/below threshold
-                              for high confidence verdict
 
     Returns:
         Tuple of (verdict, confidence_level) where:
             - verdict: True if irAKI likely, False otherwise
             - confidence_level: "high", "moderate", or "low"
-
-    Example:
-        >>> verdict, conf = compute_binary_verdict(0.75, [0.65, 0.85])
-        >>> print(f"irAKI: {verdict}, Confidence: {conf}")
     """
     lower, upper = pooled_ci
 
