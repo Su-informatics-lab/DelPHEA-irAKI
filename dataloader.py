@@ -113,18 +113,23 @@ class DataLoader:
         self._has_demographics = False
         self._data_loaded = False
 
-        # attempt to load data if not using dummy
-        if not use_dummy:
-            if not self.data_dir.exists():
-                logger.warning(f"Data directory does not exist: {self.data_dir}")
-                self.use_dummy = True
-            else:
-                try:
-                    self._load_all_data()
-                    self._data_loaded = True
-                except Exception as e:
-                    logger.error(f"Failed to load data: {e}")
-                    self.use_dummy = True
+        # if explicitly using dummy mode, no need to load real data
+        if use_dummy:
+            return
+
+        # for real data mode, fail loud if data directory doesn't exist
+        if not self.data_dir.exists():
+            raise FileNotFoundError(
+                f"Data directory does not exist: {self.data_dir}. "
+                f"Please ensure the data directory exists or use use_dummy=True for testing."
+            )
+
+        # attempt to load real data
+        try:
+            self._load_all_data()
+            self._data_loaded = True
+        except Exception as e:
+            raise RuntimeError(f"Failed to load patient data: {e}")
 
     def is_available(self) -> bool:
         """Check if patient data is available."""
@@ -156,6 +161,11 @@ class DataLoader:
         Returns raw clinical notes and demographics for expert agents to analyze.
         """
         if self.use_dummy:
+            if case_id != "iraki_case_001":
+                raise ValueError(
+                    f"Invalid case ID for dummy mode: {case_id}. "
+                    f"Only 'iraki_case_001' is available in dummy mode."
+                )
             return self._get_dummy_patient()
 
         # validate and extract person_id from case_id
@@ -173,8 +183,10 @@ class DataLoader:
 
         # validate patient exists
         if person_id not in self.patient_ids:
-            logger.warning(f"Patient {person_id} not found, using dummy data")
-            return self._get_dummy_patient()
+            raise ValueError(
+                f"Patient {person_id} not found in dataset. "
+                f"Available patient IDs: {self.patient_ids[:5]}..."
+            )
 
         # get demographics
         demographics = self._get_demographics(person_id)
