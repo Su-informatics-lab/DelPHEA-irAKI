@@ -57,6 +57,8 @@ requirements with clear mathematical formulations and fail-loud validation.
 NO auto-correction of invalid inputs per clinical safety standards.
 """
 
+from typing import Dict, Optional
+
 import numpy as np
 from scipy.stats import beta
 
