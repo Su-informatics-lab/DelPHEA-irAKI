@@ -1,41 +1,69 @@
 """
-Moderator agent for DelPHEA-irAKI orchestration.
-
+Moderator Agent for DelPHEA-irAKI Orchestration
+================================================
 Master agent coordinating the Delphi consensus process across all rounds.
+Manages expert interactions, conflict resolution, and consensus computation.
+
+Architecture:
+------------
+    Moderator (this module)
+         │
+    ┌────┼────┐
+    ▼    ▼    ▼
+  Round1 Round2 Round3
+    │     │     │
+    │  Debates  │
+    │     │     │
+    └─────┴─────┘
+         │
+    Beta Pooling
+    Consensus
+
+Delphi Process Flow:
+-------------------
+1. Round 1: Independent assessments from all experts
+2. Round 2: Debate on conflicting questions (if threshold exceeded)
+3. Round 3: Final assessments incorporating debate insights
+4. Consensus: Beta pooling to compute P(irAKI) with confidence
+
+Clinical Context:
+----------------
+The moderator ensures comprehensive evaluation by orchestrating
+diverse expert opinions, identifying key conflicts, and driving
+evidence-based consensus for irAKI classification.
 """
 
 import asyncio
+import json
 import logging
 import time
-from collections import defaultdict
-from typing import Dict, List
+from typing import Dict, List, Set
 
 import numpy as np
-from autogen_core import (
-    AgentId,
-    MessageContext,
-    RoutedAgent,
-    TopicId,
-    message_handler,
-    rpc,
-)
+from autogen_core import MessageContext, RoutedAgent, TopicId, message_handler, rpc
+from data.loader import DataLoaderWrapper
 
 from config.core import DelphiConfig
 from config.loader import ConfigurationLoader
-from data.loader import DataLoaderWrapper
 from orchestration.consensus import beta_pool_confidence
 from orchestration.messages import (
     AckMsg,
     DebatePrompt,
     ExpertRound1Reply,
     ExpertRound3Reply,
+    HumanReviewExport,
     QuestionnaireMsg,
     StartCase,
+    TerminateDebate,
 )
 
 
 class irAKIModeratorAgent(RoutedAgent):
-    """Master agent coordinating irAKI Delphi process."""
+    """Master agent coordinating irAKI Delphi consensus process.
+
+    Manages three rounds of expert assessment, debate facilitation,
+    and final consensus computation using beta pooling.
+    """
 
     def __init__(
         self,
@@ -58,27 +86,28 @@ class irAKIModeratorAgent(RoutedAgent):
         self._data_loader = data_loader
         self._delphi_config = delphi_config
 
-        # use expert_count from config
-        self._expert_ids = self._config_loader.get_available_expert_ids()[
-            : delphi_config.expert_count
-        ]
+        # use expert_count from config to select subset
+        all_expert_ids = self._config_loader.get_available_expert_ids()
+        self._expert_ids = all_expert_ids[: delphi_config.expert_count]
 
-        # round tracking
+        # round tracking - store actual replies
         self._round1_replies: List[ExpertRound1Reply] = []
         self._round3_replies: List[ExpertRound3Reply] = []
-        self._chat_logs: Dict[str, List[Dict]] = defaultdict(list)
 
-        # debate management
-        self._active_debates: dict[str, dict] = {}
+        # debate tracking
+        self._debate_summaries: Dict[str, str] = {}  # q_id -> summary
 
-        # synchronization
-        self._pending_round1: set = set()
-        self._pending_round3: set = set()
+        # synchronization primitives
+        self._pending_round1: Set[str] = set()
+        self._pending_round3: Set[str] = set()
         self._round1_done = asyncio.Event()
         self._round3_done = asyncio.Event()
 
-        self.logger = logging.getLogger(f"iraki_moderator.{case_id}")
-        self.logger.info(f"Initialized moderator with experts: {self._expert_ids}")
+        self.logger = logging.getLogger(f"moderator.{case_id}")
+        self.logger.info(
+            f"Initialized moderator for case {case_id} with {len(self._expert_ids)} experts: "
+            f"{self._expert_ids}"
+        )
 
     @message_handler
     async def handle_start_case(self, message: StartCase, ctx: MessageContext) -> None:
@@ -88,49 +117,55 @@ class irAKIModeratorAgent(RoutedAgent):
             message: Start case signal
             ctx: Message context
         """
-        self.logger.info(f"Starting irAKI Delphi process for case {message.case_id}")
+        self.logger.info(f"=== STARTING DELPHI PROCESS FOR CASE {message.case_id} ===")
+
+        # load patient data
         patient_data = self._data_loader.load_patient_case(message.case_id)
-        await self._run_round1(patient_data)
 
-    async def _run_round1(self, patient_data: Dict) -> None:
-        """Execute Round 1: individual irAKI assessments.
+        # store for later rounds
+        self._patient_data = patient_data
 
-        Args:
-            patient_data: Loaded patient case data
-        """
-        self.logger.info("=== ROUND 1: Individual irAKI Assessments ===")
+        # begin Round 1
+        await self._run_round1()
 
-        # load questions with full context from configuration
+    async def _run_round1(self) -> None:
+        """Execute Round 1: Independent expert assessments."""
+        self.logger.info("=== ROUND 1: Independent Expert Assessments ===")
+
+        # load questions from configuration
         questions = self._config_loader.get_questions()
 
-        # initialize pending tracking with actual expert IDs
+        # prepare for responses
         self._pending_round1 = set(self._expert_ids)
         self._round1_done.clear()
+        self._round1_replies.clear()
 
         # create questionnaire message
         questionnaire = QuestionnaireMsg(
             case_id=self._case_id,
-            patient_info=patient_data.get("patient_info", {}),
-            icu_summary=patient_data.get("patient_summary", ""),
-            medication_history=patient_data.get("medication_history", {}),
-            lab_values=patient_data.get("lab_values", {}),
-            imaging_reports=str(patient_data.get("imaging_reports", [])),
-            questions=questions,
             round_phase="round1",
+            patient_info=self._patient_data.get("patient_info", {}),
+            icu_summary=self._patient_data.get("patient_summary", ""),
+            medication_history=self._patient_data.get("medication_history", {}),
+            lab_values=self._patient_data.get("lab_values", {}),
+            imaging_reports=str(self._patient_data.get("imaging_reports", [])),
+            questions=questions,
         )
 
+        # broadcast to all experts via topic
         await self.publish_message(questionnaire, TopicId("case", self._case_id))
         self.logger.info(
             f"Broadcast Round 1 questionnaire to {len(self._expert_ids)} experts"
         )
 
+        # wait for responses with timeout
         await self._wait_for_round_completion("round1")
 
     @rpc
     async def record_round1(
         self, message: ExpertRound1Reply, ctx: MessageContext
     ) -> AckMsg:
-        """Collect Round 1 expert replies.
+        """Collect Round 1 expert replies via RPC.
 
         Args:
             message: Expert's Round 1 reply
@@ -139,69 +174,31 @@ class irAKIModeratorAgent(RoutedAgent):
         Returns:
             AckMsg: Acknowledgment
         """
-        # validate expert ID
+        # validate expert
         if message.expert_id not in self._expert_ids:
+            self.logger.warning(
+                f"Received reply from unknown expert: {message.expert_id}"
+            )
             return AckMsg(ok=False, message=f"Unknown expert ID: {message.expert_id}")
 
-        self._chat_logs[message.expert_id].append(
-            {
-                "role": "expert_reply",
-                "payload": message.model_dump(),
-                "timestamp": time.time(),
-            }
-        )
-
+        # store reply
         self._round1_replies.append(message)
         self._pending_round1.discard(message.expert_id)
 
         self.logger.debug(
-            f"Round 1 reply from {message.expert_id} ({len(self._pending_round1)} pending)"
+            f"Round 1 reply from {message.expert_id} "
+            f"(P(irAKI)={message.p_iraki:.2f}, conf={message.confidence:.2f}). "
+            f"{len(self._pending_round1)} experts pending."
         )
 
+        # check if all done
         if not self._pending_round1:
             self._round1_done.set()
 
         return AckMsg(ok=True, message="Round 1 reply recorded")
 
-    @rpc
-    async def record_round3(
-        self, message: ExpertRound3Reply, ctx: MessageContext
-    ) -> AckMsg:
-        """Collect Round 3 expert replies.
-
-        Args:
-            message: Expert's Round 3 reply
-            ctx: Message context
-
-        Returns:
-            AckMsg: Acknowledgment
-        """
-        # validate expert ID
-        if message.expert_id not in self._expert_ids:
-            return AckMsg(ok=False, message=f"Unknown expert ID: {message.expert_id}")
-
-        self._chat_logs[message.expert_id].append(
-            {
-                "role": "expert_reply",
-                "payload": message.model_dump(),
-                "timestamp": time.time(),
-            }
-        )
-
-        self._round3_replies.append(message)
-        self._pending_round3.discard(message.expert_id)
-
-        self.logger.debug(
-            f"Round 3 reply from {message.expert_id} ({len(self._pending_round3)} pending)"
-        )
-
-        if not self._pending_round3:
-            self._round3_done.set()
-
-        return AckMsg(ok=True, message="Round 3 reply recorded")
-
     async def _wait_for_round_completion(self, round_phase: str) -> None:
-        """Wait for round completion with timeout.
+        """Wait for round completion with timeout handling.
 
         Args:
             round_phase: "round1" or "round3"
@@ -211,13 +208,7 @@ class irAKIModeratorAgent(RoutedAgent):
 
         try:
             await asyncio.wait_for(event.wait(), timeout=timeout)
-            self.logger.info(f"All {round_phase} replies received")
-
-            if round_phase == "round1":
-                await self._run_round2()
-            else:
-                await self._compute_final_consensus()
-
+            self.logger.info(f"All {round_phase} replies received successfully")
         except asyncio.TimeoutError:
             pending = (
                 self._pending_round1
@@ -225,186 +216,377 @@ class irAKIModeratorAgent(RoutedAgent):
                 else self._pending_round3
             )
             self.logger.warning(
-                f"Timeout in {round_phase}: {len(pending)} experts pending"
+                f"Timeout in {round_phase} after {timeout}s. "
+                f"Missing experts: {pending}"
             )
+            # proceed anyway with partial results
 
-            if round_phase == "round1":
-                await self._run_round2()
-            else:
-                await self._compute_final_consensus()
+        # proceed to next phase
+        if round_phase == "round1":
+            await self._run_round2()
+        else:  # round3
+            await self._compute_final_consensus()
 
     async def _run_round2(self) -> None:
-        """Execute Round 2: debate conflicts with responsive timeout."""
-        self.logger.info("=== ROUND 2: Conflict Resolution ===")
+        """Execute Round 2: Debate on conflicting questions."""
+        self.logger.info("=== ROUND 2: Conflict Resolution via Debate ===")
 
-        conflicts = self._detect_conflicts()
+        # identify conflicts
+        conflicts = self._identify_conflicts()
 
         if not conflicts:
-            self.logger.info("No conflicts detected, proceeding to Round 3")
+            self.logger.info("No significant conflicts identified, skipping debate")
             await self._run_round3()
             return
 
-        self.logger.info(f"Detected conflicts in {len(conflicts)} questions")
+        self.logger.info(f"Identified {len(conflicts)} questions with conflicts")
 
-        # start debates for all conflicts
-        debate_tasks = {}
-        for q_id, meta in conflicts.items():
-            prompt = DebatePrompt(
-                case_id=self._case_id,
-                q_id=q_id,
-                minority_view=f"Score range: {meta['score_range']}",
-                round_no=2,
-                participating_experts=self._expert_ids,
-                clinical_context=meta.get("clinical_context"),
-            )
+        # run debates for each conflict
+        for q_id, conflict_info in conflicts.items():
+            await self._run_single_debate(q_id, conflict_info)
 
-            # send debate prompt to each expert
-            for expert_id in self._expert_ids:
-                try:
-                    await self.send_message(
-                        prompt, AgentId(f"Expert_{expert_id}", self._case_id)
-                    )
-                except Exception as e:
-                    self.logger.warning(
-                        f"Failed to send debate prompt to {expert_id}: {e}"
-                    )
-
-            # create task to wait for debate completion on this question
-            debate_tasks[q_id] = asyncio.create_task(
-                self._await_debate_completion(q_id, self._delphi_config.debate_timeout)
-            )
-
-        # wait for all debates to complete or timeout
-        try:
-            await asyncio.wait_for(
-                asyncio.gather(*debate_tasks.values(), return_exceptions=True),
-                timeout=self._delphi_config.debate_timeout,
-            )
-            self.logger.info("All debates completed")
-        except asyncio.TimeoutError:
-            self.logger.info("Debate window expired, proceeding to Round 3")
-            # cancel remaining tasks
-            for task in debate_tasks.values():
-                if not task.done():
-                    task.cancel()
-
+        # proceed to Round 3
         await self._run_round3()
 
-    def _detect_conflicts(self) -> Dict[str, Dict]:
-        """Detect questions with significant disagreement.
+    def _identify_conflicts(self) -> Dict[str, Dict]:
+        """Identify questions with significant disagreement.
 
         Returns:
-            Dict mapping question IDs to conflict metadata
+            Dict mapping question IDs to conflict information
         """
         conflicts = {}
         questions = self._config_loader.get_questions()
 
-        for i, question in enumerate(questions):
+        for question in questions:
             q_id = question["id"]
-            scores = [
-                reply.scores.get(q_id, 5)
-                for reply in self._round1_replies
-                if q_id in reply.scores
-            ]
 
-            if (
-                len(scores) > 1
-                and max(scores) - min(scores) >= self._delphi_config.conflict_threshold
-            ):
+            # collect scores for this question
+            scores = []
+            score_by_expert = {}
+            for reply in self._round1_replies:
+                if q_id in reply.scores:
+                    score = reply.scores[q_id]
+                    scores.append(score)
+                    score_by_expert[reply.expert_id] = score
+
+            if len(scores) < 2:
+                continue
+
+            # check if conflict threshold exceeded
+            score_range = max(scores) - min(scores)
+            if score_range >= self._delphi_config.conflict_threshold:
+                # collect evidence from conflicting experts
+                conflicting_evidence = {}
+                for reply in self._round1_replies:
+                    if q_id in reply.evidence:
+                        conflicting_evidence[reply.expert_id] = reply.evidence[q_id]
+
                 conflicts[q_id] = {
                     "question": question,
+                    "score_distribution": score_by_expert,
                     "score_range": f"{min(scores)}-{max(scores)}",
-                    "clinical_context": question.get("clinical_context", {}),
+                    "conflict_severity": "severe" if score_range >= 5 else "moderate",
+                    "conflicting_evidence": conflicting_evidence,
+                    "clinical_importance": question.get("clinical_context", {}).get(
+                        "importance",
+                        "Assessment of this factor is important for irAKI diagnosis",
+                    ),
                 }
 
         return conflicts
 
-    async def _await_debate_completion(self, q_id: str, timeout: float) -> None:
-        """Wait for debate completion on a specific question.
+    async def _run_single_debate(self, q_id: str, conflict_info: Dict) -> None:
+        """Run debate for a single conflicting question.
 
         Args:
             q_id: Question identifier
-            timeout: Maximum wait time in seconds
+            conflict_info: Conflict details
         """
-        # placeholder for debate completion logic
-        # in a full implementation, this would track debate comments
-        await asyncio.sleep(min(10, timeout))  # simulate debate time
-
-    async def _run_round3(self) -> None:
-        """Execute Round 3: final consensus."""
-        self.logger.info("=== ROUND 3: Final Consensus ===")
-
-        patient_data = self._data_loader.load_patient_case(self._case_id)
-        questions = self._config_loader.get_questions()
-
-        self._pending_round3 = set(self._expert_ids)
-        self._round3_done.clear()
-
-        questionnaire = QuestionnaireMsg(
-            case_id=self._case_id,
-            patient_info=patient_data.get("patient_info", {}),
-            icu_summary=patient_data.get("patient_summary", ""),
-            medication_history=patient_data.get("medication_history", {}),
-            lab_values=patient_data.get("lab_values", {}),
-            imaging_reports=str(patient_data.get("imaging_reports", [])),
-            questions=questions,
-            round_phase="round3",
+        self.logger.info(
+            f"Starting debate for question {q_id} "
+            f"(range: {conflict_info['score_range']}, "
+            f"severity: {conflict_info['conflict_severity']})"
         )
 
-        await self.publish_message(questionnaire, TopicId("case", self._case_id))
-        self.logger.info("Broadcast Round 3 questionnaire")
+        # create debate prompt
+        debate_prompt = DebatePrompt(
+            case_id=self._case_id,
+            q_id=q_id,
+            question=conflict_info["question"],
+            score_distribution=conflict_info["score_distribution"],
+            score_range=conflict_info["score_range"],
+            conflict_severity=conflict_info["conflict_severity"],
+            conflicting_evidence=conflict_info["conflicting_evidence"],
+            clinical_importance=conflict_info["clinical_importance"],
+        )
 
+        # broadcast to experts involved in conflict
+        await self.publish_message(debate_prompt, TopicId("case", self._case_id))
+
+        # simple debate timeout (in production, would track actual comments)
+        await asyncio.sleep(min(30, self._delphi_config.debate_timeout))
+
+        # terminate debate
+        terminate_msg = TerminateDebate(
+            case_id=self._case_id,
+            q_id=q_id,
+            reason="timeout",  # simplified for now
+        )
+        await self.publish_message(terminate_msg, TopicId("case", self._case_id))
+
+        # store debate summary (simplified)
+        self._debate_summaries[q_id] = (
+            f"Debate conducted on question {q_id} with {conflict_info['conflict_severity']} "
+            f"conflict (score range: {conflict_info['score_range']})"
+        )
+
+    async def _run_round3(self) -> None:
+        """Execute Round 3: Final consensus assessments."""
+        self.logger.info("=== ROUND 3: Final Consensus Assessments ===")
+
+        # prepare for responses
+        self._pending_round3 = set(self._expert_ids)
+        self._round3_done.clear()
+        self._round3_replies.clear()
+
+        # create debate summary
+        debate_summary = (
+            "\n".join(f"- {summary}" for summary in self._debate_summaries.values())
+            if self._debate_summaries
+            else "No debates were conducted."
+        )
+
+        # create Round 3 questionnaire with debate context
+        questions = self._config_loader.get_questions()
+        questionnaire = QuestionnaireMsg(
+            case_id=self._case_id,
+            round_phase="round3",
+            patient_info=self._patient_data.get("patient_info", {}),
+            icu_summary=self._patient_data.get("patient_summary", ""),
+            medication_history=self._patient_data.get("medication_history", {}),
+            lab_values=self._patient_data.get("lab_values", {}),
+            imaging_reports=str(self._patient_data.get("imaging_reports", [])),
+            questions=questions,
+            debate_summary=debate_summary,
+        )
+
+        # broadcast to all experts
+        await self.publish_message(questionnaire, TopicId("case", self._case_id))
+        self.logger.info("Broadcast Round 3 questionnaire to all experts")
+
+        # wait for responses
         await self._wait_for_round_completion("round3")
+
+    @rpc
+    async def record_round3(
+        self, message: ExpertRound3Reply, ctx: MessageContext
+    ) -> AckMsg:
+        """Collect Round 3 expert replies via RPC.
+
+        Args:
+            message: Expert's Round 3 reply
+            ctx: Message context
+
+        Returns:
+            AckMsg: Acknowledgment
+        """
+        # validate expert
+        if message.expert_id not in self._expert_ids:
+            return AckMsg(ok=False, message=f"Unknown expert ID: {message.expert_id}")
+
+        # store reply
+        self._round3_replies.append(message)
+        self._pending_round3.discard(message.expert_id)
+
+        self.logger.debug(
+            f"Round 3 reply from {message.expert_id} "
+            f"(verdict={'irAKI' if message.verdict else 'Other'}, "
+            f"P(irAKI)={message.p_iraki:.2f}). "
+            f"{len(self._pending_round3)} experts pending."
+        )
+
+        # check if all done
+        if not self._pending_round3:
+            self._round3_done.set()
+
+        return AckMsg(ok=True, message="Round 3 reply recorded")
 
     async def _compute_final_consensus(self) -> None:
         """Compute beta pooling consensus for irAKI classification."""
         self.logger.info("=== COMPUTING FINAL CONSENSUS ===")
 
         if not self._round3_replies:
-            self.logger.error("No Round 3 replies received")
+            self.logger.error("No Round 3 replies received, cannot compute consensus")
             return
 
         # extract data for beta pooling
         p_vec = np.array([r.p_iraki for r in self._round3_replies])
-        ci_mat = np.array([r.ci_iraki for r in self._round3_replies])
+        ci_mat = np.array([list(r.ci_iraki) for r in self._round3_replies])
         w_vec = np.array([r.confidence for r in self._round3_replies])
 
-        # compute beta pooling with confidence estimation
-        stats = beta_pool_confidence(p_vec, ci_mat, w_vec)
+        # compute beta pooling consensus
+        try:
+            consensus_stats = beta_pool_confidence(p_vec, ci_mat, w_vec)
+        except Exception as e:
+            self.logger.error(f"Failed to compute beta pooling: {e}")
+            # fallback to simple average
+            consensus_stats = {
+                "pooled_mean": float(np.mean(p_vec)),
+                "pooled_ci": [
+                    float(np.percentile(p_vec, 2.5)),
+                    float(np.percentile(p_vec, 97.5)),
+                ],
+                "consensus_conf": float(np.mean(w_vec)),
+            }
 
-        # traditional majority vote for comparison
-        consensus_verdict = (
-            sum(r.verdict for r in self._round3_replies) > len(self._round3_replies) / 2
-        )
+        # compute majority vote for comparison
+        votes_iraki = sum(1 for r in self._round3_replies if r.verdict)
+        consensus_verdict = votes_iraki > len(self._round3_replies) / 2
 
         # log results
         self.logger.info("=" * 80)
         self.logger.info(f"CASE {self._case_id} irAKI CONSENSUS RESULTS:")
         self.logger.info("-" * 80)
-        self.logger.info(f"Beta Pooled P(irAKI):    {stats['pooled_mean']:.3f}")
         self.logger.info(
-            f"95% Credible Interval:   [{stats['pooled_ci'][0]:.3f}, {stats['pooled_ci'][1]:.3f}]"
+            f"Beta Pooled P(irAKI):    {consensus_stats['pooled_mean']:.3f}"
         )
-        self.logger.info(f"Consensus Confidence:    {stats['consensus_conf']:.3f}")
         self.logger.info(
-            f"Majority Vote Verdict:   {'irAKI' if consensus_verdict else 'Other AKI'}"
+            f"95% Credible Interval:   [{consensus_stats['pooled_ci'][0]:.3f}, "
+            f"{consensus_stats['pooled_ci'][1]:.3f}]"
         )
-        self.logger.info(f"Expert Count:            {len(self._round3_replies)}")
+        self.logger.info(
+            f"Consensus Confidence:    {consensus_stats['consensus_conf']:.3f}"
+        )
+        self.logger.info(
+            f"Majority Vote:           {'irAKI' if consensus_verdict else 'Other AKI'} "
+            f"({votes_iraki}/{len(self._round3_replies)})"
+        )
+        self.logger.info(
+            f"Expert Participation:    {len(self._round3_replies)}/{len(self._expert_ids)}"
+        )
         self.logger.info("=" * 80)
 
         # export for human review if configured
         if self._delphi_config.export_full_transcripts:
-            await self._export_for_human_review(stats, consensus_verdict)
+            await self._export_for_human_review(consensus_stats, consensus_verdict)
 
     async def _export_for_human_review(
-        self, stats: Dict, consensus_verdict: bool
+        self, consensus_stats: Dict, consensus_verdict: bool
     ) -> None:
         """Export complete case for human expert review.
 
         Args:
-            stats: Consensus statistics
+            consensus_stats: Beta pooling statistics
             consensus_verdict: Binary verdict from majority vote
         """
         self.logger.info("Exporting case for human review...")
-        # implementation for full export would go here
-        # this would create HumanReviewExport message and save to file
+
+        # prepare export data
+        export_data = HumanReviewExport(
+            case_id=self._case_id,
+            export_timestamp=time.strftime("%Y-%m-%d %H:%M:%S"),
+            delphea_version="1.0.0",
+            # consensus results
+            final_consensus={
+                "p_iraki": consensus_stats["pooled_mean"],
+                "ci_95": consensus_stats["pooled_ci"],
+                "confidence": consensus_stats["consensus_conf"],
+                "beta_pooling_stats": consensus_stats,
+            },
+            majority_verdict=consensus_verdict,
+            expert_agreement_level=self._calculate_agreement_level(),
+            # detailed assessments
+            expert_assessments=[
+                {
+                    "round": "round1",
+                    "expert_id": r.expert_id,
+                    "p_iraki": r.p_iraki,
+                    "confidence": r.confidence,
+                    "primary_diagnosis": r.primary_diagnosis,
+                    "differential": r.differential_diagnosis,
+                }
+                for r in self._round1_replies
+            ]
+            + [
+                {
+                    "round": "round3",
+                    "expert_id": r.expert_id,
+                    "p_iraki": r.p_iraki,
+                    "verdict": r.verdict,
+                    "final_diagnosis": r.final_diagnosis,
+                    "recommendations": r.recommendations,
+                }
+                for r in self._round3_replies
+            ],
+            debate_transcripts=[
+                {"q_id": q_id, "summary": summary}
+                for q_id, summary in self._debate_summaries.items()
+            ],
+            # clinical summary
+            reasoning_summary=self._synthesize_reasoning(),
+            clinical_timeline=self._patient_data.get("timeline", {}),
+            differential_summary=self._consolidate_differentials(),
+            # recommendations
+            consensus_recommendations=self._consolidate_recommendations(),
+            # quality metrics
+            confidence_metrics={
+                "mean_confidence": float(
+                    np.mean([r.confidence for r in self._round3_replies])
+                ),
+                "min_confidence": float(
+                    np.min([r.confidence for r in self._round3_replies])
+                ),
+                "max_confidence": float(
+                    np.max([r.confidence for r in self._round3_replies])
+                ),
+            },
+        )
+
+        # save to file
+        output_file = (
+            f"iraki_consensus_{self._case_id}_{time.strftime('%Y%m%d_%H%M%S')}.json"
+        )
+        with open(output_file, "w") as f:
+            json.dump(export_data.model_dump(), f, indent=2)
+
+        self.logger.info(f"Exported consensus results to {output_file}")
+
+    def _calculate_agreement_level(self) -> float:
+        """Calculate inter-expert agreement level."""
+        if len(self._round3_replies) < 2:
+            return 1.0
+
+        # simple agreement based on verdict consistency
+        verdicts = [r.verdict for r in self._round3_replies]
+        majority = max(verdicts.count(True), verdicts.count(False))
+        return majority / len(verdicts)
+
+    def _synthesize_reasoning(self) -> str:
+        """Synthesize clinical reasoning from all experts."""
+        # simplified - in production would use NLP to summarize
+        high_confidence_experts = [
+            r for r in self._round3_replies if r.confidence > 0.7
+        ]
+        if high_confidence_experts:
+            return (
+                f"High-confidence assessment from {len(high_confidence_experts)} experts. "
+                f"Primary consensus: {high_confidence_experts[0].final_diagnosis}"
+            )
+        return "Mixed confidence levels across expert panel."
+
+    def _consolidate_differentials(self) -> List[str]:
+        """Consolidate differential diagnoses from all experts."""
+        all_differentials = set()
+        for reply in self._round1_replies:
+            all_differentials.update(reply.differential_diagnosis)
+        return sorted(list(all_differentials))
+
+    def _consolidate_recommendations(self) -> List[str]:
+        """Consolidate clinical recommendations from Round 3."""
+        # collect all unique recommendations
+        all_recommendations = set()
+        for reply in self._round3_replies:
+            all_recommendations.update(reply.recommendations)
+
+        # prioritize by frequency (simplified)
+        return sorted(list(all_recommendations))[:5]  # top 5 recommendations
