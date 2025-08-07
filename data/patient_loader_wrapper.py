@@ -7,7 +7,9 @@ import logging
 from typing import Dict, List
 
 from config.core import RuntimeConfig
-from data.dummy_patient_generator import DummyPatientGenerator
+from data.dummy_patient_generator import (
+    DummyDataGenerator,  # FIXED: Using correct class name
+)
 from data.real_patient_loader import RealPatientLoader
 
 logger = logging.getLogger(__name__)
@@ -59,7 +61,9 @@ class PatientLoaderWrapper:
             return self.real_loader.load_patient_case(case_id)
         else:
             logger.debug(f"Generating dummy patient: {case_id} (scenario: {scenario})")
-            return DummyPatientGenerator.generate_patient_case(case_id, scenario)
+            return DummyDataGenerator.generate_patient_case(
+                case_id, scenario
+            )  # FIXED: Using correct class name
 
     def get_available_patients(self, limit: int = 10) -> List[str]:
         """Get list of available patient IDs."""
@@ -87,5 +91,7 @@ class PatientLoaderWrapper:
             return {
                 "data_source": "DUMMY",
                 "total_patients": "unlimited",
-                "scenarios": list(DummyPatientGenerator.CLINICAL_SCENARIOS.keys()),
+                "scenarios": list(
+                    DummyDataGenerator.CLINICAL_SCENARIOS.keys()
+                ),  # FIXED: Using correct class name
             }

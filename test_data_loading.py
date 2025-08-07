@@ -18,7 +18,9 @@ logger = logging.getLogger(__name__)
 sys.path.append(str(Path(__file__).parent))
 
 from config.core import RuntimeConfig
-from data.dummy_patient_generator import DummyPatientGenerator
+from data.dummy_patient_generator import (
+    DummyDataGenerator,  # FIXED: Using correct class name
+)
 from data.patient_loader_wrapper import PatientLoaderWrapper
 
 
@@ -32,7 +34,9 @@ def test_dummy_data_generation():
 
     for scenario in scenarios:
         print(f"\n📝 Testing scenario: {scenario}")
-        case = DummyPatientGenerator.generate_patient_case("test_001", scenario)
+        case = DummyDataGenerator.generate_patient_case(
+            "test_001", scenario
+        )  # FIXED: Using correct class name
 
         print(f"  - Case ID: {case['case_id']}")
         print(f"  - Patient Age: {case['patient_info']['age']}")
