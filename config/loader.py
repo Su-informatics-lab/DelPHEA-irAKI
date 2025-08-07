@@ -13,7 +13,7 @@ Module Architecture:
     │ • config/panel.json           │──┐
     │ • config/questionnaire.json   │──┼──> ConfigurationLoader
     │ • prompts/*.json              │──┘         │
-    └───────────────────────────────┘            │
+    └───────────────────────────────┘           │
                                                  ▼
                                           ┌──────────────┐
                                           │  Validation  │
@@ -33,6 +33,9 @@ Key Features:
 4. **Caching**: Configurations loaded once and cached
 5. **Expert Management**: Dynamic expert panel configuration
 
+Note: This module also includes a simple DataLoaderWrapper that delegates to
+the existing dataloader.py for patient data (YAGNI principle - no redundant code).
+
 Clinical Context:
 ----------------
 The configuration defines the virtual expert panel composition, clinical
@@ -47,8 +50,12 @@ and assessment criteria for publication requirements.
 
 import json
 import logging
+import sys
 from pathlib import Path
 from typing import Dict, List
+
+# add parent to path for imports
+sys.path.append(str(Path(__file__).parent.parent))
 
 from config.core import RuntimeConfig
 
@@ -439,3 +446,94 @@ class ConfigurationLoader:
             )
 
         return True
+
+
+class DataLoaderWrapper:
+    """
+    Simple wrapper around existing DataLoader.
+
+    Uses the existing dataloader.py which already handles both real
+    and dummy data modes. No need to reinvent the wheel - YAGNI!
+    """
+
+    def __init__(self, runtime_config: RuntimeConfig):
+        """
+        Initialize wrapper using existing DataLoader.
+
+        Args:
+            runtime_config: Runtime configuration
+
+        Raises:
+            RuntimeError: If DataLoader initialization fails
+        """
+        self.config = runtime_config
+        self.logger = logging.getLogger(f"{__name__}.DataLoaderWrapper")
+
+        try:
+            # import the existing DataLoader
+            from dataloader import DataLoader
+
+            # DataLoader already handles real vs dummy internally
+            # just pass the use_dummy flag based on runtime config
+            self.data_loader = DataLoader(
+                data_dir=runtime_config.data_dir,
+                cache_dir=runtime_config.cache_dir,
+                use_dummy=not runtime_config.use_real_data,
+            )
+
+            # check if initialization was successful
+            if self.data_loader.is_available():
+                mode = "DUMMY" if self.data_loader.use_dummy else "REAL"
+                self.logger.info(f"DataLoader initialized in {mode} mode")
+
+                if not self.data_loader.use_dummy:
+                    self.logger.info(
+                        f"Loaded {len(self.data_loader.patient_ids)} real patients"
+                    )
+            else:
+                raise RuntimeError("DataLoader not available after initialization")
+
+        except ImportError as e:
+            raise RuntimeError(
+                f"Failed to import DataLoader: {e}. "
+                f"Ensure dataloader.py is in the project root."
+            )
+        except Exception as e:
+            self.logger.error(f"Failed to initialize DataLoader: {e}")
+            raise
+
+    def load_patient_case(self, case_id: str) -> Dict:
+        """
+        Load patient case using existing DataLoader.
+
+        Args:
+            case_id: Case identifier (e.g., "iraki_case_001")
+
+        Returns:
+            Dict: Patient case data
+
+        Raises:
+            ValueError: If case_id is invalid
+        """
+        return self.data_loader.load_patient_case(case_id)
+
+    def get_available_patients(self, limit: int = 10) -> List[str]:
+        """
+        Get available patient IDs from DataLoader.
+
+        Args:
+            limit: Maximum number of IDs to return
+
+        Returns:
+            List[str]: Available case identifiers
+        """
+        return self.data_loader.get_available_patients(limit=limit)
+
+    def get_data_source(self) -> str:
+        """
+        Get description of current data source.
+
+        Returns:
+            str: "REAL" or "DUMMY" mode indicator
+        """
+        return "DUMMY" if self.data_loader.use_dummy else "REAL"
