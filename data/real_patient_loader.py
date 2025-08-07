@@ -78,8 +78,6 @@ from typing import Dict, List, Optional
 
 import pandas as pd
 
-from data.dummy import DummyDataGenerator
-
 warnings.filterwarnings("ignore", category=pd.errors.PerformanceWarning)
 logger = logging.getLogger(__name__)
 
