@@ -195,21 +195,16 @@ def beta_pool_confidence(
     ci_widths = hi - lo
 
     # avoid division by zero for point estimates (CI width = 0)
-    min_width = 0.01
+    min_width = 1e-4  # CHANGED: use smaller guard to not inflate narrow CIs
     ci_widths = np.maximum(ci_widths, min_width)
 
     # strength inversely proportional to CI width
     # use quadratic relationship for more sensitivity
     strengths = 1.0 / (ci_widths**2)
 
-    # CHANGED: scale strengths to more moderate range [2, 20] instead of [1, 100]
-    # this preserves outlier influence better
-    if len(strengths) > 1 and strengths.max() > strengths.min():
-        strengths = 2.0 + 18.0 * (strengths - strengths.min()) / (
-            strengths.max() - strengths.min() + 1e-10
-        )
-    else:
-        strengths = np.full_like(p_vec, 10.0, dtype=float)
+    # CHANGED: clip strengths to reasonable range instead of rescaling
+    # this preserves the natural high precision when experts have tight CIs
+    strengths = np.clip(strengths, 2.0, 150.0)
 
     # NEW: detect disagreement patterns for adaptive prior
     var_between = np.var(p_vec)
@@ -268,13 +263,13 @@ def beta_pool_confidence(
     if var_between < 0.01:  # very high agreement
         between_score = 0.95
     elif var_between < 0.05:  # moderate agreement
-        between_score = 0.8 - 2.0 * var_between
+        between_score = 0.7 - 3.5 * var_between  # CHANGED: drops faster
     else:  # significant disagreement - use exponential decay
         between_score = max(0.1, np.exp(-5.0 * var_between))
 
     # CHANGED: adjusted within-expert certainty score scaling
-    # use 0.4 instead of 0.5 for more conservative estimates
-    within_score = 1.0 - min(mean_halfwidth / 0.4, 1.0)
+    # use 0.3 instead of 0.5 for tighter scaling
+    within_score = 1.0 - min(mean_halfwidth / 0.3, 1.0)
 
     # overall confidence: harmonic mean of agreement and certainty
     # harmonic mean penalizes if either component is low
