@@ -236,13 +236,8 @@ async def main() -> int:
         "--prompts-dir", default="prompts", help="Directory containing prompt templates"
     )
 
-    # infrastructure selection
-    parser.add_argument(
-        "--infrastructure",
-        choices=["local", "tempest", "aws"],
-        default="local",
-        help="Infrastructure to use: local, tempest (MSU), or aws",
-    )
+    # vLLM endpoint (can be overridden by infrastructure selection)
+    parser.add_argument("--vllm-endpoint", help="Override vLLM server endpoint")
     parser.add_argument(
         "--ssh-tunnel",
         action="store_true",
@@ -329,8 +324,10 @@ async def main() -> int:
         print("DelPHEA-irAKI: Starting irAKI Classification")
         print("-" * 60)
         print(f"Case ID: {args.case_id}")
-        print(f"Expert Count: {delphi_config.expert_count}")
-        print(f"Conflict Threshold: {delphi_config.conflict_threshold}")
+        print(
+            f"Expert Count: {len(config_loader.get_available_expert_ids())} (full panel)"
+        )
+        print(f"Conflict Detection: {delphi_config.conflict_method}")
         print(f"vLLM Endpoint: {runtime_config.get_vllm_endpoint()}")
         print(f"Model: {runtime_config.model_name}")
         print(f"Data Source: {'Real' if runtime_config.use_real_data else 'Dummy'}")
