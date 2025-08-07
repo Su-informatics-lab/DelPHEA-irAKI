@@ -9,7 +9,7 @@ from pathlib import Path
 # add parent directory to path
 sys.path.append(str(Path(__file__).parent.parent))
 
-from data.dataloader import DataLoader
+from dataloader import DataLoader
 
 
 def test_dummy_mode():
