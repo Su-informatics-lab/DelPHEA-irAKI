@@ -18,7 +18,7 @@ conjugate beta distribution approach, weighted by expert confidence.
     │ p₁, CI₁, w₁ │             │ α = α₀ + Σ(wᵢαᵢ) │
     │ p₂, CI₂, w₂ │  ────────>  │ β = β₀ + Σ(wᵢβᵢ) │
     │     ...     │             │ αᵢ from CI width │
-    │ pₙ, CIₙ, wₙ │              │ βᵢ from CI width │
+    │ pₙ, CIₙ, wₙ  │             │ βᵢ from CI width │
     └─────────────┘             └──────────────────┘
           │                              ▼
           │                     ┌───────────────────┐
