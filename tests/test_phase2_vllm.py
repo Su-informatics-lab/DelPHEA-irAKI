@@ -473,7 +473,7 @@ async def test_expert_simulation(endpoint: str, model_name: str) -> VLLMTestResu
 
         # create expert agent
         expert = irAKIExpertAgent(
-            expert_id="nephrologist_1",
+            expert_id="medical_oncology",  # use actual expert_id from panel.json
             case_id="test_case",
             config_loader=loader,
             vllm_client=vllm_client,
@@ -614,9 +614,7 @@ def main():
     parser.add_argument("--node", help="SLURM node name or IP (e.g., gpu-node-001)")
     parser.add_argument("--endpoint", help="Full vLLM endpoint URL (overrides --node)")
     parser.add_argument(
-        "--model",
-        default="meta-llama/Llama-3.1-70B-Instruct",
-        help="Model name for testing",
+        "--model", default="openai/gpt-oss-120b", help="Model name for testing"
     )
     parser.add_argument(
         "--verbose", "-v", action="store_true", help="Show detailed output"
@@ -638,6 +636,11 @@ def main():
 
     print(f"Testing vLLM endpoint: {endpoint}")
     print(f"Model: {args.model}")
+
+    # Important note about the model
+    if "gpt-oss" in args.model.lower():
+        print("Note: Using GPT-OSS-120B model (120B parameters)")
+        print("Expected latency: 5-15s per generation due to model size")
 
     if args.quick:
         # quick health check only
