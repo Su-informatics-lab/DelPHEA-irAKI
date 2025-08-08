@@ -170,8 +170,8 @@ async def run_iraki_assessment(case_id: str, runtime_config: RuntimeConfig) -> D
     moderator_agent = irAKIModeratorAgent(
         case_id=case_id,
         config_loader=config_loader,
-        vllm_client=llm_client,
-        runtime_config=runtime_config,
+        data_loader=data_loader,
+        delphi_config=delphi_config,
     )
 
     # register moderator agent (NEW AUTOGEN API)
