@@ -43,7 +43,6 @@ from pathlib import Path
 from typing import Dict
 
 import httpx
-from autogen_core import SingleThreadedAgentRuntime
 
 sys.path.append(str(Path(__file__).parent))
 
@@ -135,6 +134,10 @@ async def run_iraki_assessment(case_id: str, runtime_config: RuntimeConfig) -> D
     Returns:
         Dict: Assessment results with consensus probability and recommendations
     """
+    import logging
+
+    from autogen_core import AgentId, SingleThreadedAgentRuntime
+
     logger = logging.getLogger("assessment")
     logger.info(f"Starting irAKI assessment for case: {case_id}")
 
@@ -174,12 +177,18 @@ async def run_iraki_assessment(case_id: str, runtime_config: RuntimeConfig) -> D
         delphi_config=delphi_config,
     )
 
-    # register moderator agent (NEW AUTOGEN API)
-    await irAKIModeratorAgent.register(runtime, "moderator", lambda: moderator_agent)
+    # register moderator agent using AgentId
+    moderator_id = AgentId(type="moderator", key=case_id)
+    await irAKIModeratorAgent.register(
+        runtime,
+        moderator_id,
+        lambda: moderator_agent,
+    )
 
-    # register expert agents based on configuration
+    # register expert agents based on configuration (using AgentId)
     expert_configs = config_loader.expert_panel["expert_panel"]["experts"]
     expert_agents = []
+    expert_ids = []
     for expert_config in expert_configs:
         agent = irAKIExpertAgent(
             expert_id=expert_config["id"],
@@ -189,11 +198,14 @@ async def run_iraki_assessment(case_id: str, runtime_config: RuntimeConfig) -> D
             runtime_config=runtime_config,
         )
         expert_agents.append(agent)
-        await irAKIExpertAgent.register(
-            runtime, f"expert_{expert_config['id']}", lambda a=agent: a
-        )
+        exp_id = AgentId(type="expert", key=expert_config["id"])
+        expert_ids.append(exp_id)
+        await irAKIExpertAgent.register(runtime, exp_id, lambda a=agent: a)
 
     logger.info(f"Registered ALL {len(expert_configs)} expert agents")
+
+    # start the runtime
+    runtime.start()
 
     # start assessment by sending case to moderator
     await runtime.send_message(
@@ -202,11 +214,11 @@ async def run_iraki_assessment(case_id: str, runtime_config: RuntimeConfig) -> D
             patient_data=patient_case,
             expert_ids=[e["id"] for e in expert_configs],
         ),
-        "moderator",
+        moderator_id,
     )
 
     # run until completion
-    await runtime.stop()
+    await runtime.stop_when_idle()
 
     # return results (placeholder for now)
     return {
