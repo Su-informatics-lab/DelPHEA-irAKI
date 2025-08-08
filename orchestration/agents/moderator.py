@@ -44,6 +44,7 @@ from autogen_core import MessageContext, RoutedAgent, TopicId, message_handler, 
 
 from config.core import DelphiConfig
 from config.loader import ConfigurationLoader
+from dataloader import DataLoader  # FIX: Import DataLoader from dataloader.py
 from orchestration.consensus import beta_pool_confidence
 from orchestration.messages import (
     AckMsg,
@@ -68,7 +69,7 @@ class irAKIModeratorAgent(RoutedAgent):
         self,
         case_id: str,
         config_loader: ConfigurationLoader,
-        data_loader: DataLoaderWrapper,
+        data_loader: DataLoader,  # FIX: Changed from DataLoaderWrapper to DataLoader
         delphi_config: DelphiConfig,
     ) -> None:
         """Initialize moderator for case coordination.
@@ -76,7 +77,7 @@ class irAKIModeratorAgent(RoutedAgent):
         Args:
             case_id: Case identifier
             config_loader: Configuration loader instance
-            data_loader: Data loader wrapper instance
+            data_loader: Data loader instance (changed from DataLoaderWrapper)
             delphi_config: Delphi methodology configuration
         """
         super().__init__(f"irAKI Moderator for case {case_id}")
