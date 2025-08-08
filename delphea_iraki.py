@@ -181,7 +181,7 @@ async def run_iraki_assessment(case_id: str, runtime_config: RuntimeConfig) -> D
     moderator_id = AgentId(type="moderator", key=case_id)
     await irAKIModeratorAgent.register(
         runtime,
-        moderator_id,
+        "moderator",
         lambda: moderator_agent,
     )
 
@@ -200,7 +200,7 @@ async def run_iraki_assessment(case_id: str, runtime_config: RuntimeConfig) -> D
         expert_agents.append(agent)
         exp_id = AgentId(type="expert", key=expert_config["id"])
         expert_ids.append(exp_id)
-        await irAKIExpertAgent.register(runtime, exp_id, lambda a=agent: a)
+        await irAKIExpertAgent.register(runtime, "expert", lambda a=agent: a)
 
     logger.info(f"Registered ALL {len(expert_configs)} expert agents")
 
