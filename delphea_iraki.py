@@ -241,8 +241,8 @@ def main():
     parser.add_argument(
         "--vllm-endpoint",
         type=str,
-        default="http://localhost:8000",
-        help="VLLM server endpoint (default: http://localhost:8000)",
+        default="http://tempest-gpu021:8000",
+        help="VLLM server endpoint (default: http://tempest-gpu021:8000)",
     )
 
     parser.add_argument(
@@ -265,52 +265,91 @@ def main():
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
 
-    # create infrastructure config with the endpoint
+    # import here to avoid circular imports
     from config.core import DelphiConfig, InfrastructureConfig
 
+    # create infrastructure config
     infrastructure_config = InfrastructureConfig()
 
-    # determine endpoint type and set accordingly
+    # handle endpoint configuration
     if args.local_model:
         infrastructure_config.endpoint_type = InfrastructureConfig.ENDPOINT_LOCAL
-        infrastructure_config.local_endpoint = args.vllm_endpoint
-    else:
-        # assume AWS endpoint by default (can be enhanced to detect)
-        infrastructure_config.endpoint_type = InfrastructureConfig.ENDPOINT_AWS
-        infrastructure_config.aws_endpoint = args.vllm_endpoint
+    elif args.vllm_endpoint:
+        # determine endpoint type based on the URL
+        if "tempest" in args.vllm_endpoint:
+            infrastructure_config.endpoint_type = InfrastructureConfig.ENDPOINT_TEMPEST
+        elif "172.31" in args.vllm_endpoint:
+            infrastructure_config.endpoint_type = InfrastructureConfig.ENDPOINT_AWS
+            infrastructure_config.aws_endpoint = args.vllm_endpoint
+        else:
+            # default to local for custom endpoints
+            infrastructure_config.endpoint_type = InfrastructureConfig.ENDPOINT_LOCAL
+            infrastructure_config.local_endpoint = args.vllm_endpoint
 
-    # create runtime configuration with proper parameters
+    # create runtime configuration - CORRECT WAY
     runtime_config = RuntimeConfig(
         infrastructure=infrastructure_config,
         use_real_data=args.use_real_data,
     )
 
-    # create delphi config if expert count is specified
-    delphi_config = None
-    if args.expert_count:
-        delphi_config = DelphiConfig(expert_count=args.expert_count)
-
     # run appropriate command
     if args.health_check:
+        print("=" * 70)
+        print("DelPHEA-irAKI System Health Check")
+        print("=" * 70)
+
         success = asyncio.run(run_health_check(runtime_config))
-        sys.exit(0 if success else 1)
+
+        print("=" * 70)
+        if success:
+            print("✓ Health check PASSED")
+            print("\nSystem is ready for:")
+            print("1. Mock mode testing: --case-id <ID> --local-model")
+            print("2. Real LLM testing: --case-id <ID> --vllm-endpoint <URL>")
+            print("\nAvailable patient IDs (first 5):")
+
+            # Show available patients
+            try:
+                from dataloader import DataLoader
+
+                loader = DataLoader(use_dummy=not args.use_real_data)
+                patients = loader.get_available_patients(limit=5)
+                for pid in patients:
+                    print(f"  - {pid}")
+            except:
+                print("  - iraki_case_001 (dummy)")
+
+            sys.exit(0)
+        else:
+            print("✗ Health check FAILED")
+            print("Check the errors above for details")
+            sys.exit(1)
 
     elif args.case_id:
         try:
-            # pass delphi_config if created
-            if delphi_config:
-                results = asyncio.run(
-                    run_iraki_assessment(args.case_id, runtime_config, delphi_config)
-                )
-            else:
-                results = asyncio.run(
-                    run_iraki_assessment(args.case_id, runtime_config)
-                )
+            # Create DelphiConfig (no expert_count)
+            delphi_config = DelphiConfig()
+
+            print(f"Starting assessment for case: {args.case_id}")
+            print(f"Mode: {'Local/Mock' if args.local_model else 'vLLM'}")
+            print(f"Data: {'Real' if args.use_real_data else 'Dummy'}")
+
+            results = asyncio.run(
+                run_iraki_assessment(args.case_id, runtime_config, delphi_config)
+            )
+
             print(f"\nAssessment Results:\n{results}")
         except Exception as e:
             logging.error(f"Assessment failed: {e}")
+            if args.verbose:
+                import traceback
+
+                traceback.print_exc()
             sys.exit(1)
 
     else:
         parser.print_help()
+        print("\nQuick start:")
+        print("  python delphea_iraki.py --health-check")
+        print("  python delphea_iraki.py --case-id iraki_case_001 --local-model")
         sys.exit(1)
