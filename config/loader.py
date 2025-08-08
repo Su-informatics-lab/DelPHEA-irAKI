@@ -269,18 +269,11 @@ class ConfigurationLoader:
             )
         return self._expert_lookup[expert_id]
 
-    def get_questions(self, question_id: str) -> Dict:
+    def get_questions(self) -> list:
         """
-        Get specific question configuration.
-
-        Args:
-            question_id: Question identifier
-
+        Return the full list of assessment questions.
         Returns:
-            Dict: Question configuration
-
-        Raises:
-            KeyError: If question_id not found
+            List: All question configurations
         """
         return self._questionnaire["questionnaire"]["questions"]
 
