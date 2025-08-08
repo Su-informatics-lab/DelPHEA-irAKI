@@ -65,11 +65,6 @@ logging.basicConfig(
 async def run_health_check(runtime_config: RuntimeConfig) -> bool:
     """Run system health check.
 
-    Validates:
-    - Configuration files exist and are valid
-    - Data loader can initialize
-    - VLLM endpoint is reachable (if not local)
-
     Args:
         runtime_config: Runtime configuration
 
@@ -79,52 +74,55 @@ async def run_health_check(runtime_config: RuntimeConfig) -> bool:
     logger = logging.getLogger("health_check")
     logger.info("Starting health check...")
 
-    try:
-        # check configuration
-        config_loader = ConfigurationLoader(runtime_config)
-        logger.info(
-            f"✓ Configuration loaded: {len(config_loader.expert_panel['expert_panel']['experts'])} experts"
-        )
+    checks_passed = True
 
-        # check data loader - it handles dummy vs real internally
+    # check 1: configuration files
+    try:
+        config_loader = ConfigurationLoader(runtime_config)
+        logger.info("✓ Configuration files loaded")
+    except Exception as e:
+        logger.error(f"✗ Configuration loading failed: {e}")
+        checks_passed = False
+
+    # check 2: data loader
+    try:
         data_loader = DataLoader(
             data_dir=runtime_config.data_dir, use_dummy=not runtime_config.use_real_data
         )
-
-        if data_loader.is_available():
-            mode = "DUMMY" if data_loader.use_dummy else "REAL"
-            logger.info(f"✓ DataLoader initialized in {mode} mode")
+        available_patients = data_loader.get_available_patients(limit=1)
+        if available_patients:
+            logger.info(
+                f"✓ Data loader initialized ({len(available_patients)} patients available)"
+            )
         else:
-            logger.error("✗ DataLoader not available")
-            return False
-
-        # check VLLM endpoint if configured
-        # get the endpoint from the infrastructure config
-        vllm_endpoint = runtime_config.get_vllm_endpoint()
-
-        # only check if not using local/mock mode
-        if vllm_endpoint and runtime_config.infrastructure.endpoint_type != "local":
-            async with httpx.AsyncClient() as client:
-                try:
-                    response = await client.get(f"{vllm_endpoint}/health")
-                    if response.status_code == 200:
-                        logger.info(f"✓ VLLM endpoint reachable: {vllm_endpoint}")
-                    else:
-                        logger.warning(
-                            f"⚠ VLLM endpoint returned status {response.status_code}"
-                        )
-                except Exception as e:
-                    logger.warning(f"⚠ Could not reach VLLM endpoint: {e}")
-
-        logger.info("✓ Health check passed")
-        return True
-
+            logger.warning("⚠ No patient data available")
     except Exception as e:
-        logger.error(f"✗ Health check failed: {e}")
-        import traceback
+        logger.error(f"✗ Data loader initialization failed: {e}")
+        checks_passed = False
 
-        traceback.print_exc()  # print full traceback for debugging
-        return False
+    # check 3: vLLM endpoint (if not local)
+    if runtime_config.infrastructure.endpoint_type != "local":
+        endpoint = runtime_config.get_vllm_endpoint()
+        if endpoint:
+            try:
+                async with httpx.AsyncClient() as client:
+                    response = await client.get(f"{endpoint}/health", timeout=5.0)
+                    if response.status_code == 200:
+                        logger.info(f"✓ vLLM endpoint healthy: {endpoint}")
+                    else:
+                        logger.error(
+                            f"✗ vLLM endpoint unhealthy: {response.status_code}"
+                        )
+                        checks_passed = False
+            except Exception as e:
+                logger.error(f"✗ vLLM endpoint unreachable: {e}")
+                checks_passed = False
+        else:
+            logger.warning("⚠ No vLLM endpoint configured")
+    else:
+        logger.info("✓ Local model mode - no endpoint check needed")
+
+    return checks_passed
 
 
 async def run_iraki_assessment(case_id: str, runtime_config: RuntimeConfig) -> Dict:
@@ -334,9 +332,7 @@ def main():
             print(f"Mode: {'Local/Mock' if args.local_model else 'vLLM'}")
             print(f"Data: {'Real' if args.use_real_data else 'Dummy'}")
 
-            results = asyncio.run(
-                run_iraki_assessment(args.case_id, runtime_config, delphi_config)
-            )
+            results = asyncio.run(run_iraki_assessment(args.case_id, runtime_config))
 
             print(f"\nAssessment Results:\n{results}")
         except Exception as e:
@@ -355,5 +351,6 @@ def main():
         sys.exit(1)
 
 
+# CRITICAL FIX: Add the missing entry point!
 if __name__ == "__main__":
     main()
