@@ -99,7 +99,12 @@ class irAKIExpertAgent(RoutedAgent):
         self.logger = logging.getLogger(f"expert.{expert_id}")
 
         # load expert profile - fail fast if not found
-        self._expert_profile = self._config_loader.get_expert_profile(expert_id)
+        # derive profile directly from loaded JSON (no helper needed)
+        self._expert_profile = next(
+            ep
+            for ep in self._config_loader.expert_panel["expert_panel"]["experts"]
+            if ep["id"] == expert_id
+        )
         self.logger.info(
             f"Initialized expert: {self._expert_profile['name']} "
             f"({self._expert_profile['specialty']})"
