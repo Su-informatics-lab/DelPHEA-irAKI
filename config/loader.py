@@ -48,15 +48,6 @@ Configuration transparency ensures reproducible expert panel composition
 and assessment criteria for publication requirements.
 """
 
-"""
-Simplified Configuration Loader for DelPHEA-irAKI (YAGNI Principle)
-===================================================================
-
-Validates minimal required fields following YAGNI principle. Expert agents
-will interpret questions based on their built-in expertise rather than
-following prescriptive guidance.
-"""
-
 import json
 import logging
 from pathlib import Path
