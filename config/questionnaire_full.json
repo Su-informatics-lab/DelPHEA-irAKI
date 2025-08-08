@@ -2,7 +2,7 @@
   "questionnaire": {
     "title": "irAKI vs Other AKI Classification Assessment",
     "description": "Comprehensive clinical assessment to distinguish immune-related acute kidney injury from other AKI etiologies",
-    "version": "1.1",
+    "version": "2.0",
     "timestamp": "Aug 7, 2025",
     "reference": "Based on Sprangers et al. Nature Reviews Nephrology 2022 and clinical guidelines with peer-review enhancements",
     "scale": {

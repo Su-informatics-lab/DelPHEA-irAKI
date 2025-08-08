@@ -18,8 +18,7 @@ class InfrastructureConfig:
     ENDPOINT_TEMPEST = "tempest"
     ENDPOINT_LOCAL = "local"
 
-    # CHANGED: Default to Tempest instead of AWS
-    endpoint_type: str = ENDPOINT_TEMPEST  # Changed from ENDPOINT_AWS
+    endpoint_type: str = ENDPOINT_TEMPEST
 
     # aws configuration
     aws_endpoint: str = "http://172.31.11.192:8000"
@@ -91,7 +90,7 @@ class RuntimeConfig:
     api_key: Optional[str] = None
 
     # inference parameters
-    temperature: float = 0.7
+    temperature: float = 0.3
     top_p: float = 0.9
     max_tokens: int = 102400
     timeout: float = 120.0
