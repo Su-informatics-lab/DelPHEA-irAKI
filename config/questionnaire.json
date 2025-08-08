@@ -1,9 +1,9 @@
 {
   "questionnaire": {
-    "title": "irAKI vs Other AKI Classification Assessment (Enhanced)",
-    "description": "Comprehensive clinical assessment to distinguish immune-related acute kidney injury from other AKI etiologies",
-    "version": "1.1",
-    "reference": "Based on Sprangers et al. Nature Reviews Nephrology 2022 and clinical guidelines with peer-review enhancements",
+    "title": "irAKI vs Other AKI Classification Assessment",
+    "version": "2.0",
+    "timestamp": "Aug 7, 2025",
+    "reference": "Sprangers et al. Nature Reviews Nephrology 2022",
     "scale": {
       "type": "9-point Likert",
       "range": "1-9",
@@ -16,431 +16,67 @@
     "questions": [
       {
         "id": "Q1",
-        "category": "temporal_relationship",
-        "question": "The temporal relationship between immune checkpoint inhibitor (ICI) exposure and AKI onset strongly supports irAKI diagnosis",
-        "description": "Assess the timing of AKI development in relation to ICI therapy initiation/continuation. Note: combination ICI regimens typically have shorter median time-to-irAKI (4-8 weeks) vs monotherapy (≥12 weeks)",
-        "clinical_context": {
-          "supportive_evidence": [
-            "AKI onset 2-5 months after ICI initiation (monotherapy)",
-            "AKI onset 4-8 weeks after combination ICI initiation",
-            "Clear temporal sequence without other explanations",
-            "AKI development during active ICI treatment",
-            "No alternative temporal associations"
-          ],
-          "contradictory_evidence": [
-            "AKI onset before ICI therapy",
-            "AKI onset >12 months after ICI discontinuation",
-            "Clear alternative temporal cause identified",
-            "AKI pattern inconsistent with typical irAKI timeline"
-          ]
-        },
-        "specialty_focus": {
-          "medical_oncology": "ICI treatment timeline and dosing history",
-          "nephrology": "AKI progression pattern and timing",
-          "clinical_pharmacy": "Drug exposure timeline analysis"
-        }
+        "question": "The temporal relationship between immune checkpoint inhibitor (ICI) exposure and AKI onset strongly supports irAKI diagnosis"
       },
       {
         "id": "Q2",
-        "category": "prerenal_exclusion",
-        "question": "Prerenal causes of AKI have been adequately excluded",
-        "description": "Evaluate whether volume depletion, hypotension, or reduced effective circulating volume explains the AKI",
-        "clinical_context": {
-          "assessment_criteria": [
-            "Hemodynamic stability assessment",
-            "Volume status evaluation",
-            "Response to fluid resuscitation",
-            "Fractional excretion of sodium/urea",
-            "Medication effects on renal perfusion"
-          ],
-          "exclusion_evidence": [
-            "Normal hemodynamics and volume status",
-            "Lack of response to appropriate fluid resuscitation",
-            "FENa >1% or FeUrea >35%",
-            "No nephrotoxic hemodynamic medications"
-          ]
-        },
-        "specialty_focus": {
-          "critical_care": "Hemodynamic assessment and fluid status",
-          "nephrology": "Renal perfusion and prerenal markers",
-          "hospital_medicine": "Clinical volume assessment"
-        }
+        "question": "Prerenal causes of AKI have been adequately excluded"
       },
       {
         "id": "Q3",
-        "category": "postrenal_exclusion",
-        "question": "Postrenal/obstructive causes of AKI have been adequately excluded",
-        "description": "Assess whether urinary tract obstruction or structural abnormalities explain the AKI",
-        "clinical_context": {
-          "assessment_criteria": [
-            "Renal ultrasound findings",
-            "CT imaging if indicated",
-            "Bladder catheter drainage response",
-            "Post-void residual assessment",
-            "Urological evaluation if appropriate"
-          ],
-          "exclusion_evidence": [
-            "Normal renal ultrasound without hydronephrosis",
-            "No evidence of structural obstruction",
-            "Normal bladder emptying",
-            "No retroperitoneal pathology"
-          ]
-        },
-        "specialty_focus": {
-          "nephrology": "Structural kidney assessment",
-          "emergency_medicine": "Rapid obstruction exclusion",
-          "clinical_informatics": "Imaging data interpretation"
-        }
+        "question": "Postrenal/obstructive causes of AKI have been adequately excluded"
       },
       {
         "id": "Q4",
-        "category": "other_intrinsic_exclusion",
-        "question": "Other intrinsic causes of AKI (ATN, contrast nephropathy, other drugs) have been adequately excluded",
-        "description": "Evaluate alternative intrinsic kidney injury mechanisms beyond immune-mediated causes",
-        "clinical_context": {
-          "alternative_causes": [
-            "Acute tubular necrosis from hypotension/sepsis",
-            "Contrast-induced nephropathy",
-            "Other nephrotoxic medications",
-            "Rhabdomyolysis or tumor lysis syndrome",
-            "Thrombotic microangiopathy"
-          ],
-          "exclusion_criteria": [
-            "No significant hypotensive episodes",
-            "No recent contrast exposure",
-            "Careful medication review excludes other nephrotoxins",
-            "No evidence of muscle breakdown or hemolysis",
-            "Normal peripheral blood smear"
-          ]
-        },
-        "specialty_focus": {
-          "nephrology": "Comprehensive AKI differential diagnosis",
-          "clinical_pharmacy": "Nephrotoxic medication assessment",
-          "critical_care": "Sepsis and hypotension-related AKI"
-        }
+        "question": "Other intrinsic causes of AKI (ATN, contrast nephropathy, other drugs) have been adequately excluded"
       },
       {
         "id": "Q5",
-        "category": "urinalysis_pattern",
-        "question": "Urinalysis findings are consistent with immune-mediated kidney injury",
-        "description": "Assess urinalysis pattern for findings suggestive of tubulointerstitial nephritis or immune injury",
-        "clinical_context": {
-          "supportive_findings": [
-            "Proteinuria (typically <3g/day)",
-            "Microscopic hematuria",
-            "Pyuria without bacterial infection",
-            "White blood cell casts",
-            "Eosinophiluria (if present)",
-            "Granular casts",
-            "Absence of muddy-brown casts (excludes ATN)"
-          ],
-          "atypical_findings": [
-            "Massive proteinuria (>3g/day)",
-            "Red blood cell casts (suggests glomerular disease)",
-            "No inflammatory cells",
-            "Normal urinalysis despite significant AKI"
-          ]
-        },
-        "specialty_focus": {
-          "nephrology": "Urinalysis pattern interpretation",
-          "renal_pathology": "Urinary sediment correlation with histology",
-          "oncology_nursing": "Urinalysis monitoring in irAE assessment"
-        }
+        "question": "Urinalysis findings are consistent with immune-mediated kidney injury"
       },
       {
         "id": "Q6",
-        "category": "systemic_immune_activation",
-        "question": "Laboratory evidence suggests systemic immune activation consistent with irAKI",
-        "description": "Evaluate biomarkers and laboratory findings indicative of immune system activation",
-        "clinical_context": {
-          "supportive_markers": [
-            "Peripheral eosinophilia (>4%)",
-            "Elevated inflammatory markers (CRP, ESR)",
-            "Complement consumption (low C3/C4)",
-            "Elevated cytokines if measured",
-            "Other organ irAE manifestations"
-          ],
-          "assessment_considerations": [
-            "Eosinophil count trend over time",
-            "Inflammatory marker correlation with AKI timing",
-            "Complement levels compared to baseline",
-            "Systemic vs localized inflammatory response"
-          ]
-        },
-        "specialty_focus": {
-          "rheumatology": "Immune activation markers and complement",
-          "clinical_informatics": "Biomarker pattern analysis",
-          "medical_oncology": "irAE-associated laboratory patterns"
-        }
+        "question": "Laboratory evidence suggests systemic immune activation consistent with irAKI"
       },
       {
         "id": "Q7",
-        "category": "concomitant_medications",
-        "question": "Concomitant medications known to cause AKI/ATIN have been adequately assessed and excluded",
-        "description": "Evaluate exposure to medications commonly associated with acute tubulointerstitial nephritis",
-        "clinical_context": {
-          "high_risk_medications": [
-            "Proton pump inhibitors (PPIs)",
-            "NSAIDs (including selective COX-2 inhibitors)",
-            "Antibiotics (especially beta-lactams, sulfonamides)",
-            "Diuretics and ACE inhibitors",
-            "Other immunosuppressive agents"
-          ],
-          "assessment_approach": [
-            "Comprehensive medication reconciliation",
-            "Temporal relationship analysis for each medication",
-            "Dose and duration assessment",
-            "Previous tolerance to these medications",
-            "Response to medication discontinuation"
-          ]
-        },
-        "specialty_focus": {
-          "clinical_pharmacy": "Comprehensive medication analysis",
-          "hospitalist": "Medication reconciliation and assessment",
-          "nephrology": "Drug-induced nephritis patterns"
-        }
+        "question": "Concomitant medications known to cause AKI/ATIN have been adequately assessed and excluded"
       },
       {
         "id": "Q8",
-        "category": "other_irae_correlation",
-        "question": "The presence of other immune-related adverse events (irAEs) supports the diagnosis of irAKI",
-        "description": "Assess whether concurrent or previous irAEs support immune-mediated etiology",
-        "clinical_context": {
-          "relevant_iraes": [
-            "Dermatologic irAEs (rash, vitiligo)",
-            "Gastrointestinal irAEs (colitis, hepatitis)",
-            "Endocrine irAEs (thyroiditis, hypophysitis)",
-            "Pulmonary irAEs (pneumonitis)",
-            "Rheumatologic irAEs (arthritis, myositis)"
-          ],
-          "correlation_factors": [
-            "Temporal clustering of multiple irAEs",
-            "Response pattern to immunosuppression",
-            "Shared immune-mediated mechanisms",
-            "Severity correlation across organ systems"
-          ]
-        },
-        "specialty_focus": {
-          "medical_oncology": "irAE pattern recognition and correlation",
-          "rheumatology": "Multi-organ autoimmune manifestations",
-          "oncology_nursing": "irAE monitoring and documentation"
-        }
+        "question": "The presence of other immune-related adverse events (irAEs) supports the diagnosis of irAKI"
       },
       {
         "id": "Q9",
-        "category": "biopsy_indication",
-        "question": "Kidney biopsy is indicated and expected to show findings consistent with immune-mediated injury",
-        "description": "Assess the appropriateness and expected yield of kidney biopsy for confirming irAKI",
-        "clinical_context": {
-          "biopsy_indications": [
-            "AKI stage 2 or higher without clear alternative cause",
-            "Atypical presentation requiring tissue diagnosis",
-            "Need to exclude other glomerular diseases",
-            "Persistent AKI despite initial management",
-            "Unusual urinalysis findings"
-          ],
-          "expected_findings": [
-            "Acute tubulointerstitial nephritis (most common)",
-            "Lymphocytic infiltrate in interstitium",
-            "Tubular epithelial damage",
-            "Possible eosinophil infiltration",
-            "Minimal glomerular involvement"
-          ]
-        },
-        "specialty_focus": {
-          "nephrology": "Biopsy indication assessment",
-          "renal_pathology": "Expected histologic patterns in irAKI",
-          "medical_oncology": "Risk-benefit of biopsy in cancer patients"
-        }
+        "question": "Kidney biopsy is indicated and expected to show findings consistent with immune-mediated injury"
       },
       {
         "id": "Q10",
-        "category": "treatment_response",
-        "question": "The clinical course and expected response pattern are consistent with irAKI",
-        "description": "Evaluate whether the natural history and treatment response support immune-mediated etiology",
-        "clinical_context": {
-          "typical_course": [
-            "Subacute onset over days to weeks",
-            "Progressive worsening without intervention",
-            "Non-response to fluid resuscitation",
-            "Response to corticosteroid therapy",
-            "Improvement with ICI discontinuation",
-            "Potential for recurrence with rechallenge"
-          ],
-          "response_indicators": [
-            "Creatinine improvement with steroids",
-            "Resolution of urinalysis abnormalities",
-            "Improvement in other concurrent irAEs",
-            "Appropriate timeline for recovery"
-          ]
-        },
-        "specialty_focus": {
-          "nephrology": "AKI recovery patterns and steroid response",
-          "medical_oncology": "irAE treatment response patterns",
-          "critical_care": "Clinical course in critically ill patients"
-        }
+        "question": "The clinical course and expected response pattern are consistent with irAKI"
       },
       {
         "id": "Q11",
-        "category": "alternative_diagnosis_exclusion",
-        "question": "Alternative systemic diagnoses for AKI have been systematically excluded",
-        "description": "Comprehensive assessment excluding systemic and cancer-related specific causes of AKI in this clinical context",
-        "clinical_context": {
-          "specific_alternatives": [
-            "Cancer-related AKI (tumor lysis, obstruction)",
-            "Infection-related AKI (sepsis, direct infection)",
-            "Chemotherapy-induced nephrotoxicity",
-            "Autoimmune disease flare (lupus, vasculitis)",
-            "Thrombotic microangiopathy",
-            "Acute glomerulonephritis"
-          ],
-          "exclusion_workup": [
-            "Infection markers and cultures",
-            "Autoimmune serologies if indicated",
-            "Complement levels and immune complexes",
-            "Peripheral blood smear examination",
-            "Cancer staging and complication assessment"
-          ]
-        },
-        "specialty_focus": {
-          "nephrology": "Systematic AKI differential diagnosis",
-          "rheumatology": "Autoimmune disease exclusion",
-          "medical_oncology": "Cancer-related AKI causes"
-        }
+        "question": "Alternative systemic diagnoses for AKI have been systematically excluded"
       },
       {
         "id": "Q12",
-        "category": "clinical_gestalt",
-        "question": "Overall clinical judgment strongly favors irAKI as the most likely diagnosis",
-        "description": "Integrative clinical assessment considering all available evidence",
-        "clinical_context": {
-          "integration_factors": [
-            "Constellation of clinical findings",
-            "Temporal relationships and timeline",
-            "Response to interventions",
-            "Exclusion of alternative diagnoses",
-            "Consistency with known irAKI patterns",
-            "Overall clinical coherence"
-          ],
-          "confidence_factors": [
-            "Strength of supporting evidence",
-            "Adequacy of alternative cause exclusion",
-            "Quality and completeness of available data",
-            "Consistency across clinical domains",
-            "Alignment with published literature"
-          ]
-        },
-        "specialty_focus": {
-          "all_specialties": "Integrative clinical reasoning",
-          "clinical_informatics": "Evidence synthesis and pattern recognition",
-          "hospitalist": "Comprehensive case assessment"
-        }
+        "question": "Overall clinical judgment strongly favors irAKI as the most likely diagnosis"
       },
       {
         "id": "Q13",
-        "category": "infection_exclusion",
-        "question": "Infection-related AKI (septic ATN, pyelonephritis, other infectious causes) has been systematically excluded",
-        "description": "Systematic exclusion of infection-mediated AKI in immunosuppressed cancer patients",
-        "clinical_context": {
-          "exclusion_criteria": [
-            "Negative blood and urine cultures",
-            "Absence of fever or systemic inflammatory response",
-            "No evidence of pyelonephritis or other renal infections",
-            "Adequate MAP without septic physiology",
-            "No occult infections (imaging, biomarkers)"
-          ],
-          "high_risk_factors": [
-            "Immunosuppressed state from cancer/treatment",
-            "Recent invasive procedures or hospitalizations",
-            "Indwelling devices or catheters",
-            "Atypical presentations in immunocompromised patients"
-          ]
-        },
-        "specialty_focus": {
-          "infectious_disease": "Occult infection identification in immunocompromised",
-          "critical_care": "Sepsis-associated AKI vs other causes",
-          "emergency_medicine": "Rapid infection screening and risk assessment"
-        }
+        "question": "Infection-related AKI (septic ATN, pyelonephritis, other infectious causes) has been systematically excluded"
       },
       {
         "id": "Q14",
-        "category": "imaging_evidence",
-        "question": "Radiologic findings support immune-mediated kidney injury or exclude alternative structural causes",
-        "description": "Assessment of imaging evidence for intrinsic parenchymal injury patterns consistent with or contradicting irAKI",
-        "clinical_context": {
-          "supportive_findings": [
-            "Increased renal cortical echogenicity",
-            "Peri-renal inflammatory changes",
-            "Bilateral symmetric kidney involvement",
-            "No evidence of cortical necrosis or infarcts",
-            "Normal collecting system"
-          ],
-          "contradictory_findings": [
-            "Renal vein thrombosis",
-            "Cortical necrosis patterns",
-            "Asymmetric involvement suggesting vascular cause",
-            "Evidence of renal infarction",
-            "Structural abnormalities explaining AKI"
-          ]
-        },
-        "specialty_focus": {
-          "radiology": "Imaging pattern recognition for immune vs other causes",
-          "nephrology": "Correlation of imaging with clinical presentation",
-          "emergency_medicine": "Rapid imaging interpretation for alternative causes"
-        }
+        "question": "Radiologic findings support immune-mediated kidney injury or exclude alternative structural causes"
       },
       {
         "id": "Q15",
-        "category": "baseline_risk_factors",
-        "question": "Baseline renal reserve, age-related changes, and frailty have been appropriately considered in AKI assessment",
-        "description": "Assessment accounts for baseline CKD, geriatric factors, and individual patient vulnerability",
-        "clinical_context": {
-          "risk_modifiers": [
-            "Baseline eGFR and CKD stage",
-            "Age-related nephron loss and reserve",
-            "Frailty indices and functional status",
-            "Polypharmacy and drug interactions",
-            "Comorbidity burden affecting recovery"
-          ],
-          "assessment_considerations": [
-            "Lower threshold for significant AKI in CKD patients",
-            "Age-adjusted expectations for recovery",
-            "Medication adjustment for renal function",
-            "Frailty impact on treatment tolerance"
-          ]
-        },
-        "specialty_focus": {
-          "geriatric_medicine": "Age and frailty impact on AKI presentation and recovery",
-          "clinical_pharmacy": "Medication adjustments for baseline renal function",
-          "nephrology": "Baseline CKD impact on AKI severity and prognosis"
-        }
+        "question": "Baseline renal reserve, age-related changes, and frailty have been appropriately considered in AKI assessment"
       },
       {
         "id": "Q16",
-        "category": "rechallenge_assessment",
-        "question": "The risk-benefit profile supports rechallenge with ICI therapy after AKI recovery",
-        "description": "Assessment of whether restarting ICI is appropriate based on AKI severity, recovery, and cancer prognosis",
-        "clinical_context": {
-          "favorable_factors": [
-            "Complete or near-complete renal recovery",
-            "KDIGO stage 1-2 initial AKI severity",
-            "Clear alternative cause identified and addressed",
-            "Excellent cancer response to ICI therapy",
-            "No other viable treatment options available"
-          ],
-          "unfavorable_factors": [
-            "Incomplete renal recovery or CKD progression",
-            "KDIGO stage 3 AKI with prolonged course",
-            "Biopsy-proven severe tubulointerstitial nephritis",
-            "Multiple concurrent irAEs",
-            "Alternative effective cancer treatments available"
-          ]
-        },
-        "specialty_focus": {
-          "medical_oncology": "Cancer prognosis and alternative treatment options",
-          "nephrology": "Renal recovery assessment and rechallenge risk",
-          "renal_pathology": "Histologic severity predicting rechallenge risk"
-        }
+        "question": "The risk-benefit profile supports rechallenge with ICI therapy after AKI recovery"
       }
     ],
     "scoring_guidelines": {
@@ -455,7 +91,7 @@
         "low_confidence": "Mixed scores or insufficient evidence"
       },
       "consensus_calculation": {
-        "method": "Weighted average with confidence adjustment",
+        "method": "Beta-pooled consensus with confidence adjustment",
         "minimum_agreement": "≥70% of experts within 2 points on final gestalt",
         "debate_threshold": "≥3 point disagreement on any question"
       }
@@ -495,12 +131,5 @@
         ]
       }
     }
-  },
-  "validation": {
-    "content_validity": "Reviewed by multidisciplinary expert panel with peer-review feedback integration",
-    "clinical_correlation": "Based on published irAKI case series, guidelines, and expert consensus (Sprangers et al. 2022)",
-    "inter_rater_reliability": "Target >0.8 agreement among expert reviewers across 16-question assessment",
-    "sensitivity_analysis": "Question weighting validation against clinical outcomes and rechallenge decisions",
-    "expert_coverage": "Comprehensive specialty representation including infection disease, radiology, and geriatrics"
   }
 }
