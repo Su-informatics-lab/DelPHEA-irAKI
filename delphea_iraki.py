@@ -187,8 +187,6 @@ async def run_iraki_assessment(case_id: str, runtime_config: RuntimeConfig) -> D
 
     # register expert agents based on configuration (using AgentId)
     expert_configs = config_loader.expert_panel["expert_panel"]["experts"]
-    expert_agents = []
-    expert_ids = []
     for expert_config in expert_configs:
         agent = irAKIExpertAgent(
             expert_id=expert_config["id"],
@@ -197,10 +195,8 @@ async def run_iraki_assessment(case_id: str, runtime_config: RuntimeConfig) -> D
             vllm_client=llm_client,
             runtime_config=runtime_config,
         )
-        expert_agents.append(agent)
-        exp_id = AgentId(type="expert", key=expert_config["id"])
-        expert_ids.append(exp_id)
-        await irAKIExpertAgent.register(runtime, "expert", lambda a=agent: a)
+        agent_type = f"expert_{expert_config['id']}"
+        await irAKIExpertAgent.register(runtime, agent_type, lambda a=agent: a)
 
     logger.info(f"Registered ALL {len(expert_configs)} expert agents")
 
