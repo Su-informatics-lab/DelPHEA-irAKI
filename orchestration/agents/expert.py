@@ -143,6 +143,7 @@ class irAKIExpertAgent(RoutedAgent):
             llm_response = await self._vllm_client.generate_structured_response(
                 prompt=prompt, response_format=response_format
             )
+            self._log_first_tokens(llm_response, f"[{message.round_phase}]")
 
             # validate and clean response
             cleaned_response = self._validate_llm_response(
@@ -199,6 +200,7 @@ class irAKIExpertAgent(RoutedAgent):
             llm_response = await self._vllm_client.generate_structured_response(
                 prompt=prompt, response_format=response_format
             )
+            self._log_first_tokens(llm_response, "[debate]")
 
             # create debate comment
             comment = DebateComment(
@@ -341,6 +343,10 @@ class irAKIExpertAgent(RoutedAgent):
             formatted.append(f"{i}. [{q_id}] {q_text}{context_str}")
 
         return "\n".join(formatted)
+
+    def _log_first_tokens(self, response, context=""):
+        text = str(response)
+        self.logger.info(f"[{self._expert_id}]{context} First LLM output: {text[:200]}")
 
     def _add_round3_context(self, prompt: str, message: QuestionnaireMsg) -> str:
         """Add Round 3 specific context including debate learnings.
