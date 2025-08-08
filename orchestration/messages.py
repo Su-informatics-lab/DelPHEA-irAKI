@@ -298,21 +298,27 @@ class TerminateDebate(BaseModel):
 
 
 class StartCase(BaseModel):
-    """Bootstrap signal to begin Delphi process for a case.
+    """Bootstrap signal that kicks off the Delphi workflow.
 
-    Triggers moderator to load patient data and start Round 1.
+    Besides the case identifier, the moderator may receive a
+    lightweight snapshot of patient data and the roster of expert IDs
+    (useful when a distributed service launches the run).
     """
 
     model_config = ConfigDict(strict=True, extra="forbid")
 
+    # required
     case_id: str
-    priority: Optional[str] = "normal"  # "urgent", "normal", "research"
+
+    # optional metadata
+    priority: str = "normal"  # "urgent", "normal", "research"
+    patient_data: Optional[Dict[str, Any]] = None  # minimal EHR bundle
+    expert_ids: Optional[List[str]] = None  # full list or subset
 
     @field_validator("priority")
     @classmethod
     def validate_priority(cls, v: str) -> str:
-        """Ensure priority level is valid."""
-        if v not in ["urgent", "normal", "research"]:
+        if v not in {"urgent", "normal", "research"}:
             raise ValueError(f"Invalid priority: {v}")
         return v
 
