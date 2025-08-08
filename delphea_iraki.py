@@ -218,7 +218,7 @@ async def run_iraki_assessment(case_id: str, runtime_config: RuntimeConfig) -> D
 
 
 def main():
-    """Main entry point."""
+    """Main entry point for DelPHEA-irAKI."""
     parser = argparse.ArgumentParser(
         description="DelPHEA-irAKI: Expert consensus system for immune-related AKI classification"
     )
@@ -267,13 +267,30 @@ def main():
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
 
-    # create runtime configuration
+    # create infrastructure config with the endpoint
+    from config.core import DelphiConfig, InfrastructureConfig
+
+    infrastructure_config = InfrastructureConfig()
+
+    # determine endpoint type and set accordingly
+    if args.local_model:
+        infrastructure_config.endpoint_type = InfrastructureConfig.ENDPOINT_LOCAL
+        infrastructure_config.local_endpoint = args.vllm_endpoint
+    else:
+        # assume AWS endpoint by default (can be enhanced to detect)
+        infrastructure_config.endpoint_type = InfrastructureConfig.ENDPOINT_AWS
+        infrastructure_config.aws_endpoint = args.vllm_endpoint
+
+    # create runtime configuration with proper parameters
     runtime_config = RuntimeConfig(
-        vllm_endpoint=args.vllm_endpoint,
+        infrastructure=infrastructure_config,
         use_real_data=args.use_real_data,
-        expert_count=args.expert_count,
-        local_model=args.local_model,
     )
+
+    # create delphi config if expert count is specified
+    delphi_config = None
+    if args.expert_count:
+        delphi_config = DelphiConfig(expert_count=args.expert_count)
 
     # run appropriate command
     if args.health_check:
@@ -282,7 +299,15 @@ def main():
 
     elif args.case_id:
         try:
-            results = asyncio.run(run_iraki_assessment(args.case_id, runtime_config))
+            # pass delphi_config if created
+            if delphi_config:
+                results = asyncio.run(
+                    run_iraki_assessment(args.case_id, runtime_config, delphi_config)
+                )
+            else:
+                results = asyncio.run(
+                    run_iraki_assessment(args.case_id, runtime_config)
+                )
             print(f"\nAssessment Results:\n{results}")
         except Exception as e:
             logging.error(f"Assessment failed: {e}")
@@ -291,7 +316,3 @@ def main():
     else:
         parser.print_help()
         sys.exit(1)
-
-
-if __name__ == "__main__":
-    main()
