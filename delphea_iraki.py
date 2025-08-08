@@ -43,6 +43,7 @@ from pathlib import Path
 from typing import Dict
 
 import httpx
+from autogen_core import AgentId, SingleThreadedAgentRuntime
 
 sys.path.append(str(Path(__file__).parent))
 
@@ -134,9 +135,6 @@ async def run_iraki_assessment(case_id: str, runtime_config: RuntimeConfig) -> D
     Returns:
         Dict: Assessment results with consensus probability and recommendations
     """
-    import logging
-
-    from autogen_core import AgentId, SingleThreadedAgentRuntime
 
     logger = logging.getLogger("assessment")
     logger.info(f"Starting irAKI assessment for case: {case_id}")
@@ -169,34 +167,34 @@ async def run_iraki_assessment(case_id: str, runtime_config: RuntimeConfig) -> D
     ):
         llm_client = VLLMClient(runtime_config)
 
-    # instantiate moderator agent
-    moderator_agent = irAKIModeratorAgent(
-        case_id=case_id,
-        config_loader=config_loader,
-        data_loader=data_loader,
-        delphi_config=delphi_config,
-    )
-
-    # register moderator agent using AgentId
+    # register moderator agent
     moderator_id = AgentId(type="moderator", key=case_id)
     await irAKIModeratorAgent.register(
         runtime,
         "moderator",
-        lambda: moderator_agent,
-    )
-
-    # register expert agents based on configuration (using AgentId)
-    expert_configs = config_loader.expert_panel["expert_panel"]["experts"]
-    for expert_config in expert_configs:
-        agent = irAKIExpertAgent(
-            expert_id=expert_config["id"],
+        lambda: irAKIModeratorAgent(
             case_id=case_id,
             config_loader=config_loader,
-            vllm_client=llm_client,
-            runtime_config=runtime_config,
+            data_loader=data_loader,
+            delphi_config=delphi_config,
+        ),
+    )
+
+    # register expert agents (factory lambda per expert)
+    expert_configs = config_loader.expert_panel["expert_panel"]["experts"]
+    for expert_config in expert_configs:
+        agent_type = f"expert_{expert_config['id']}"  # unique per expert
+        await irAKIExpertAgent.register(
+            runtime,
+            agent_type,
+            lambda ec=expert_config: irAKIExpertAgent(
+                expert_id=ec["id"],
+                case_id=case_id,
+                config_loader=config_loader,
+                vllm_client=llm_client,
+                runtime_config=runtime_config,
+            ),
         )
-        agent_type = f"expert_{expert_config['id']}"
-        await irAKIExpertAgent.register(runtime, agent_type, lambda a=agent: a)
 
     logger.info(f"Registered ALL {len(expert_configs)} expert agents")
 
