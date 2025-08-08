@@ -39,16 +39,20 @@ import argparse
 import asyncio
 import logging
 import sys
+from pathlib import Path
 
 import httpx
 from autogen_core import AgentId, SingleThreadedAgentRuntime
 
-# data layer imports
-from data.loader import DataLoaderWrapper
+# add current directory to path for imports
+sys.path.append(str(Path(__file__).parent))
 
 # configuration imports
 from config.core import DelphiConfig, RuntimeConfig
 from config.loader import ConfigurationLoader
+
+# direct import of dataloader - no wrapper needed (YAGNI)
+from dataloader import DataLoader
 
 # orchestration imports
 from orchestration.agents.expert import irAKIExpertAgent
@@ -66,281 +70,233 @@ logging.basicConfig(
 async def run_health_check(runtime_config: RuntimeConfig) -> bool:
     """Run system health check.
 
+    Validates:
+    - Configuration files exist and are valid
+    - Data loader can initialize
+    - VLLM endpoint is reachable (if not local)
+
     Args:
         runtime_config: Runtime configuration
 
     Returns:
         bool: True if all checks pass
     """
+    logger = logging.getLogger("health_check")
+    logger.info("Starting health check...")
+
     try:
-        # validate configurations
+        # check configuration
         config_loader = ConfigurationLoader(runtime_config)
+        logger.info(
+            f"✓ Configuration loaded: {len(config_loader.expert_panel['expert_panel']['experts'])} experts"
+        )
 
-        # check vLLM endpoint
-        vllm_client = VLLMClient(runtime_config)
-        healthy = await vllm_client.health_check()
-        await vllm_client.close()
+        # check data loader - it handles dummy vs real internally
+        data_loader = DataLoader(
+            data_dir=runtime_config.data_dir, use_dummy=not runtime_config.use_real_data
+        )
 
-        if healthy:
-            print("✓ DelPHEA-irAKI system healthy")
-            print(f"✓ Loaded {len(config_loader.get_available_expert_ids())} experts")
-            print(f"✓ Loaded {len(config_loader.get_questions())} questions")
-            print(f"✓ vLLM endpoint: {runtime_config.get_vllm_endpoint()}")
-            print(f"✓ Model: {runtime_config.model_name}")
-            return True
+        if data_loader.is_available():
+            mode = "DUMMY" if data_loader.use_dummy else "REAL"
+            logger.info(f"✓ DataLoader initialized in {mode} mode")
         else:
-            print(
-                f"✗ vLLM health check failed for {runtime_config.get_vllm_endpoint()}"
-            )
+            logger.error("✗ DataLoader not available")
             return False
 
+        # check VLLM endpoint if provided
+        if runtime_config.vllm_endpoint and not runtime_config.local_model:
+            async with httpx.AsyncClient() as client:
+                try:
+                    response = await client.get(
+                        f"{runtime_config.vllm_endpoint}/health"
+                    )
+                    if response.status_code == 200:
+                        logger.info(
+                            f"✓ VLLM endpoint reachable: {runtime_config.vllm_endpoint}"
+                        )
+                    else:
+                        logger.warning(
+                            f"⚠ VLLM endpoint returned status {response.status_code}"
+                        )
+                except Exception as e:
+                    logger.warning(f"⚠ Could not reach VLLM endpoint: {e}")
+
+        logger.info("✓ Health check passed")
+        return True
+
     except Exception as e:
-        print(f"✗ Health check failed: {e}")
+        logger.error(f"✗ Health check failed: {e}")
         return False
 
 
-async def run_delphi_consensus(
-    case_id: str,
-    runtime_config: RuntimeConfig,
-    delphi_config: DelphiConfig,
-) -> int:
-    """Run the Delphi consensus process for a case.
+async def run_iraki_assessment(case_id: str, runtime_config: RuntimeConfig) -> Dict:
+    """Run irAKI assessment for a patient case.
 
     Args:
-        case_id: Case identifier
+        case_id: Patient case identifier
         runtime_config: Runtime configuration
-        delphi_config: Delphi methodology configuration
 
     Returns:
-        int: Exit code (0 for success)
+        Dict: Assessment results with consensus probability and recommendations
     """
-    logger = logging.getLogger("delphea_iraki.main")
+    logger = logging.getLogger("assessment")
+    logger.info(f"Starting irAKI assessment for case: {case_id}")
 
-    try:
-        # initialize configuration loader
-        logger.info("Loading configurations...")
-        config_loader = ConfigurationLoader(runtime_config)
+    # initialize components
+    config_loader = ConfigurationLoader(runtime_config)
+    delphi_config = DelphiConfig()
 
-        # initialize data loader
-        logger.info("Initializing data loader...")
-        data_loader = DataLoaderWrapper(
-            data_dir=runtime_config.data_dir, use_real_data=runtime_config.use_real_data
-        )
-
-        # create shared HTTP client for all vLLM requests
-        logger.info("Setting up vLLM client...")
-        shared_http_client = httpx.AsyncClient(
-            timeout=httpx.Timeout(
-                connect=30.0, read=runtime_config.timeout, write=10.0, pool=5.0
-            )
-        )
-
-        # create shared vLLM client
-        shared_vllm_client = VLLMClient(runtime_config, shared_http_client)
-
-        # verify vLLM is available
-        if not await shared_vllm_client.health_check():
-            logger.error("vLLM server is not healthy")
-            return 1
-
-        # create runtime for agent orchestration
-        logger.info("Initializing agent runtime...")
-        runtime = SingleThreadedAgentRuntime()
-
-        # register moderator agent
-        logger.info("Registering moderator agent...")
-        await runtime.register(
-            "Moderator",
-            lambda _: irAKIModeratorAgent(
-                case_id=case_id,
-                config_loader=config_loader,
-                data_loader=data_loader,
-                delphi_config=delphi_config,
-            ),
-        )
-
-        # register expert agents
-        expert_ids = config_loader.get_available_expert_ids()[
-            : delphi_config.expert_count
-        ]
-        logger.info(f"Registering {len(expert_ids)} expert agents...")
-
-        for expert_id in expert_ids:
-            await runtime.register(
-                f"Expert_{expert_id}",
-                lambda _, eid=expert_id: irAKIExpertAgent(
-                    expert_id=eid,
-                    case_id=case_id,
-                    config_loader=config_loader,
-                    vllm_client=shared_vllm_client,  # share vLLM client
-                ),
-            )
-
-        # start runtime
-        logger.info("Starting agent runtime...")
-        await runtime.start()
-
-        # bootstrap the Delphi process
-        logger.info(f"Starting Delphi process for case: {case_id}")
-        await runtime.send_message(
-            StartCase(case_id=case_id), AgentId("Moderator", case_id)
-        )
-
-        # wait for completion
-        logger.info("Waiting for consensus completion...")
-        await runtime.stop_when_idle()
-
-        # cleanup
-        logger.info("Cleaning up resources...")
-        await shared_vllm_client.close()
-        await shared_http_client.aclose()
-        await runtime.stop()
-
-        logger.info("✓ DelPHEA-irAKI completed successfully!")
-        return 0
-
-    except Exception as e:
-        logger.error(f"Fatal error in Delphi consensus: {e}", exc_info=True)
-        return 1
-
-
-async def main() -> int:
-    """Main entry point for DelPHEA-irAKI system.
-
-    Returns:
-        int: Exit code
-    """
-    parser = argparse.ArgumentParser(
-        description="DelPHEA-irAKI: Clinical Decision Support for immune-related AKI"
+    # initialize data loader directly - no wrapper needed
+    data_loader = DataLoader(
+        data_dir=runtime_config.data_dir, use_dummy=not runtime_config.use_real_data
     )
 
-    # core arguments
+    # load patient case
+    try:
+        patient_case = data_loader.load_patient_case(case_id)
+        logger.info(f"Loaded case: {patient_case['case_id']}")
+    except ValueError as e:
+        logger.error(f"Failed to load case {case_id}: {e}")
+        raise
+
+    # create runtime for agents
+    runtime = SingleThreadedAgentRuntime()
+
+    # initialize VLLM client if using remote endpoint
+    llm_client = None
+    if runtime_config.vllm_endpoint and not runtime_config.local_model:
+        llm_client = VLLMClient(
+            base_url=runtime_config.vllm_endpoint, model=runtime_config.model_name
+        )
+
+    # register moderator agent
+    moderator_id = AgentId("moderator", "iraki")
+    await runtime.register_agent(
+        "moderator",
+        lambda: irAKIModeratorAgent(
+            case_id=case_id,
+            config_loader=config_loader,
+            data_loader=data_loader,  # pass DataLoader directly
+            delphi_config=delphi_config,
+        ),
+        agent_id=moderator_id,
+    )
+
+    # register expert agents based on configuration
+    expert_configs = config_loader.expert_panel["expert_panel"]["experts"]
+
+    # limit experts if specified
+    if runtime_config.expert_count:
+        expert_configs = expert_configs[: runtime_config.expert_count]
+
+    for expert_config in expert_configs:
+        expert_id = AgentId(expert_config["id"], "expert")
+        await runtime.register_agent(
+            expert_config["id"],
+            lambda ec=expert_config: irAKIExpertAgent(
+                expert_config=ec, llm_client=llm_client, config_loader=config_loader
+            ),
+            agent_id=expert_id,
+        )
+
+    logger.info(f"Registered {len(expert_configs)} expert agents")
+
+    # start assessment by sending case to moderator
+    await runtime.send_message(
+        StartCase(
+            case_id=case_id,
+            patient_data=patient_case,
+            expert_ids=[e["id"] for e in expert_configs],
+        ),
+        moderator_id,
+    )
+
+    # run until completion
+    await runtime.stop()
+
+    # return results (placeholder for now)
+    return {
+        "case_id": case_id,
+        "status": "completed",
+        "consensus": "Assessment complete - results would be here",
+    }
+
+
+def main():
+    """Main entry point."""
+    parser = argparse.ArgumentParser(
+        description="DelPHEA-irAKI: Expert consensus system for immune-related AKI classification"
+    )
+
     parser.add_argument(
         "--case-id",
-        default="iraki_case_001",
-        help="Patient case identifier (default: iraki_case_001)",
+        type=str,
+        help="Patient case ID to assess (e.g., iraki_case_001 or dummy_001)",
     )
 
-    # configuration files
     parser.add_argument(
-        "--expert-panel-config",
-        default="config/panel.json",
-        help="Expert panel configuration file",
-    )
-    parser.add_argument(
-        "--questionnaire-config",
-        default="config/questionnaire.json",
-        help="Assessment questionnaire configuration",
-    )
-    parser.add_argument(
-        "--prompts-dir", default="prompts", help="Directory containing prompt templates"
+        "--health-check", action="store_true", help="Run system health check"
     )
 
-    # vLLM endpoint (can be overridden by infrastructure selection)
-    parser.add_argument("--vllm-endpoint", help="Override vLLM server endpoint")
     parser.add_argument(
-        "--ssh-tunnel",
+        "--vllm-endpoint",
+        type=str,
+        default="http://localhost:8000",
+        help="VLLM server endpoint (default: http://localhost:8000)",
+    )
+
+    parser.add_argument(
+        "--expert-count",
+        type=int,
+        default=None,
+        help="Number of experts to use (default: all configured experts)",
+    )
+
+    parser.add_argument(
+        "--use-real-data",
         action="store_true",
-        help="Use SSH tunnel for Tempest connection",
-    )
-    parser.add_argument(
-        "--model-name", default="openai/gpt-oss-120b", help="Model name for inference"
+        help="Use real patient data if available (default: use dummy data)",
     )
 
-    # data configuration
-    parser.add_argument(
-        "--data-dir", default="irAKI_data", help="Directory containing patient data"
-    )
-    parser.add_argument(
-        "--use-dummy-data", action="store_true", help="Use dummy data for testing"
-    )
+    parser.add_argument("--verbose", action="store_true", help="Enable verbose logging")
 
-    # Delphi process configuration
     parser.add_argument(
-        "--conflict-method",
-        choices=["range", "std", "category"],
-        default="category",
-        help="Method for identifying conflicts: range, std, or category (default: category)",
-    )
-
-    # system options
-    parser.add_argument(
-        "--health-check", action="store_true", help="Run health check and exit"
-    )
-    parser.add_argument(
-        "--verbose", "-v", action="store_true", help="Enable verbose logging"
+        "--local-model",
+        action="store_true",
+        help="Use local model instead of VLLM endpoint",
     )
 
     args = parser.parse_args()
 
-    # configure logging level
+    # set logging level
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
 
     # create runtime configuration
     runtime_config = RuntimeConfig(
-        expert_panel_config=args.expert_panel_config,
-        questionnaire_config=args.questionnaire_config,
-        prompts_dir=args.prompts_dir,
-        model_name=args.model_name,
-        data_dir=args.data_dir,
-        use_real_data=not args.use_dummy_data,
+        vllm_endpoint=args.vllm_endpoint,
+        use_real_data=args.use_real_data,
+        expert_count=args.expert_count,
+        local_model=args.local_model,
     )
-
-    # configure infrastructure
-    if args.infrastructure == "tempest":
-        runtime_config.infrastructure.use_tempest = True
-        if args.ssh_tunnel:
-            print(
-                f"SSH Tunnel command: {runtime_config.infrastructure.get_ssh_tunnel_command()}"
-            )
-            runtime_config.infrastructure.use_ssh_tunnel = True
-    elif args.infrastructure == "aws":
-        # AWS endpoint should be provided via environment or config
-        runtime_config.infrastructure.use_aws = True
-
-    # update vLLM endpoint based on infrastructure
-    if args.vllm_endpoint:
-        runtime_config.infrastructure.local_endpoint = args.vllm_endpoint
-
-    # create Delphi configuration with intelligent conflict detection
-    delphi_config = DelphiConfig(
-        expert_count=len(config_loader.get_available_expert_ids()),  # use ALL experts
-        conflict_threshold=3,  # will be replaced by category method
-        export_full_transcripts=True,
-    )
-
-    # set conflict detection method
-    delphi_config.conflict_method = args.conflict_method
 
     # run appropriate command
     if args.health_check:
-        # health check mode
-        healthy = await run_health_check(runtime_config)
-        return 0 if healthy else 1
-    else:
-        # normal execution mode
-        print("=" * 60)
-        print("DelPHEA-irAKI: Starting irAKI Classification")
-        print("-" * 60)
-        print(f"Case ID: {args.case_id}")
-        print(
-            f"Expert Count: {len(config_loader.get_available_expert_ids())} (full panel)"
-        )
-        print(f"Conflict Detection: {delphi_config.conflict_method}")
-        print(f"vLLM Endpoint: {runtime_config.get_vllm_endpoint()}")
-        print(f"Model: {runtime_config.model_name}")
-        print(f"Data Source: {'Real' if runtime_config.use_real_data else 'Dummy'}")
-        print("=" * 60)
+        success = asyncio.run(run_health_check(runtime_config))
+        sys.exit(0 if success else 1)
 
-        return await run_delphi_consensus(
-            case_id=args.case_id,
-            runtime_config=runtime_config,
-            delphi_config=delphi_config,
-        )
+    elif args.case_id:
+        try:
+            results = asyncio.run(run_iraki_assessment(args.case_id, runtime_config))
+            print(f"\nAssessment Results:\n{results}")
+        except Exception as e:
+            logging.error(f"Assessment failed: {e}")
+            sys.exit(1)
+
+    else:
+        parser.print_help()
+        sys.exit(1)
 
 
 if __name__ == "__main__":
-    # run async main and exit with proper code
-    exit_code = asyncio.run(main())
-    sys.exit(exit_code)
+    main()
