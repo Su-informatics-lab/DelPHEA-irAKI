@@ -89,46 +89,6 @@
         "high_confidence": "≥7 on ≥12 questions with no major contradictions",
         "moderate_confidence": "≥6 on most questions with some uncertainty",
         "low_confidence": "Mixed scores or insufficient evidence"
-      },
-      "consensus_calculation": {
-        "method": "Beta-pooled consensus with confidence adjustment",
-        "minimum_agreement": "≥70% of experts within 2 points on final gestalt",
-        "debate_threshold": "≥3 point disagreement on any question"
-      }
-    },
-    "clinical_decision_support": {
-      "high_probability_iraki": {
-        "threshold": "≥7.0 average score",
-        "recommendations": [
-          "Consider kidney biopsy for confirmation",
-          "Initiate corticosteroid therapy",
-          "Hold or discontinue ICI therapy",
-          "Monitor for other irAEs",
-          "Nephrology consultation",
-          "Assess rechallenge potential after recovery"
-        ]
-      },
-      "moderate_probability_iraki": {
-        "threshold": "5.0-6.9 average score",
-        "recommendations": [
-          "Kidney biopsy strongly recommended",
-          "Exclude alternative causes more thoroughly",
-          "Consider empiric steroid trial",
-          "Multidisciplinary discussion",
-          "Close monitoring with serial assessments",
-          "Systematic infection workup in immunocompromised"
-        ]
-      },
-      "low_probability_iraki": {
-        "threshold": "<5.0 average score",
-        "recommendations": [
-          "Focus on alternative AKI causes",
-          "Standard AKI management",
-          "Continue ICI if oncologically appropriate",
-          "Consider irAKI if clinical course changes",
-          "Document reasoning for alternative diagnosis",
-          "Address baseline CKD and frailty factors"
-        ]
       }
     }
   }
