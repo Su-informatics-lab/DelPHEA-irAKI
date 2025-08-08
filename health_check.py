@@ -6,8 +6,12 @@ Run this to identify which components are working and which need fixes.
 import sys
 from pathlib import Path
 
-# add parent directory to path
-sys.path.append(str(Path(__file__).parent))
+# add parent directory to path (if running from tests/ directory)
+# otherwise just use current directory
+if Path(__file__).parent.name == "tests":
+    sys.path.insert(0, str(Path(__file__).parent.parent))
+else:
+    sys.path.insert(0, str(Path(__file__).parent))
 
 print("=" * 70)
 print("DelPHEA-irAKI DIAGNOSTIC TEST")
@@ -50,7 +54,11 @@ try:
     print(f"✓ RuntimeConfig created")
 
     delphi = DelphiConfig()
-    print(f"✓ DelphiConfig created (expert_count: {delphi.expert_count})")
+    # Check what attributes exist
+    if hasattr(delphi, "expert_count"):
+        print(f"✓ DelphiConfig created (expert_count: {delphi.expert_count})")
+    else:
+        print(f"✓ DelphiConfig created (no expert_count - uses all experts)")
 
 except Exception as e:
     print(f"✗ Configuration error: {e}")
@@ -60,7 +68,7 @@ except Exception as e:
 
 print()
 
-# Test 3: Configuration Loader
+# Test 3: Configuration Loader - UPDATED VERSION
 print("Test 3: Configuration Loader")
 print("-" * 30)
 try:
@@ -71,20 +79,83 @@ try:
     config_loader = ConfigurationLoader(runtime_config)
     print("✓ ConfigurationLoader created")
 
-    # check if configs loaded
+    # Check expert panel
     if hasattr(config_loader, "expert_panel"):
         expert_count = len(
             config_loader.expert_panel.get("expert_panel", {}).get("experts", [])
         )
         print(f"✓ Expert panel loaded: {expert_count} experts")
+    elif hasattr(config_loader, "_expert_panel"):
+        expert_count = len(
+            config_loader._expert_panel.get("expert_panel", {}).get("experts", [])
+        )
+        print(f"✓ Expert panel loaded: {expert_count} experts")
     else:
         print("⚠ Expert panel not loaded")
 
-    if hasattr(config_loader, "questionnaire"):
-        question_count = len(config_loader.questionnaire.get("questions", []))
-        print(f"✓ Questionnaire loaded: {question_count} questions")
-    else:
-        print("⚠ Questionnaire not loaded")
+    # Check questionnaire - try multiple approaches
+    question_count = 0
+    questions_found = False
+
+    # Method 1: Try get_questions() method
+    if hasattr(config_loader, "get_questions"):
+        try:
+            questions = config_loader.get_questions()
+            question_count = len(questions)
+            questions_found = True
+            print(
+                f"✓ Questionnaire loaded (via get_questions): {question_count} questions"
+            )
+        except Exception as e:
+            print(f"⚠ get_questions() failed: {e}")
+
+    # Method 2: Try direct access to questionnaire property
+    if not questions_found and hasattr(config_loader, "questionnaire"):
+        try:
+            questionnaire = config_loader.questionnaire
+            if isinstance(questionnaire, dict):
+                questions = questionnaire.get("questionnaire", {}).get("questions", [])
+                question_count = len(questions)
+                questions_found = True
+                print(
+                    f"✓ Questionnaire loaded (via property): {question_count} questions"
+                )
+        except Exception as e:
+            print(f"⚠ questionnaire property failed: {e}")
+
+    # Method 3: Try private _questionnaire attribute
+    if not questions_found and hasattr(config_loader, "_questionnaire"):
+        try:
+            questionnaire = config_loader._questionnaire
+            if isinstance(questionnaire, dict):
+                questions = questionnaire.get("questionnaire", {}).get("questions", [])
+                question_count = len(questions)
+                questions_found = True
+                print(
+                    f"✓ Questionnaire loaded (via _questionnaire): {question_count} questions"
+                )
+        except Exception as e:
+            print(f"⚠ _questionnaire access failed: {e}")
+
+    if not questions_found:
+        print("✗ Could not load questionnaire")
+    elif question_count < 16:
+        print(f"⚠ Only {question_count} questions loaded (expected 16)")
+        print("  The questionnaire.json file might be incomplete")
+
+    # Also check the raw JSON file directly
+    try:
+        import json
+
+        with open("config/questionnaire.json", "r") as f:
+            raw_data = json.load(f)
+            raw_questions = raw_data.get("questionnaire", {}).get("questions", [])
+            if len(raw_questions) != question_count:
+                print(
+                    f"⚠ JSON file has {len(raw_questions)} questions but loader shows {question_count}"
+                )
+    except Exception as e:
+        print(f"⚠ Could not verify JSON file: {e}")
 
 except Exception as e:
     print(f"✗ ConfigurationLoader error: {e}")
@@ -167,12 +238,62 @@ except Exception as e:
     traceback.print_exc()
 
 print()
+
+# Test 7: Quick JSON validation
+print("Test 7: Questionnaire JSON Validation")
+print("-" * 30)
+try:
+    import json
+
+    with open("config/questionnaire.json", "r") as f:
+        data = json.load(f)
+
+    if "questionnaire" in data and "questions" in data["questionnaire"]:
+        questions = data["questionnaire"]["questions"]
+        question_ids = [q.get("id", "NO_ID") for q in questions]
+        print(
+            f"✓ JSON valid with {len(questions)} questions: {', '.join(question_ids[:5])}..."
+        )
+
+        # Check for all 16 questions
+        expected_ids = [f"Q{i}" for i in range(1, 17)]
+        missing = set(expected_ids) - set(question_ids)
+        if missing:
+            print(f"✗ Missing questions: {', '.join(sorted(missing))}")
+        elif len(questions) == 16:
+            print("✓ All 16 questions present in JSON file")
+    else:
+        print("✗ Invalid JSON structure")
+
+except json.JSONDecodeError as e:
+    print(f"✗ Invalid JSON syntax: {e}")
+    print("  The questionnaire.json file is corrupted or incomplete")
+except FileNotFoundError:
+    print("✗ questionnaire.json not found")
+except Exception as e:
+    print(f"✗ Error checking JSON: {e}")
+
+print()
 print("=" * 70)
 print("DIAGNOSTIC COMPLETE")
 print("=" * 70)
 print()
-print("Next steps based on results above:")
-print("1. Fix any import errors first")
-print("2. Ensure configuration files exist in config/ directory")
-print("3. Address any specific component failures")
+
+# Summary
+print("Summary:")
+print("-" * 30)
+if "question_count" in locals():
+    if question_count == 0:
+        print("⚠ CRITICAL: Questionnaire not loading - check JSON file")
+    elif question_count < 16:
+        print(f"⚠ WARNING: Only {question_count}/16 questions loaded")
+    else:
+        print(f"✓ All {question_count} questions loaded successfully")
+
+print("\nNext steps based on results above:")
+print("1. If questionnaire shows 0 or <16 questions, fix config/questionnaire.json")
+print(
+    "2. If 'RoutedAgent not defined' error, remove duplicate class from delphea_iraki.py"
+)
+print("3. Ensure all configuration files exist in config/ directory")
 print("4. Once all tests pass, try: python delphea_iraki.py --health-check --verbose")
