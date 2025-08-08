@@ -1,7 +1,7 @@
 {
   "expert_panel": {
     "description": "Multi-disciplinary expert panel for irAKI classification",
-    "version": "1.0",
+    "version": "2.0",
     "experts": [
       {
         "id": "oncologist",

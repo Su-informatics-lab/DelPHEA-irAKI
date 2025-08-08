@@ -33,50 +33,6 @@
       {
         "id": "Q5",
         "question": "Urinalysis findings are consistent with immune-mediated kidney injury"
-      },
-      {
-        "id": "Q6",
-        "question": "Laboratory evidence suggests systemic immune activation consistent with irAKI"
-      },
-      {
-        "id": "Q7",
-        "question": "Concomitant medications known to cause AKI/ATIN have been adequately assessed and excluded"
-      },
-      {
-        "id": "Q8",
-        "question": "The presence of other immune-related adverse events (irAEs) supports the diagnosis of irAKI"
-      },
-      {
-        "id": "Q9",
-        "question": "Kidney biopsy is indicated and expected to show findings consistent with immune-mediated injury"
-      },
-      {
-        "id": "Q10",
-        "question": "The clinical course and expected response pattern are consistent with irAKI"
-      },
-      {
-        "id": "Q11",
-        "question": "Alternative systemic diagnoses for AKI have been systematically excluded"
-      },
-      {
-        "id": "Q12",
-        "question": "Overall clinical judgment strongly favors irAKI as the most likely diagnosis"
-      },
-      {
-        "id": "Q13",
-        "question": "Infection-related AKI (septic ATN, pyelonephritis, other infectious causes) has been systematically excluded"
-      },
-      {
-        "id": "Q14",
-        "question": "Radiologic findings support immune-mediated kidney injury or exclude alternative structural causes"
-      },
-      {
-        "id": "Q15",
-        "question": "Baseline renal reserve, age-related changes, and frailty have been appropriately considered in AKI assessment"
-      },
-      {
-        "id": "Q16",
-        "question": "The risk-benefit profile supports rechallenge with ICI therapy after AKI recovery"
       }
     ],
     "scoring_guidelines": {
