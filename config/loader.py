@@ -282,12 +282,7 @@ class ConfigurationLoader:
         Raises:
             KeyError: If question_id not found
         """
-        if question_id not in self._question_lookup:
-            raise KeyError(
-                f"Question '{question_id}' not found. "
-                f"Available: {list(self._question_lookup.keys())}"
-            )
-        return self._question_lookup[question_id]
+        return self._questionnaire["questionnaire"]["questions"]
 
     def get_prompt(self, template_name: str) -> Dict:
         """

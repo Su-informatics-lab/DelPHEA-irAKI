@@ -18,7 +18,8 @@ class InfrastructureConfig:
     ENDPOINT_TEMPEST = "tempest"
     ENDPOINT_LOCAL = "local"
 
-    endpoint_type: str = ENDPOINT_AWS
+    # CHANGED: Default to Tempest instead of AWS
+    endpoint_type: str = ENDPOINT_TEMPEST  # Changed from ENDPOINT_AWS
 
     # aws configuration
     aws_endpoint: str = "http://172.31.11.192:8000"
@@ -117,7 +118,8 @@ class DelphiConfig:
     conflict_threshold: int = 3
     max_debate_rounds: int = 6
     max_debate_participants: int = 8
-    expert_count: int = 8
+
+    expert_count: Optional[int] = None
 
     # consensus configuration
     consensus_threshold: float = 0.8
