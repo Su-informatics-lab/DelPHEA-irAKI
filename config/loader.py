@@ -269,7 +269,7 @@ class ConfigurationLoader:
             )
         return self._expert_lookup[expert_id]
 
-    def get_question(self, question_id: str) -> Dict:
+    def get_questions(self, question_id: str) -> Dict:
         """
         Get specific question configuration.
 
