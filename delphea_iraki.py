@@ -353,3 +353,7 @@ def main():
         print("  python delphea_iraki.py --health-check")
         print("  python delphea_iraki.py --case-id iraki_case_001 --local-model")
         sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
