@@ -40,21 +40,16 @@ import asyncio
 import logging
 import sys
 from pathlib import Path
+from typing import Dict
 
 import httpx
 from autogen_core import AgentId, SingleThreadedAgentRuntime
 
-# add current directory to path for imports
 sys.path.append(str(Path(__file__).parent))
 
-# configuration imports
 from config.core import DelphiConfig, RuntimeConfig
 from config.loader import ConfigurationLoader
-
-# direct import of dataloader - no wrapper needed (YAGNI)
 from dataloader import DataLoader
-
-# orchestration imports
 from orchestration.agents.expert import irAKIExpertAgent
 from orchestration.agents.moderator import irAKIModeratorAgent
 from orchestration.clients import VLLMClient
