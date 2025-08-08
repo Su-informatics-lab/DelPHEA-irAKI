@@ -98,17 +98,17 @@ async def run_health_check(runtime_config: RuntimeConfig) -> bool:
             logger.error("✗ DataLoader not available")
             return False
 
-        # check VLLM endpoint if provided
-        if runtime_config.vllm_endpoint and not runtime_config.local_model:
+        # check VLLM endpoint if configured
+        # get the endpoint from the infrastructure config
+        vllm_endpoint = runtime_config.get_vllm_endpoint()
+
+        # only check if not using local/mock mode
+        if vllm_endpoint and runtime_config.infrastructure.endpoint_type != "local":
             async with httpx.AsyncClient() as client:
                 try:
-                    response = await client.get(
-                        f"{runtime_config.vllm_endpoint}/health"
-                    )
+                    response = await client.get(f"{vllm_endpoint}/health")
                     if response.status_code == 200:
-                        logger.info(
-                            f"✓ VLLM endpoint reachable: {runtime_config.vllm_endpoint}"
-                        )
+                        logger.info(f"✓ VLLM endpoint reachable: {vllm_endpoint}")
                     else:
                         logger.warning(
                             f"⚠ VLLM endpoint returned status {response.status_code}"
@@ -121,6 +121,9 @@ async def run_health_check(runtime_config: RuntimeConfig) -> bool:
 
     except Exception as e:
         logger.error(f"✗ Health check failed: {e}")
+        import traceback
+
+        traceback.print_exc()  # print full traceback for debugging
         return False
 
 
