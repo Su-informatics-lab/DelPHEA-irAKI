@@ -41,7 +41,6 @@ from typing import Dict, List, Set
 
 import numpy as np
 from autogen_core import MessageContext, RoutedAgent, TopicId, message_handler, rpc
-from data.loader import DataLoaderWrapper
 
 from config.core import DelphiConfig
 from config.loader import ConfigurationLoader
