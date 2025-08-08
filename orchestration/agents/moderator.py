@@ -87,7 +87,9 @@ class irAKIModeratorAgent(RoutedAgent):
         self._delphi_config = delphi_config
 
         # use expert_count from config to select subset
-        all_expert_ids = self._config_loader.get_available_expert_ids()
+        all_expert_ids = [
+            e["id"] for e in self._config_loader.expert_panel["expert_panel"]["experts"]
+        ]
         self._expert_ids = all_expert_ids[: delphi_config.expert_count]
 
         # round tracking - store actual replies
