@@ -43,7 +43,7 @@ from pathlib import Path
 from typing import Dict
 
 import httpx
-from autogen_core import AgentId, SingleThreadedAgentRuntime
+from autogen_core import SingleThreadedAgentRuntime
 
 sys.path.append(str(Path(__file__).parent))
 
@@ -166,35 +166,31 @@ async def run_iraki_assessment(case_id: str, runtime_config: RuntimeConfig) -> D
     ):
         llm_client = VLLMClient(runtime_config)
 
-    # register moderator agent
-    moderator_id = AgentId("moderator", "iraki")
-    await runtime.register_agent(
-        "moderator",
-        lambda: irAKIModeratorAgent(
-            case_id=case_id,
-            config_loader=config_loader,
-            data_loader=data_loader,  # pass DataLoader directly
-            delphi_config=delphi_config,
-        ),
-        agent_id=moderator_id,
+    # instantiate moderator agent
+    moderator_agent = irAKIModeratorAgent(
+        case_id=case_id,
+        config_loader=config_loader,
+        vllm_client=llm_client,
+        runtime_config=runtime_config,
     )
+
+    # register moderator agent (NEW AUTOGEN API)
+    await irAKIModeratorAgent.register(runtime, "moderator", lambda: moderator_agent)
 
     # register expert agents based on configuration
     expert_configs = config_loader.expert_panel["expert_panel"]["experts"]
-
+    expert_agents = []
     for expert_config in expert_configs:
-        agent_id = AgentId(expert_config["id"], "expert")
-
-        await runtime.register_agent(
-            expert_config["id"],  # agent type
-            lambda ec=expert_config: irAKIExpertAgent(
-                expert_id=ec["id"],  # pass the expert ID from the config
-                case_id=case_id,
-                config_loader=config_loader,
-                vllm_client=llm_client,
-                runtime_config=runtime_config,
-            ),
-            agent_id=agent_id,  # use the agent_id we created
+        agent = irAKIExpertAgent(
+            expert_id=expert_config["id"],
+            case_id=case_id,
+            config_loader=config_loader,
+            vllm_client=llm_client,
+            runtime_config=runtime_config,
+        )
+        expert_agents.append(agent)
+        await irAKIExpertAgent.register(
+            runtime, f"expert_{expert_config['id']}", lambda a=agent: a
         )
 
     logger.info(f"Registered ALL {len(expert_configs)} expert agents")
@@ -206,7 +202,7 @@ async def run_iraki_assessment(case_id: str, runtime_config: RuntimeConfig) -> D
             patient_data=patient_case,
             expert_ids=[e["id"] for e in expert_configs],
         ),
-        moderator_id,
+        "moderator",
     )
 
     # run until completion
