@@ -313,31 +313,19 @@ class ConfigurationLoader:
         """
         Validate cross-configuration consistency.
 
-        Ensures expert specialties match any specialty_focus fields
-        in questions (if present).
+        Simple validation to ensure configuration is coherent.
 
         Raises:
-            ValueError: If inconsistencies detected
+            ValueError: If critical inconsistencies detected
         """
-        available_specialties = {
-            expert["specialty"]
-            for expert in self._expert_panel["expert_panel"]["experts"]
-        }
+        # ensure we have at least one expert
+        experts = self._expert_panel["expert_panel"]["experts"]
+        if not experts:
+            raise ValueError("No experts configured")
 
-        # check if any questions reference non-existent specialties
-        for question in self._questionnaire["questionnaire"]["questions"]:
-            if "specialty_focus" in question:
-                # specialty_focus is optional but if present should be valid
-                focus = question["specialty_focus"]
-                if isinstance(focus, dict):
-                    for specialty in focus.keys():
-                        if (
-                            specialty not in available_specialties
-                            and specialty != "all_specialties"
-                        ):
-                            self.logger.warning(
-                                f"Question {question['id']} references "
-                                f"non-existent specialty: {specialty}"
-                            )
+        # ensure we have questions
+        questions = self._questionnaire["questionnaire"]["questions"]
+        if not questions:
+            raise ValueError("No questions configured")
 
         self.logger.info("Runtime consistency validation complete")
