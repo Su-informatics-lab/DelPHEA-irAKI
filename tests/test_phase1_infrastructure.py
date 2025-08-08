@@ -28,8 +28,8 @@ import sys
 from pathlib import Path
 from typing import List, Tuple
 
-# add parent to path for imports
-sys.path.append(str(Path(__file__).parent))
+# add parent directory to path for imports (go up from tests/ to project root)
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from config.core import DelphiConfig, RuntimeConfig
 from config.loader import ConfigurationLoader
