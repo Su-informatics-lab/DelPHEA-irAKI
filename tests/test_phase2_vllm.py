@@ -162,7 +162,9 @@ async def test_vllm_health(endpoint: str) -> VLLMTestResult:
 
     try:
         config = RuntimeConfig()
-        config.vllm_endpoint = endpoint
+        # Force local endpoint for testing
+        config.infrastructure.endpoint_type = "local"
+        config.infrastructure.local_endpoint = endpoint
 
         # initialize client
         client = VLLMClient(config)
@@ -214,7 +216,9 @@ async def test_clinical_generation(endpoint: str, model_name: str) -> VLLMTestRe
 
     try:
         config = RuntimeConfig()
-        config.vllm_endpoint = endpoint
+        # Force local endpoint
+        config.infrastructure.endpoint_type = "local"
+        config.infrastructure.local_endpoint = endpoint
         config.model_name = model_name
 
         client = VLLMClient(config)
@@ -297,7 +301,9 @@ async def test_structured_output(endpoint: str, model_name: str) -> VLLMTestResu
 
     try:
         config = RuntimeConfig()
-        config.vllm_endpoint = endpoint
+        # Force local endpoint
+        config.infrastructure.endpoint_type = "local"
+        config.infrastructure.local_endpoint = endpoint
         config.model_name = model_name
 
         # load actual questionnaire
@@ -394,7 +400,9 @@ async def test_throughput(
 
     try:
         config = RuntimeConfig()
-        config.vllm_endpoint = endpoint
+        # Force local endpoint
+        config.infrastructure.endpoint_type = "local"
+        config.infrastructure.local_endpoint = endpoint
         config.model_name = model_name
 
         client = VLLMClient(config)
@@ -465,7 +473,9 @@ async def test_expert_simulation(endpoint: str, model_name: str) -> VLLMTestResu
         from orchestration.agents.expert import irAKIExpertAgent
 
         config = RuntimeConfig()
-        config.vllm_endpoint = endpoint
+        # Force local endpoint
+        config.infrastructure.endpoint_type = "local"
+        config.infrastructure.local_endpoint = endpoint
         config.model_name = model_name
 
         loader = ConfigurationLoader(config)
