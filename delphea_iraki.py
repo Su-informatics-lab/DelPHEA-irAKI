@@ -36,7 +36,6 @@ treatment and cancer therapy interruption.
 """
 
 import argparse
-import asyncio
 import logging
 import sys
 from pathlib import Path
@@ -144,7 +143,7 @@ async def run_iraki_assessment(case_id: str, runtime_config: RuntimeConfig) -> D
     config_loader = ConfigurationLoader(runtime_config)
     delphi_config = DelphiConfig()
 
-    # initialize data loader directly - no wrapper needed
+    # initialize data loader directly
     data_loader = DataLoader(
         data_dir=runtime_config.data_dir, use_dummy=not runtime_config.use_real_data
     )
@@ -162,10 +161,11 @@ async def run_iraki_assessment(case_id: str, runtime_config: RuntimeConfig) -> D
 
     # initialize VLLM client if using remote endpoint
     llm_client = None
-    if runtime_config.vllm_endpoint and not runtime_config.local_model:
-        llm_client = VLLMClient(
-            base_url=runtime_config.vllm_endpoint, model=runtime_config.model_name
-        )
+    if (
+        runtime_config.get_vllm_endpoint()
+        and runtime_config.infrastructure.endpoint_type != "local"
+    ):
+        llm_client = VLLMClient(runtime_config)
 
     # register moderator agent
     moderator_id = AgentId("moderator", "iraki")
@@ -183,21 +183,22 @@ async def run_iraki_assessment(case_id: str, runtime_config: RuntimeConfig) -> D
     # register expert agents based on configuration
     expert_configs = config_loader.expert_panel["expert_panel"]["experts"]
 
-    # limit experts if specified
-    if runtime_config.expert_count:
-        expert_configs = expert_configs[: runtime_config.expert_count]
-
     for expert_config in expert_configs:
-        expert_id = AgentId(expert_config["id"], "expert")
+        agent_id = AgentId(expert_config["id"], "expert")
+
         await runtime.register_agent(
-            expert_config["id"],
+            expert_config["id"],  # agent type
             lambda ec=expert_config: irAKIExpertAgent(
-                expert_config=ec, llm_client=llm_client, config_loader=config_loader
+                expert_id=ec["id"],  # pass the expert ID from the config
+                case_id=case_id,
+                config_loader=config_loader,
+                vllm_client=llm_client,
+                runtime_config=runtime_config,
             ),
-            agent_id=expert_id,
+            agent_id=agent_id,  # use the agent_id we created
         )
 
-    logger.info(f"Registered {len(expert_configs)} expert agents")
+    logger.info(f"Registered ALL {len(expert_configs)} expert agents")
 
     # start assessment by sending case to moderator
     await runtime.send_message(
@@ -239,16 +240,11 @@ def main():
     parser.add_argument(
         "--vllm-endpoint",
         type=str,
-        default="http://localhost:8000",
-        help="VLLM server endpoint (default: http://localhost:8000)",
+        default="http://tempest-gpu021:8000",  # Default to Tempest
+        help="VLLM server endpoint (default: http://tempest-gpu021:8000)",
     )
 
-    parser.add_argument(
-        "--expert-count",
-        type=int,
-        default=None,
-        help="Number of experts to use (default: all configured experts)",
-    )
+    # REMOVED --expert-count argument
 
     parser.add_argument(
         "--use-real-data",
@@ -270,52 +266,52 @@ def main():
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
 
-    # create infrastructure config with the endpoint
+    # create infrastructure config
     from config.core import DelphiConfig, InfrastructureConfig
 
     infrastructure_config = InfrastructureConfig()
-
-    # determine endpoint type and set accordingly
+    # Infrastructure already defaults to tempest, but can override if needed
     if args.local_model:
         infrastructure_config.endpoint_type = InfrastructureConfig.ENDPOINT_LOCAL
-        infrastructure_config.local_endpoint = args.vllm_endpoint
-    else:
-        # assume AWS endpoint by default (can be enhanced to detect)
-        infrastructure_config.endpoint_type = InfrastructureConfig.ENDPOINT_AWS
-        infrastructure_config.aws_endpoint = args.vllm_endpoint
 
-    # create runtime configuration with proper parameters
+    # create runtime configuration
     runtime_config = RuntimeConfig(
         infrastructure=infrastructure_config,
         use_real_data=args.use_real_data,
     )
 
-    # create delphi config if expert count is specified
-    delphi_config = None
-    if args.expert_count:
-        delphi_config = DelphiConfig(expert_count=args.expert_count)
+    # create delphi config (no expert_count needed)
+    delphi_config = DelphiConfig()
 
-    # run appropriate command
-    if args.health_check:
-        success = asyncio.run(run_health_check(runtime_config))
-        sys.exit(0 if success else 1)
+    # rest of main...
 
-    elif args.case_id:
-        try:
-            # pass delphi_config if created
-            if delphi_config:
-                results = asyncio.run(
-                    run_iraki_assessment(args.case_id, runtime_config, delphi_config)
-                )
-            else:
-                results = asyncio.run(
-                    run_iraki_assessment(args.case_id, runtime_config)
-                )
-            print(f"\nAssessment Results:\n{results}")
-        except Exception as e:
-            logging.error(f"Assessment failed: {e}")
-            sys.exit(1)
 
-    else:
-        parser.print_help()
-        sys.exit(1)
+# ============================================================================
+# FIX 4: Update moderator.py - Always use all experts
+# ============================================================================
+
+
+# In orchestration/agents/moderator.py:
+class irAKIModeratorAgent(RoutedAgent):
+    def __init__(
+        self,
+        case_id: str,
+        config_loader: ConfigurationLoader,
+        data_loader: DataLoader,
+        delphi_config: DelphiConfig,
+    ) -> None:
+        """Initialize moderator for case coordination."""
+        super().__init__(f"irAKI Moderator for case {case_id}")
+        self._case_id = case_id
+        self._config_loader = config_loader
+        self._data_loader = data_loader
+        self._delphi_config = delphi_config
+
+        # ALWAYS use ALL experts
+        self._expert_ids = self._config_loader.get_available_expert_ids()
+
+        # rest of initialization...
+        self.logger.info(
+            f"Initialized moderator for case {case_id} with ALL {len(self._expert_ids)} experts: "
+            f"{self._expert_ids}"
+        )
