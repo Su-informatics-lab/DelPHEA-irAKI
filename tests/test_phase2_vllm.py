@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Phase 2: vLLM Infrastructure Tests for DelPHEA-irAKI
 =====================================================
@@ -8,9 +7,8 @@ Requires vLLM server running (via serve.sbatch on SLURM).
 
 Usage:
     # after getting node allocation
-    python test_phase2_vllm.py --node gpu-node-001
-    python test_phase2_vllm.py --node gpu-node-001 --model meta-llama/Llama-3.1-70B-Instruct
-    python test_phase2_vllm.py --endpoint http://172.31.11.192:8000 --verbose
+    python tests/test_phase2_vllm.py --endpoint http://localhost:8000 --quick
+    python tests/test_phase2_vllm.py --endpoint http://localhost:8000 --verbose
 
 Clinical Context:
     Validates that the vLLM infrastructure can handle clinical reasoning
@@ -236,15 +234,7 @@ async def test_clinical_generation(endpoint: str, model_name: str) -> VLLMTestRe
         Provide a probability between 0 and 1 with brief clinical reasoning.
         """
 
-        response_format = {
-            "type": "object",
-            "properties": {
-                "probability": {"type": "number"},
-                "reasoning": {"type": "string"},
-                "differential": {"type": "array", "items": {"type": "string"}},
-            },
-            "required": ["probability", "reasoning"],
-        }
+        response_format = {"type": "json_object"}  # OpenAI-compatible format
 
         # generate response
         start = time.time()
@@ -323,23 +313,7 @@ async def test_structured_output(endpoint: str, model_name: str) -> VLLMTestResu
         Provide scores and overall assessment.
         """
 
-        response_format = {
-            "type": "object",
-            "properties": {
-                "scores": {
-                    "type": "object",
-                    "additionalProperties": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "maximum": 10,
-                    },
-                },
-                "p_iraki": {"type": "number", "minimum": 0, "maximum": 1},
-                "confidence": {"type": "number", "minimum": 0, "maximum": 1},
-                "key_findings": {"type": "array", "items": {"type": "string"}},
-            },
-            "required": ["scores", "p_iraki", "confidence"],
-        }
+        response_format = {"type": "json_object"}  # OpenAI-compatible format
 
         # generate
         start = time.time()
@@ -419,10 +393,7 @@ async def test_throughput(
             start = time.time()
             response = await client.generate_structured_response(
                 prompt=prompt,
-                response_format={
-                    "type": "object",
-                    "properties": {"answer": {"type": "string"}},
-                },
+                response_format={"type": "json_object"},  # OpenAI-compatible
                 expert_context={"request_id": idx},
             )
             return time.time() - start
@@ -483,7 +454,7 @@ async def test_expert_simulation(endpoint: str, model_name: str) -> VLLMTestResu
 
         # create expert agent
         expert = irAKIExpertAgent(
-            expert_id="medical_oncology",  # use actual expert_id from panel.json
+            expert_id="oncologist",  # use actual expert_id from panel.json
             case_id="test_case",
             config_loader=loader,
             vllm_client=vllm_client,
