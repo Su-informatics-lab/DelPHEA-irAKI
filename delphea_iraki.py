@@ -222,6 +222,10 @@ async def run_iraki_assessment(case_id: str, runtime_config: RuntimeConfig) -> D
     await runtime.stop_when_idle()
     logger.info("Runtime idle; assessment finished pipeline execution")
 
+    # clean shutdown of all agents/resources
+    await runtime.close()
+    logger.info("Runtime closed; all agents cleaned up")
+
     # return results (placeholder for now)
     return {
         "case_id": case_id,

@@ -85,7 +85,6 @@ class irAKIModeratorAgent(RoutedAgent):
         self._config_loader = config_loader
         self._data_loader = data_loader
         self._delphi_config = delphi_config
-        self._ctx = None
 
         # use expert_count from config to select subset
         all_expert_ids = [
@@ -114,70 +113,34 @@ class irAKIModeratorAgent(RoutedAgent):
 
     @message_handler
     async def handle_start_case(self, message: StartCase, ctx: MessageContext) -> None:
-        """Bootstrap irAKI Delphi process.
-
-        Args:
-            message: Start case signal
-            ctx: Message context
-        """
         self.logger.info(f"=== STARTING DELPHI PROCESS FOR CASE {message.case_id} ===")
-
-        # hold onto ctx for later direct sends
-        self._ctx = ctx
-
-        # load patient data
         patient_data = self._data_loader.load_patient_case(message.case_id)
-
-        # store for later rounds
         self._patient_data = patient_data
+        await self._run_round1(ctx)
 
-        # begin Round 1
-        await self._run_round1()
-
-    async def _run_round1(self) -> None:
-        """Execute Round 1: Independent expert assessments."""
+    async def _run_round1(self, ctx: MessageContext) -> None:
         self.logger.info("=== ROUND 1: Independent Expert Assessments ===")
-
-        if self._ctx is None:
-            raise RuntimeError("moderator context not initialized before round 1")
-
-        # load questions from configuration
         questions = self._config_loader.get_questions()
-
-        # prepare for responses
         self._pending_round1 = set(self._expert_ids)
         self._round1_done.clear()
         self._round1_replies.clear()
-
-        # create questionnaire message
         questionnaire = QuestionnaireMsg(
             case_id=self._case_id,
             round_phase="round1",
             patient_info=self._patient_data.get("patient_info", {}),
-            icu_summary=self._patient_data.get("patient_summary", ""),
+            icu_summary=self._patient_data.get(
+                "icu_summary", self._patient_data.get("patient_summary", "")
+            ),
             medication_history=self._patient_data.get("medication_history", {}),
             lab_values=self._patient_data.get("lab_values", {}),
             imaging_reports=str(self._patient_data.get("imaging_reports", [])),
             questions=questions,
         )
-
-        # direct-send to each expert (no pub/sub)
         for ex_id in self._expert_ids:
             target = AgentId(type=f"expert_{ex_id}", key=self._case_id)
-            await self._ctx.send_message(questionnaire, target)
-            self.logger.info(
-                "→ sent Round 1 questionnaire to %s (agent=%s/%s)",
-                ex_id,
-                target.type,
-                target.key,
-            )
-
-        self.logger.info(
-            "Broadcast (direct) complete to %d experts", len(self._expert_ids)
-        )
-
-        # wait for responses with timeout
-        await self._wait_for_round_completion("round1")
+            await self.send_message(ctx, questionnaire, target)
+            self.logger.info("→ sent Round 1 questionnaire to %s", ex_id)
+        await self._wait_for_round_completion("round1", ctx)
 
     @rpc
     async def record_round1(
@@ -202,28 +165,30 @@ class irAKIModeratorAgent(RoutedAgent):
         # store reply
         self._round1_replies.append(message)
         self._pending_round1.discard(message.expert_id)
-
-        self.logger.debug(
-            f"Round 1 reply from {message.expert_id} "
-            f"(P(irAKI)={message.p_iraki:.2f}, conf={message.confidence:.2f}). "
-            f"{len(self._pending_round1)} experts pending."
+        self.logger.info(
+            "✓ Round 1 reply from %s; pending: %d -> %s",
+            message.expert_id,
+            len(self._pending_round1),
+            sorted(self._pending_round1),
+        )
+        self.logger.info(
+            "✓ Round 1 reply from %s; pending: %d -> %s",
+            message.expert_id,
+            len(self._pending_round1),
+            sorted(self._pending_round1),
         )
 
-        # check if all done
+        # flip event when done
         if not self._pending_round1:
             self._round1_done.set()
 
         return AckMsg(ok=True, message="Round 1 reply recorded")
 
-    async def _wait_for_round_completion(self, round_phase: str) -> None:
-        """Wait for round completion with timeout handling.
-
-        Args:
-            round_phase: "round1" or "round3"
-        """
+    async def _wait_for_round_completion(
+        self, round_phase: str, ctx: MessageContext
+    ) -> None:
         event = self._round1_done if round_phase == "round1" else self._round3_done
         timeout = getattr(self._delphi_config, f"{round_phase}_timeout", 300)
-
         try:
             await asyncio.wait_for(event.wait(), timeout=timeout)
             self.logger.info(f"All {round_phase} replies received successfully")
@@ -234,55 +199,29 @@ class irAKIModeratorAgent(RoutedAgent):
                 else self._pending_round3
             )
             self.logger.warning(
-                f"Timeout in {round_phase} after {timeout}s. "
-                f"Missing experts: {pending}"
+                f"Timeout in {round_phase} after {timeout}s. Missing experts: {pending}"
             )
-            # proceed anyway with partial results
-
-        # proceed to next phase
         if round_phase == "round1":
-            await self._run_round2()
-        else:  # round3
+            await self._run_round2(ctx)
+        else:
             await self._compute_final_consensus()
 
-    async def _run_round2(self) -> None:
-        """Execute Round 2: Debate on conflicting questions."""
+    async def _run_round2(self, ctx: MessageContext) -> None:
         self.logger.info("=== ROUND 2: Conflict Resolution via Debate ===")
-
-        # identify conflicts
         conflicts = self._identify_conflicts()
-
         if not conflicts:
             self.logger.info("No significant conflicts identified, skipping debate")
-            await self._run_round3()
+            await self._run_round3(ctx)
             return
-
         self.logger.info(f"Identified {len(conflicts)} questions with conflicts")
-
-        # run debates for each conflict
         for q_id, conflict_info in conflicts.items():
-            await self._run_single_debate(q_id, conflict_info)
+            await self._run_single_debate(ctx, q_id, conflict_info)
+        await self._run_round3(ctx)
 
-        # proceed to Round 3
-        await self._run_round3()
-
-    async def _run_single_debate(self, q_id: str, conflict_info: Dict) -> None:
-        """Run debate for a single conflicting question.
-
-        Args:
-            q_id: Question identifier
-            conflict_info: Conflict details
-        """
-        self.logger.info(
-            f"Starting debate for question {q_id} "
-            f"(range: {conflict_info['score_range']}, "
-            f"severity: {conflict_info['conflict_severity']})"
-        )
-
-        if self._ctx is None:
-            raise RuntimeError("moderator context not initialized before debate")
-
-        # create debate prompt
+    async def _run_single_debate(
+        self, ctx: MessageContext, q_id: str, conflict_info: Dict
+    ) -> None:
+        self.logger.info(f"Starting debate for question {q_id}")
         debate_prompt = DebatePrompt(
             case_id=self._case_id,
             q_id=q_id,
@@ -293,40 +232,20 @@ class irAKIModeratorAgent(RoutedAgent):
             conflicting_evidence=conflict_info["conflicting_evidence"],
             clinical_importance=conflict_info["clinical_importance"],
         )
-
-        # send only to experts actually involved in the conflict (fallback to all if empty)
         participants = (
             list(conflict_info["score_distribution"].keys()) or self._expert_ids
         )
         for ex_id in participants:
             target = AgentId(type=f"expert_{ex_id}", key=self._case_id)
-            await self._ctx.send_message(debate_prompt, target)
-            self.logger.info(
-                "→ sent debate prompt for %s to %s (agent=%s/%s)",
-                q_id,
-                ex_id,
-                target.type,
-                target.key,
-            )
-
-        # simple debate timeout (in production, would track actual comments)
+            await self.send_message(ctx, debate_prompt, target)
         await asyncio.sleep(min(30, self._delphi_config.debate_timeout))
-
-        # terminate debate
         terminate_msg = TerminateDebate(
-            case_id=self._case_id,
-            q_id=q_id,
-            reason="timeout",  # simplified for now
+            case_id=self._case_id, q_id=q_id, reason="timeout"
         )
         for ex_id in participants:
             target = AgentId(type=f"expert_{ex_id}", key=self._case_id)
-            await self._ctx.send_message(terminate_msg, target)
-
-        # store debate summary (simplified)
-        self._debate_summaries[q_id] = (
-            f"Debate conducted on question {q_id} with {conflict_info['conflict_severity']} "
-            f"conflict (score range: {conflict_info['score_range']})"
-        )
+            await self.send_message(ctx, terminate_msg, target)
+        self._debate_summaries[q_id] = f"Debate conducted on question {q_id}"
 
     def _identify_conflicts(self) -> Dict[str, Dict]:
         """Identify questions with significant disagreement using category method.
@@ -422,56 +341,33 @@ class irAKIModeratorAgent(RoutedAgent):
 
         return conflicts
 
-    async def _run_round3(self) -> None:
-        """Execute Round 3: Final consensus assessments."""
+    async def _run_round3(self, ctx: MessageContext) -> None:
         self.logger.info("=== ROUND 3: Final Consensus Assessments ===")
-
-        if self._ctx is None:
-            raise RuntimeError("moderator context not initialized before round 3")
-
-        # prepare for responses
         self._pending_round3 = set(self._expert_ids)
         self._round3_done.clear()
         self._round3_replies.clear()
-
-        # create debate summary
         debate_summary = (
-            "\n".join(f"- {summary}" for summary in self._debate_summaries.values())
-            if self._debate_summaries
-            else "No debates were conducted."
+            "\n".join(f"- {s}" for s in self._debate_summaries.values())
+            or "No debates were conducted."
         )
-
-        # create Round 3 questionnaire with debate context
         questions = self._config_loader.get_questions()
         questionnaire = QuestionnaireMsg(
             case_id=self._case_id,
             round_phase="round3",
             patient_info=self._patient_data.get("patient_info", {}),
-            icu_summary=self._patient_data.get("patient_summary", ""),
+            icu_summary=self._patient_data.get(
+                "icu_summary", self._patient_data.get("patient_summary", "")
+            ),
             medication_history=self._patient_data.get("medication_history", {}),
             lab_values=self._patient_data.get("lab_values", {}),
             imaging_reports=str(self._patient_data.get("imaging_reports", [])),
             questions=questions,
             debate_summary=debate_summary,
         )
-
-        # direct-send to all experts
         for ex_id in self._expert_ids:
             target = AgentId(type=f"expert_{ex_id}", key=self._case_id)
-            await self._ctx.send_message(questionnaire, target)
-            self.logger.info(
-                "→ sent Round 3 questionnaire to %s (agent=%s/%s)",
-                ex_id,
-                target.type,
-                target.key,
-            )
-
-        self.logger.info(
-            "Broadcast (direct) complete to %d experts", len(self._expert_ids)
-        )
-
-        # wait for responses
-        await self._wait_for_round_completion("round3")
+            await self.send_message(ctx, questionnaire, target)
+        await self._wait_for_round_completion("round3", ctx)
 
     @rpc
     async def record_round3(
@@ -494,14 +390,13 @@ class irAKIModeratorAgent(RoutedAgent):
         self._round3_replies.append(message)
         self._pending_round3.discard(message.expert_id)
 
-        self.logger.debug(
-            f"Round 3 reply from {message.expert_id} "
-            f"(verdict={'irAKI' if message.verdict else 'Other'}, "
-            f"P(irAKI)={message.p_iraki:.2f}). "
-            f"{len(self._pending_round3)} experts pending."
+        self.logger.info(
+            "✓ Round 3 reply from %s; pending: %d -> %s",
+            message.expert_id,
+            len(self._pending_round3),
+            sorted(self._pending_round3),
         )
 
-        # check if all done
         if not self._pending_round3:
             self._round3_done.set()
 
