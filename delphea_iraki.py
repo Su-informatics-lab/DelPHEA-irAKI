@@ -14,10 +14,10 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 from aggregator import WeightedMeanAggregator
 from dataloader import DataLoader
 from expert import Expert
+from llm_backend import LLMBackend
 from moderator import Moderator
 from router import FullRouter, SparseRouter
 from schema import load_qids  # for early qid introspection
-from vllm_backend import VLLMBackend
 
 # -------------------- helpers: id parsing & dataloader glue --------------------
 
@@ -281,8 +281,10 @@ def main() -> None:
         )
 
     # backend
-    backend = VLLMBackend(
-        endpoint_url=args.endpoint_url, model=args.model_name, api_key=None
+    backend = LLMBackend(
+        endpoint_url=args.endpoint_url,
+        model=args.model_name,
+        api_key=None,
     )
 
     # experts (reused across cases)
