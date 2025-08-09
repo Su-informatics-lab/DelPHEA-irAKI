@@ -85,6 +85,7 @@ class ConfigurationLoader:
         self._expert_panel = self._load_expert_panel()
         self._questionnaire = self._load_questionnaire()
         self._prompts = self._load_prompts()
+        self._validate_prompts_required()
 
         # create quick lookup indices
         self._expert_lookup = {
@@ -233,6 +234,68 @@ class ConfigurationLoader:
             raise ValueError(f"No valid prompt templates found in {prompts_dir}")
 
         return prompts
+
+    def _validate_prompts_required(self) -> None:
+        req = ["iraki_assessment", "debate", "confidence_instructions"]
+        missing = [k for k in req if k not in self._prompts]
+        if missing:
+            raise ValueError(f"Missing required prompt files: {missing}")
+
+        ia = self._prompts["iraki_assessment"]
+        if "base_template" not in ia or "json_schema" not in ia:
+            raise ValueError(
+                "iraki_assessment.json must include 'base_template' and 'json_schema'"
+            )
+
+        db = self._prompts["debate"]
+        if "base_template" not in db:
+            raise ValueError("debate.json must include 'base_template'")
+
+        ci = self._prompts["confidence_instructions"]
+        if "ci_instructions" not in ci:
+            raise ValueError(
+                "confidence_instructions.json must include 'ci_instructions'"
+            )
+
+    def get_prompt_template(self, name: str) -> str:
+        """
+        Strict API used by expert agents. Valid names: 'round1', 'round3', 'debate'.
+        Raises loudly if unknown or malformed.
+        """
+        if name == "debate":
+            tpl = self._prompts["debate"]["base_template"]
+            if not isinstance(tpl, str) or not tpl.strip():
+                raise ValueError("debate.base_template must be a non-empty string")
+            return tpl
+
+        if name in ("round1", "round3"):
+            ia = self._prompts["iraki_assessment"]
+            ci = self._prompts["confidence_instructions"]["ci_instructions"]
+            base = ia["base_template"]
+            rsi_key = (
+                "round1_instructions" if name == "round1" else "round3_instructions"
+            )
+            rsi = ia.get(rsi_key, "")
+
+            if not isinstance(base, str) or not base.strip():
+                raise ValueError(
+                    "iraki_assessment.base_template must be a non-empty string"
+                )
+            if not isinstance(ci, str) or not ci.strip():
+                raise ValueError(
+                    "confidence_instructions.ci_instructions must be a non-empty string"
+                )
+            if not isinstance(rsi, str):
+                raise ValueError(f"iraki_assessment.{rsi_key} must be a string")
+
+            # stitch confidence instructions + round-specific instructions into the template
+            return base.replace("{confidence_instructions}", ci).replace(
+                "{round_specific_instructions}", rsi
+            )
+
+        raise KeyError(
+            f"Unknown prompt template '{name}'. Expected one of: round1, round3, debate"
+        )
 
     @property
     def expert_panel(self) -> Dict:
