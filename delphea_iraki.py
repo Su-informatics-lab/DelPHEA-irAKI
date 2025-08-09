@@ -61,6 +61,23 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 
+for n in ("autogen_core", "autogen_core.events"):
+    logging.getLogger(n).setLevel(logging.WARNING)
+
+
+class _Trunc(logging.Filter):
+    def __init__(self, limit=300):
+        self.limit = limit
+
+    def filter(self, record):
+        if isinstance(record.msg, str) and len(record.msg) > self.limit:
+            record.msg = record.msg[: self.limit] + "... [truncated]"
+        return True
+
+
+for h in logging.getLogger().handlers:
+    h.addFilter(_Trunc(300))
+
 
 async def run_health_check(runtime_config: RuntimeConfig) -> bool:
     """Run system health check.
