@@ -1,9 +1,8 @@
 {
-  "base_prompt": "You are {expert_name}, a {specialty} specialist.\n\nirAKI ASSESSMENT ({round_phase}) — Case {case_id}\n\nDEMOGRAPHICS\n{demographics}\n\nAGGREGATED CLINICAL NOTES\n{clinical_notes}\n\nASSESSMENT QUESTIONS (1–9 Likert)\n{questions}\n\nOUTPUT SPEC:\nReturn a strict JSON object matching the schema for {round_phase} below. Do not include extra keys.",
-  "round1_instructions": "- Judge irAKI vs alternatives using timing, UA pattern, other irAEs, and exclusion of pre/post-renal causes.\n- Provide concise evidence per question.\n- Give p_iraki with a realistic 95% CI and a confidence 0–1.\n- Include a differential list; set primary_diagnosis.",
-  "round3_instructions": "- Reassess after debate/peer insights.\n- Explain what changed from Round 1 (per question if applicable).\n- Provide final binary verdict (true=irAKI), final_diagnosis, recommendations, and confidence in verdict.",
-  "json_schema": {
-    "round1": {
+  "round1": {
+    "base_prompt": "You are {expert_name}, a {specialty} specialist.\n\nirAKI ASSESSMENT (Round 1) — Case {case_id}\n\nDEMOGRAPHICS\n{demographics}\n\nAGGREGATED CLINICAL NOTES\n{clinical_notes}\n\nASSESSMENT QUESTIONS (1–9 Likert)\n{questions}\n\nOUTPUT SPEC:\nReturn a strict JSON object matching the schema for Round 1 below. Do not include extra keys.",
+    "instructions": "- Judge irAKI vs alternatives using timing, UA pattern, other irAEs, and exclusion of pre/post-renal causes.\n- Provide concise evidence per question.\n- Give p_iraki with a realistic 95% CI and a confidence 0–1.\n- Include a differential list; set primary_diagnosis.",
+    "json_schema": {
       "scores": "object {qid:int(1-9)}",
       "evidence": "object {qid:str}",
       "clinical_reasoning": "string",
@@ -12,8 +11,12 @@
       "confidence": "float 0-1",
       "differential_diagnosis": "string[]",
       "primary_diagnosis": "string"
-    },
-    "round3": {
+    }
+  },
+  "round3": {
+    "base_prompt": "You are {expert_name}, a {specialty} specialist.\n\nirAKI ASSESSMENT (Round 3) — Case {case_id}\n\nDEMOGRAPHICS\n{demographics}\n\nAGGREGATED CLINICAL NOTES\n{clinical_notes}\n\nASSESSMENT QUESTIONS (1–9 Likert)\n{questions}\n\nOUTPUT SPEC:\nReturn a strict JSON object matching the schema for Round 3 below. Do not include extra keys.",
+    "instructions": "- Reassess after debate/peer insights.\n- Explain what changed from Round 1 (per question if applicable).\n- Provide final binary verdict (true=irAKI), final_diagnosis, recommendations, and confidence in verdict.",
+    "json_schema": {
       "scores": "object {qid:int(1-9)}",
       "evidence": "object {qid:str}",
       "p_iraki": "float 0-1",

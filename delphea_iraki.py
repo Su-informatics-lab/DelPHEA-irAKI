@@ -386,6 +386,5 @@ def main():
         sys.exit(1)
 
 
-# CRITICAL FIX: Add the missing entry point!
 if __name__ == "__main__":
     main()
