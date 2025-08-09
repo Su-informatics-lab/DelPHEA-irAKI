@@ -86,6 +86,7 @@ class ConfigurationLoader:
         self._questionnaire = self._load_questionnaire()
         self._prompts = self._load_prompts()
         self._validate_prompts_required()
+        self._prompt_index = self._index_prompts(self._prompts)
 
         # create quick lookup indices
         self._expert_lookup = {
@@ -101,6 +102,51 @@ class ConfigurationLoader:
             f"{len(self._expert_lookup)} experts, "
             f"{len(self._question_lookup)} questions"
         )
+
+    def _index_prompts(self, raw: Dict[str, Dict]) -> Dict[str, Dict]:
+        """
+        Flatten/normalize prompt files into named templates with guaranteed 'base_prompt'.
+        Expected names: round1, round3, debate. Fail fast if missing.
+        """
+        idx: Dict[str, Dict] = {}
+
+        def ensure_base(name: str, tpl: Dict, src: str) -> Dict:
+            base = tpl.get("base_prompt") or tpl.get("prompt") or tpl.get("template")
+            if not base:
+                raise ValueError(
+                    f"Prompt '{name}' missing 'base_prompt' in {src}. "
+                    "Add key 'base_prompt' (string) or rename your existing key to it."
+                )
+            # don’t mutate original; normalize key
+            out = dict(tpl)
+            out["base_prompt"] = base
+            return out
+
+        for fname, data in raw.items():
+            # iraki_assessment.json may contain sections
+            if fname == "iraki_assessment":
+                if "round1" in data:
+                    idx["round1"] = ensure_base(
+                        "round1", data["round1"], f"{fname}.json"
+                    )
+                if "round3" in data:
+                    idx["round3"] = ensure_base(
+                        "round3", data["round3"], f"{fname}.json"
+                    )
+            # debate.json may be flat
+            if fname == "debate":
+                idx["debate"] = ensure_base("debate", data, f"{fname}.json")
+
+        # Fail fast: require all three
+        missing = [k for k in ("round1", "round3", "debate") if k not in idx]
+        if missing:
+            raise ValueError(
+                f"Missing prompt templates: {missing}. "
+                f"Loaded files: {list(raw.keys())}. "
+                "Ensure iraki_assessment.json has 'round1' and 'round3', and debate.json exists."
+            )
+
+        return idx
 
     def _load_expert_panel(self) -> Dict:
         """
@@ -257,45 +303,14 @@ class ConfigurationLoader:
                 "confidence_instructions.json must include 'ci_instructions'"
             )
 
-    def get_prompt_template(self, name: str) -> str:
-        """
-        Strict API used by expert agents. Valid names: 'round1', 'round3', 'debate'.
-        Raises loudly if unknown or malformed.
-        """
-        if name == "debate":
-            tpl = self._prompts["debate"]["base_template"]
-            if not isinstance(tpl, str) or not tpl.strip():
-                raise ValueError("debate.base_template must be a non-empty string")
-            return tpl
-
-        if name in ("round1", "round3"):
-            ia = self._prompts["iraki_assessment"]
-            ci = self._prompts["confidence_instructions"]["ci_instructions"]
-            base = ia["base_template"]
-            rsi_key = (
-                "round1_instructions" if name == "round1" else "round3_instructions"
+    def get_prompt_template(self, name: str) -> Dict:
+        """Return normalized prompt by name (round1, round3, debate)."""
+        if name not in self._prompt_index:
+            raise KeyError(
+                f"Unknown prompt template '{name}'. "
+                f"Available: {list(self._prompt_index.keys())}"
             )
-            rsi = ia.get(rsi_key, "")
-
-            if not isinstance(base, str) or not base.strip():
-                raise ValueError(
-                    "iraki_assessment.base_template must be a non-empty string"
-                )
-            if not isinstance(ci, str) or not ci.strip():
-                raise ValueError(
-                    "confidence_instructions.ci_instructions must be a non-empty string"
-                )
-            if not isinstance(rsi, str):
-                raise ValueError(f"iraki_assessment.{rsi_key} must be a string")
-
-            # stitch confidence instructions + round-specific instructions into the template
-            return base.replace("{confidence_instructions}", ci).replace(
-                "{round_specific_instructions}", rsi
-            )
-
-        raise KeyError(
-            f"Unknown prompt template '{name}'. Expected one of: round1, round3, debate"
-        )
+        return self._prompt_index[name]
 
     @property
     def expert_panel(self) -> Dict:
