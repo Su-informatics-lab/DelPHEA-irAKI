@@ -103,6 +103,11 @@ def get_confidence_instructions() -> Dict[str, Any]:
     return _confidence_instructions  # type: ignore[return-value]
 
 
+def get_conf_instructions() -> Dict[str, Any]:
+    """back-compat shim; prefer get_confidence_instructions()."""
+    return get_confidence_instructions()
+
+
 def set_prompts_dir(path: str | Path) -> None:
     """optional: override base prompts directory at runtime and clear caches."""
     global _BASE_DIR, _expert_prompts, _iraki_assessment, _confidence_instructions
@@ -120,5 +125,6 @@ __all__ = [
     "get_expert_prompts",
     "get_iraki_assessment",
     "get_confidence_instructions",
+    "get_conf_instructions",
     "set_prompts_dir",
 ]
