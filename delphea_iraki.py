@@ -282,7 +282,7 @@ def main() -> None:
 
     # backend
     backend = VLLMBackend(
-        model=args.model_name, base_url=args.endpoint_url, api_key=None
+        endpoint_url=args.endpoint_url, model=args.model_name, api_key=None
     )
 
     # experts (reused across cases)
