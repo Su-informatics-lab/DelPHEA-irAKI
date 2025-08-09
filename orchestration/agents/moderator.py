@@ -136,7 +136,7 @@ class irAKIModeratorAgent(RoutedAgent):
         self.logger.info(f"=== STARTING DELPHI PROCESS FOR CASE {message.case_id} ===")
         patient_data = self._data_loader.load_patient_case(message.case_id)
         self._patient_data = patient_data
-        await self._run_round1(ctx)
+        await self._run_round1()
 
     async def _run_round1(self) -> None:
         self.logger.info("=== ROUND 1: Independent Expert Assessments ===")
