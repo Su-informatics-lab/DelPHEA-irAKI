@@ -35,10 +35,10 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict
 
-from expert_validation import PayloadValidationError, call_llm_with_schema
 from llm_backend import LLMBackend
 from models import AssessmentR1, AssessmentR3, DebateTurn
 from schema import load_qids
+from validators import PayloadValidationError, call_llm_with_schema
 
 
 class Expert:
