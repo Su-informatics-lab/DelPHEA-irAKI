@@ -1,7 +1,7 @@
 # prompts/__init__.py
-"""Public API for the prompts package.
+"""public api for the prompts package.
 
-Exposes only the top-level functions used by other modules:
+exports only the top-level formatters used elsewhere:
 - format_round1_prompt
 - format_round3_prompt
 """
