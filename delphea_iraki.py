@@ -185,6 +185,56 @@ def main():
         "--outdir", default="out", help="directory to write one report per case"
     )
     args = parser.parse_args()
+    # defaults for backend config (env → hard defaults)
+    import os
+    import sys
+
+    import requests
+
+    if args.base_url is None:
+        args.base_url = (
+            os.getenv("VLLM_ENDPOINT")
+            or os.getenv("VLLM_BASE_URL")
+            or os.getenv("OPENAI_BASE_URL")
+            or "http://127.0.0.1:8000"
+        )
+    # normalize: users sometimes paste a base that already includes /v1
+    args.base_url = re.sub(r"/v1/?$", "", args.base_url.rstrip("/"))
+
+    if args.model is None:
+        args.model = (
+            os.getenv("OPENAI_MODEL")
+            or os.getenv("VLLM_MODEL")
+            or "openai/gpt-oss-120b"
+        )
+
+    # api key (if your vLLM server requires it)
+    if args.api_key is None:
+        args.api_key = os.getenv("OPENAI_API_KEY") or os.getenv("VLLM_API_KEY")
+
+    # propagate to env for modules that read from environment
+    os.environ["VLLM_BASE_URL"] = args.base_url
+    os.environ["OPENAI_BASE_URL"] = args.base_url
+    if args.api_key:
+        os.environ["OPENAI_API_KEY"] = args.api_key
+        os.environ["VLLM_API_KEY"] = args.api_key
+    os.environ["OPENAI_MODEL"] = args.model
+    os.environ["VLLM_MODEL"] = args.model
+
+    # fail fast if endpoint/model is wrong
+    try:
+        base = args.base_url.rstrip("/")
+        r = requests.get(f"{base}/v1/models", timeout=3)
+        r.raise_for_status()
+        served = {m.get("id") for m in r.json().get("data", []) if isinstance(m, dict)}
+        if args.model not in served:
+            raise RuntimeError(
+                f"requested model '{args.model}' not served at {base}. "
+                f"available: {sorted(served) or 'none'}"
+            )
+    except Exception as e:
+        print(f"[fatal] vllm endpoint/model check failed: {e}", file=sys.stderr)
+        sys.exit(2)
 
     # dataloader (fail fast if data_dir missing and not using dummy)
     loader = DataLoader(data_dir=args.data_dir, use_dummy=args.use_dummy_loader)
