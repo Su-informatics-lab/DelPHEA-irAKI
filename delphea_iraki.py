@@ -356,7 +356,15 @@ def main() -> None:
             len(experts),
         )
 
-        log.info("[case %s] aggregation start — WeightedMeanAggregator", case_id)
+        p_hat = getattr(
+            consensus, "iraki_probability", getattr(consensus, "p_iraki", None)
+        )
+        log.info(
+            "[case %s] aggregation done — p=%.3f, ci=%s",
+            case_id,
+            p_hat,
+            consensus.ci_iraki,
+        )
         consensus = moderator.aggregator.aggregate([a for _, a in r3])
         log.info(
             "[case %s] aggregation done — p=%.3f, ci=%s",

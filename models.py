@@ -5,7 +5,14 @@ from __future__ import annotations
 
 from typing import Dict, List, Tuple
 
-from pydantic import BaseModel, Field, ValidationInfo, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    Field,
+    ValidationInfo,
+    computed_field,
+    field_validator,
+    model_validator,
+)
 
 
 class AssessmentBase(BaseModel):
@@ -44,7 +51,7 @@ class AssessmentBase(BaseModel):
     @model_validator(mode="after")
     def _strict_schema_echo(self, info: ValidationInfo):
         # ensure qids in scores and evidence exactly match questionnaire expected_qids, if provided
-        expected = set(info.context.get("expected_qids", []))
+        expected = set(info.context.get("expected_qids", [])) if info.context else set()
         if expected:
             s_keys, e_keys = set(self.scores.keys()), set(self.evidence.keys())
             if s_keys != expected:
@@ -99,3 +106,9 @@ class Consensus(BaseModel):
     consensus_confidence: float = Field(..., ge=0.0, le=1.0)
     ci_iraki: Tuple[float, float] = Field(..., description="[lower, upper] in [0,1]")
     expert_count: int = Field(..., ge=1)
+
+    # backward-compat alias so older code can access .p_iraki; also shows up in model_dump()
+    @computed_field  # type: ignore[misc]
+    @property
+    def p_iraki(self) -> float:
+        return self.iraki_probability
