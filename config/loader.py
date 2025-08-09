@@ -288,14 +288,14 @@ class ConfigurationLoader:
             raise ValueError(f"Missing required prompt files: {missing}")
 
         ia = self._prompts["iraki_assessment"]
-        if "base_template" not in ia or "json_schema" not in ia:
+        if "base_prompt" not in ia or "json_schema" not in ia:
             raise ValueError(
-                "iraki_assessment.json must include 'base_template' and 'json_schema'"
+                "iraki_assessment.json must include 'base_prompt' and 'json_schema'"
             )
 
         db = self._prompts["debate"]
-        if "base_template" not in db:
-            raise ValueError("debate.json must include 'base_template'")
+        if "base_prompt" not in db:
+            raise ValueError("debate.json must include 'base_prompt'")
 
         ci = self._prompts["confidence_instructions"]
         if "ci_instructions" not in ci:
