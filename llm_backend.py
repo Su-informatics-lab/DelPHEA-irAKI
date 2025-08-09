@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, Dict, List, Optional
 
 import requests
@@ -87,16 +88,16 @@ class LLMBackend:
             payload.update(extra)
 
         text = self._post_and_parse_text(self._completions, payload, mode="completions")
-        if isinstance(text, str) and text.strip():
+        text = self._clean_and_maybe_extract_json(text)
+        if text is not None:
             return text
 
-        # fallback to chat api; force json_object if server supports it
+        # fallback to chat api; request json if supported
         chat_payload: Dict[str, Any] = {
             "model": self._model,
             "messages": [{"role": "user", "content": prompt}],
             "max_tokens": max_tokens,
             "temperature": temperature,
-            # many vllm/openai-compatible servers honor this and yield strict json
             "response_format": {"type": "json_object"},
         }
         if stop:
@@ -104,11 +105,11 @@ class LLMBackend:
         if seed is not None:
             chat_payload["seed"] = seed
         if isinstance(extra, dict):
-            # let caller override response_format or add server-specific args
             chat_payload.update(extra)
 
         text = self._post_and_parse_text(self._chat, chat_payload, mode="chat")
-        if isinstance(text, str) and text.strip():
+        text = self._clean_and_maybe_extract_json(text)
+        if text is not None:
             return text
 
         raise RuntimeError("LLMBackend.generate: no usable text from either route")
@@ -155,9 +156,7 @@ class LLMBackend:
                 if not choices:
                     return None
                 text = choices[0].get("text")
-                if isinstance(text, str) and text.strip():
-                    return text
-                return None
+                return text if isinstance(text, str) and text.strip() else None
 
             # chat mode
             choices = data.get("choices") or []
@@ -170,7 +169,7 @@ class LLMBackend:
             if isinstance(content, str) and content.strip():
                 return content
 
-            # secondary: some servers/models emit function/tool calls with arguments json
+            # secondary: function/tool calls
             tool_calls = msg.get("tool_calls") or []
             for tc in tool_calls:
                 fn = tc.get("function") or {}
@@ -180,10 +179,67 @@ class LLMBackend:
                 if isinstance(args, str) and args.strip():
                     return args
 
-            # nothing usable
             return None
 
         except Exception as e:  # noqa: BLE001
             raise RuntimeError(
                 f"LLMBackend: failed to parse response schema from {url}: {e}"
             ) from e
+
+    # -------------------- helpers --------------------
+
+    def _clean_and_maybe_extract_json(self, text: Optional[str]) -> Optional[str]:
+        """normalize empty to None; if text contains json, extract and return it."""
+        if not isinstance(text, str):
+            return None
+        s = text.strip()
+        if not s:
+            return None
+
+        # fast path: already valid json
+        if self._is_valid_json(s):
+            return s
+
+        # fenced code block: ```json ...```
+        m = re.search(
+            r"```(?:json)?\s*(\{[\s\S]*?\}|\[[\s\S]*?\])\s*```", s, flags=re.IGNORECASE
+        )
+        if m and self._is_valid_json(m.group(1)):
+            return m.group(1)
+
+        # first balanced-looking json object/array substring (simple heuristic)
+        # try object
+        obj = self._extract_first_braced(s, opener="{", closer="}")
+        if obj and self._is_valid_json(obj):
+            return obj
+        # try array
+        arr = self._extract_first_braced(s, opener="[", closer="]")
+        if arr and self._is_valid_json(arr):
+            return arr
+
+        # no valid json found; return None so caller can fallback/raise
+        return None
+
+    @staticmethod
+    def _is_valid_json(s: str) -> bool:
+        try:
+            json.loads(s)
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
+    def _extract_first_braced(s: str, *, opener: str, closer: str) -> Optional[str]:
+        # simple bracket matching to find the first top-level balanced segment
+        start = s.find(opener)
+        if start == -1:
+            return None
+        depth = 0
+        for i in range(start, len(s)):
+            if s[i] == opener:
+                depth += 1
+            elif s[i] == closer:
+                depth -= 1
+                if depth == 0:
+                    return s[start : i + 1]
+        return None
