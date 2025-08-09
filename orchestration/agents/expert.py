@@ -232,15 +232,22 @@ class irAKIExpertAgent(RoutedAgent):
         return prompt
 
     def _format_patient_summary(self, message: QuestionnaireMsg) -> str:
+        """
+        Kept for compatibility with existing calls, but now only uses the new fields.
+        """
         parts = []
-        if message.patient_info:
-            age = message.patient_info.get("age", "Unknown")
-            gender = message.patient_info.get("gender", "Unknown")
-            parts.append(f"Patient: {age}-year-old {gender}")
-        if message.icu_summary:
-            parts.append(f"Clinical Summary: {message.icu_summary}")
-        if not message.lab_values or not message.medication_history:
-            parts.append("Note: Lab values and medications pending integration")
+        demo = message.demographics or {}
+        age = demo.get("age")
+        gender = demo.get("gender")
+        if age is not None or gender:
+            parts.append(
+                f"Patient: {age if age is not None else 'Unknown'}-year-old {gender or 'Unknown'}"
+            )
+        notes = (message.clinical_notes or "").strip()
+        if notes:
+            parts.append(
+                f"Clinical Notes: {notes[:1200]}"
+            )  # guardrail to avoid flooding logs/prompts
         return "\n".join(parts)
 
     def _format_questions(self, questions: List[Dict]) -> str:
