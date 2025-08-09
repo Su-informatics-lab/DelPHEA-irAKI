@@ -138,6 +138,79 @@ class irAKIModeratorAgent(RoutedAgent):
         self._patient_data = patient_data
         await self._run_round1()
 
+    def _verdict_from_prob(self, p: float) -> bool:
+        thr = getattr(self._delphi_config, "verdict_threshold", 0.5)
+        try:
+            return float(p) >= float(thr)
+        except Exception:
+            return False
+
+    async def _compute_final_consensus(self) -> None:
+        """Compute beta pooling consensus for irAKI classification."""
+        self.logger.info("=== COMPUTING FINAL CONSENSUS ===")
+
+        if not self._round3_replies:
+            self.logger.error("No Round 3 replies received, cannot compute consensus")
+            return
+
+        # extract data for beta pooling
+        p_vec = np.array([r.p_iraki for r in self._round3_replies])
+        ci_mat = np.array([list(r.ci_iraki) for r in self._round3_replies])
+        w_vec = np.array([r.confidence for r in self._round3_replies])
+
+        # compute beta pooling consensus
+        try:
+            consensus_stats = beta_pool_confidence(p_vec, ci_mat, w_vec)
+        except Exception as e:
+            self.logger.error(f"Failed to compute beta pooling: {e}")
+            consensus_stats = {
+                "pooled_mean": float(np.mean(p_vec)),
+                "pooled_ci": [
+                    float(np.percentile(p_vec, 2.5)),
+                    float(np.percentile(p_vec, 97.5)),
+                ],
+                "consensus_conf": float(np.mean(w_vec)),
+            }
+
+        # Majority vote from probability (not raw LLM boolean)
+        votes_iraki = sum(
+            1 for r in self._round3_replies if self._verdict_from_prob(r.p_iraki)
+        )
+        consensus_verdict = votes_iraki > len(self._round3_replies) / 2
+
+        label = "irAKI" if consensus_verdict else "Other AKI"
+        count = (
+            votes_iraki
+            if consensus_verdict
+            else (len(self._round3_replies) - votes_iraki)
+        )
+
+        self.logger.info("=" * 80)
+        self.logger.info(f"CASE {self._case_id} irAKI CONSENSUS RESULTS:")
+        self.logger.info("-" * 80)
+        self.logger.info(
+            f"Beta Pooled P(irAKI):    {consensus_stats['pooled_mean']:.3f}"
+        )
+        self.logger.info(
+            f"95% Credible Interval:   [{consensus_stats['pooled_ci'][0]:.3f}, "
+            f"{consensus_stats['pooled_ci'][1]:.3f}]"
+        )
+        self.logger.info(
+            f"Consensus Confidence:    {consensus_stats['consensus_conf']:.3f}"
+        )
+        self.logger.info(
+            f"Majority Vote:           {label} ({count}/{len(self._round3_replies)})"
+        )
+        self.logger.info(
+            f"Expert Participation:    {len(self._round3_replies)}/{len(self._expert_ids)}"
+        )
+        self.logger.info("=" * 80)
+
+        if self._delphi_config.export_full_transcripts:
+            await self._export_for_human_review(
+                consensus_verdict=consensus_verdict, consensus_stats=consensus_stats
+            )
+
     async def _run_round1(self) -> None:
         self.logger.info("=== ROUND 1: Independent Expert Assessments ===")
         questions = self._config_loader.get_questions()
@@ -370,68 +443,72 @@ class irAKIModeratorAgent(RoutedAgent):
 
         return AckMsg(ok=True, message="Round 3 reply recorded")
 
-    async def _compute_final_consensus(self) -> None:
-        self.logger.info("=== COMPUTING FINAL CONSENSUS ===")
-
-        if not self._round3_replies:
-            self.logger.error("No Round 3 replies received, cannot compute consensus")
-            return
-
-        p_vec = np.array([r.p_iraki for r in self._round3_replies])
-        ci_mat = np.array([list(r.ci_iraki) for r in self._round3_replies])
-        w_vec = np.array([r.confidence for r in self._round3_replies])
-
-        try:
-            consensus_stats = beta_pool_confidence(p_vec, ci_mat, w_vec)
-        except Exception as e:
-            self.logger.error(f"Failed to compute beta pooling: {e}")
-            consensus_stats = {
-                "pooled_mean": float(np.mean(p_vec)),
-                "pooled_ci": [
-                    float(np.percentile(p_vec, 2.5)),
-                    float(np.percentile(p_vec, 97.5)),
-                ],
-                "consensus_conf": float(np.mean(w_vec)),
-            }
-
-        votes_iraki = sum(1 for r in self._round3_replies if r.verdict)
-        consensus_verdict = votes_iraki > len(self._round3_replies) / 2
-
-        label = "irAKI" if consensus_verdict else "Other AKI"
-        count = (
-            votes_iraki
-            if consensus_verdict
-            else (len(self._round3_replies) - votes_iraki)
-        )
-
-        self.logger.info("=" * 80)
-        self.logger.info(f"CASE {self._case_id} irAKI CONSENSUS RESULTS:")
-        self.logger.info("-" * 80)
-        self.logger.info(
-            f"Beta Pooled P(irAKI):    {consensus_stats['pooled_mean']:.3f}"
-        )
-        self.logger.info(
-            f"95% Credible Interval:   [{consensus_stats['pooled_ci'][0]:.3f}, "
-            f"{consensus_stats['pooled_ci'][1]:.3f}]"
-        )
-        self.logger.info(
-            f"Consensus Confidence:    {consensus_stats['consensus_conf']:.3f}"
-        )
-        self.logger.info(
-            f"Majority Vote:           {label} ({count}/{len(self._round3_replies)})"
-        )
-        self.logger.info(
-            f"Expert Participation:    {len(self._round3_replies)}/{len(self._expert_ids)}"
-        )
-        self.logger.info("=" * 80)
-
-        if self._delphi_config.export_full_transcripts:
-            await self._export_for_human_review(consensus_stats, consensus_verdict)
-
     async def _export_for_human_review(
         self, consensus_stats: Dict, consensus_verdict: bool
     ) -> None:
+        """Export complete case for human review with R1 snapshot and computed deltas."""
         self.logger.info("Exporting case for human review...")
+
+        # index R1 by expert for delta computation
+        r1_by_expert = {r.expert_id: r for r in self._round1_replies}
+
+        # build expert assessments with:
+        #   - full R1 snapshot
+        #   - R3 with both LLM summary and computed deltas
+        expert_assessments: List[Dict[str, Any]] = []
+
+        # Round 1 entries (add structured fields)
+        for r in self._round1_replies:
+            expert_assessments.append(
+                {
+                    "round": "round1",
+                    "expert_id": r.expert_id,
+                    "p_iraki": float(r.p_iraki),
+                    "confidence": float(r.confidence),
+                    "scores": {str(k): int(v) for k, v in r.scores.items()},
+                    "evidence": {str(k): str(v) for k, v in r.evidence.items()},
+                    "clinical_reasoning": r.clinical_reasoning,
+                }
+            )
+
+        # Round 3 entries with computed deltas from R1
+        for r3 in self._round3_replies:
+            r1 = r1_by_expert.get(r3.expert_id)
+            computed_changes: Dict[str, Any] = {}
+            if r1:
+                # programmatic deltas
+                score_deltas = {}
+                for qid, s1 in r1.scores.items():
+                    s3 = r3.scores.get(qid, s1)
+                    try:
+                        score_deltas[str(qid)] = int(s3) - int(s1)
+                    except Exception:
+                        pass
+
+                computed_changes = {
+                    "delta_p_iraki": float(r3.p_iraki - r1.p_iraki),
+                    "delta_confidence": float(r3.confidence - r1.confidence),
+                    "verdict_from_prob": bool(self._verdict_from_prob(r3.p_iraki)),
+                    "verdict_changed_from_prob": bool(
+                        self._verdict_from_prob(r3.p_iraki)
+                        != self._verdict_from_prob(r1.p_iraki)
+                    ),
+                    "score_deltas": score_deltas,
+                }
+
+            expert_assessments.append(
+                {
+                    "round": "round3",
+                    "expert_id": r3.expert_id,
+                    "p_iraki": float(r3.p_iraki),
+                    "confidence": float(r3.confidence),
+                    # keep the raw LLM boolean for transparency, but add our thresholded verdict too
+                    "verdict_llm": bool(r3.verdict),
+                    "verdict_from_prob": bool(self._verdict_from_prob(r3.p_iraki)),
+                    "changes_from_round1": r3.changes_from_round1,  # LLM-provided summary (optional)
+                    "computed_changes": computed_changes,  # programmatic deltas
+                }
+            )
 
         export_data = {
             "case_id": self._case_id,
@@ -447,26 +524,7 @@ class irAKIModeratorAgent(RoutedAgent):
             },
             "majority_verdict": bool(consensus_verdict),
             "expert_agreement_level": float(self._calculate_agreement_level()),
-            "expert_assessments": [
-                {
-                    "round": "round1",
-                    "expert_id": r.expert_id,
-                    "p_iraki": float(r.p_iraki),
-                    "confidence": float(r.confidence),
-                }
-                for r in self._round1_replies
-            ]
-            + [
-                {
-                    "round": "round3",
-                    "expert_id": r.expert_id,
-                    "p_iraki": float(r.p_iraki),
-                    "confidence": float(r.confidence),
-                    "verdict": bool(r.verdict),
-                    "changes_from_round1": r.changes_from_round1,
-                }
-                for r in self._round3_replies
-            ],
+            "expert_assessments": expert_assessments,
             "debate_transcripts": [
                 {"q_id": q_id, "summary": summary}
                 for q_id, summary in self._debate_summaries.items()
@@ -485,6 +543,7 @@ class irAKIModeratorAgent(RoutedAgent):
             },
         }
 
+        # make sure it’s JSON-serializable even with numpy types/arrays
         export_data = _to_builtin(export_data)
 
         output_file = (
