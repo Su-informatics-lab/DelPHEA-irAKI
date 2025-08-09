@@ -1,58 +1,37 @@
 # delphea_iraki.py
-# cli entrypoint wiring config → agents → run
+# cli entrypoint wiring config → dataloader → agents → run (single or batch)
+# defaults to vllm backend; --case accepts a plain patient_id string for fast testing.
 
 from __future__ import annotations
 
 import argparse
 import json
+import re
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from consensus import WeightedMeanAggregator
-from expert import Expert  # requires the lightweight Expert with assess_round1/3/debate
+from aggregator import WeightedMeanAggregator
+from dataloader import DataLoader
+from expert import Expert
 from llm_backend import LLMBackend
 from moderator import Moderator
 from router import FullRouter, SparseRouter
-from schema import load_qids  # single source of truth
+from vllm_backend import VLLMBackend  # default backend
+
+# -------------------- helpers: id parsing & dataloader glue --------------------
+
+_ID_RE = re.compile(r"(\d+)")
 
 
-class DummyBackend(LLMBackend):
-    # simple backend stub for smoke tests; replace with real transport
-    def assess_round1(self, expert_ctx: Dict[str, Any]) -> Dict[str, Any]:
-        qids = load_qids(expert_ctx["questionnaire_path"])
-        return {
-            "scores": {q: 7 for q in qids},
-            "evidence": {q: "placeholder evidence" for q in qids},
-            "clinical_reasoning": "placeholder reasoning",
-            "p_iraki": 0.7,
-            "ci_iraki": [0.6, 0.8],
-            "confidence": 0.8,
-            "differential_diagnosis": ["ATIN", "ATN"],
-            "primary_diagnosis": "irAKI",
-        }
-
-    def assess_round3(self, expert_ctx: Dict[str, Any]) -> Dict[str, Any]:
-        qids = load_qids(expert_ctx["questionnaire_path"])
-        return {
-            "scores": {q: 8 for q in qids},
-            "evidence": {q: "updated evidence after debate" for q in qids},
-            "p_iraki": 0.75,
-            "ci_iraki": [0.65, 0.85],
-            "confidence": 0.85,
-            "changes_from_round1": {"overall": "nudged up after debate"},
-            "debate_influence": "convinced by nephrology/rheum arguments",
-            "verdict": True,
-            "final_diagnosis": "irAKI",
-            "confidence_in_verdict": 0.85,
-            "recommendations": ["hold ICI", "consider steroids", "nephrology consult"],
-        }
-
-    def debate(self, expert_ctx: Dict[str, Any]) -> Dict[str, Any]:
-        return {
-            "text": "constructive rebuttal text",
-            "citations": [],
-            "satisfied": True,
-        }
+def _to_case_id_from_patient_id(x: str | int) -> str:
+    """Normalize arbitrary patient_id inputs (e.g., 'P123', '123') to 'iraki_case_123'."""
+    if isinstance(x, int):
+        return f"iraki_case_{x}"
+    s = str(x).strip()
+    m = _ID_RE.search(s)
+    if not m:
+        raise ValueError(f"Could not extract an integer patient_id from: {x!r}")
+    return f"iraki_case_{int(m.group(1))}"
 
 
 def _load_panel(panel_path: str):
@@ -60,28 +39,213 @@ def _load_panel(panel_path: str):
         return json.load(f)["expert_panel"]["experts"]
 
 
+def _read_json(path: Path):
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _case_from_loader(case_like: Any, loader: DataLoader) -> Tuple[str, Dict[str, Any]]:
+    """
+    Accepts either a patient_id (string/int) or a full case dict.
+    Returns (case_id, case_dict) using DataLoader when an id is provided.
+    """
+    # full case dict path (already structured like DataLoader output)
+    if isinstance(case_like, dict) and "clinical_notes" in case_like:
+        cid = str(
+            case_like.get("case_id")
+            or case_like.get("person_id")
+            or case_like.get("patient_id")
+            or "case_001"
+        )
+        return cid, case_like
+
+    # patient_id string/int path → use DataLoader
+    if isinstance(case_like, (str, int)):
+        case_id = _to_case_id_from_patient_id(case_like)
+        case_dict = loader.load_patient_case(case_id)
+        return case_id, case_dict
+
+    # minimal dict with id fields (load via DataLoader)
+    if isinstance(case_like, dict):
+        any_id = (
+            case_like.get("case_id")
+            or case_like.get("person_id")
+            or case_like.get("patient_id")
+        )
+        if not any_id:
+            raise ValueError(
+                "Case dict must include one of: case_id, person_id, patient_id"
+            )
+        case_id = (
+            any_id
+            if str(any_id).startswith("iraki_case_")
+            else _to_case_id_from_patient_id(any_id)
+        )
+        case_dict = loader.load_patient_case(case_id)
+        return case_id, case_dict
+
+    raise ValueError(f"Unsupported case object type: {type(case_like)}")
+
+
+def _iter_cases(
+    case_arg: Optional[str], cases_path: Optional[str], loader: DataLoader
+) -> Iterable[Tuple[str, Dict[str, Any]]]:
+    """
+    Yields (case_id, case_dict).
+
+    --case (single) accepts:
+      • plain patient_id string/int (fast path) -> DataLoader.load_patient_case(...)
+      • JSON string or path to .json -> if full case dict (has 'clinical_notes'), use as-is;
+        otherwise, extract id and load via DataLoader.
+
+    --cases (batch) accepts:
+      • path to .jsonl (each line: patient_id string/int OR full case dict)
+      • path to .json containing a list[patient_id or case_dict] or {"cases":[...]}
+    """
+    if cases_path:
+        p = Path(cases_path)
+        if not p.exists():
+            raise FileNotFoundError(f"--cases path not found: {p}")
+        if p.suffix.lower() == ".jsonl":
+            with p.open("r", encoding="utf-8") as f:
+                for i, line in enumerate(f, 1):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except Exception:
+                        obj = line  # treat as a plain patient_id
+                    yield _case_from_loader(obj, loader)
+            return
+        if p.suffix.lower() == ".json":
+            obj = _read_json(p)
+            seq = obj.get("cases") if isinstance(obj, dict) and "cases" in obj else obj
+            if isinstance(seq, list):
+                for item in seq:
+                    yield _case_from_loader(item, loader)
+                return
+            yield _case_from_loader(obj, loader)
+            return
+        raise ValueError(f"--cases only supports .jsonl or .json, got {p.suffix}")
+
+    # single-case mode
+    if case_arg is None:
+        raise ValueError("Provide --case (patient_id) or --cases (file).")
+    p = Path(case_arg)
+    if p.exists():
+        obj = _read_json(p)
+        yield _case_from_loader(obj, loader)
+        return
+    # try JSON first; if it fails, treat as patient_id string
+    try:
+        obj = json.loads(case_arg)
+        yield _case_from_loader(obj, loader)
+    except Exception:
+        yield _case_from_loader(case_arg, loader)
+
+
+# -------------------- main --------------------
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--questionnaire", default="questionnaire_full.json")
     parser.add_argument("--panel", default="panel.json")
     parser.add_argument("--router", choices=["sparse", "full"], default="sparse")
-    parser.add_argument("--backend", default="dummy", choices=["dummy"])
+
+    # backend: default vllm
+    parser.add_argument("--backend", choices=["vllm", "dummy"], default="vllm")
     parser.add_argument(
-        "--case", default="{}", help="json string or path to .json with case context"
+        "--base-url", default=None, help="vllm base url, e.g., http://localhost:8000/v1"
+    )
+    parser.add_argument("--model", default=None, help="model name as served by vllm")
+    parser.add_argument("--api-key", default=None, help="optional bearer token")
+
+    # data loader
+    parser.add_argument(
+        "--data-dir", default="irAKI_data", help="root directory for patient data"
+    )
+    parser.add_argument(
+        "--use-dummy-loader", action="store_true", help="use DataLoader dummy mode"
+    )
+
+    # input (choose one)
+    parser.add_argument(
+        "--case",
+        default=None,
+        help="patient_id string/int, JSON string, or path to .json (single case)",
+    )
+    parser.add_argument(
+        "--cases", default=None, help="path to .jsonl or .json with list/cases object"
+    )
+
+    # output
+    parser.add_argument(
+        "--outdir", default="out", help="directory to write one report per case"
     )
     args = parser.parse_args()
 
-    qpath = args.questionnaire
+    # dataloader (fail fast if data_dir missing and not using dummy)
+    loader = DataLoader(data_dir=args.data_dir, use_dummy=args.use_dummy_loader)
+    if not loader.is_available():
+        raise RuntimeError(
+            "DataLoader is not available. Check --data-dir or pass --use-dummy-loader for quick tests."
+        )
 
-    # load case from string or file
-    case_arg = args.case
-    if Path(case_arg).exists():
-        with open(case_arg, "r", encoding="utf-8") as f:
-            case: Dict[str, Any] = json.load(f)
+    # backend
+    if args.backend == "vllm":
+        backend = VLLMBackend(
+            model=args.model, base_url=args.base_url, api_key=args.api_key
+        )
     else:
-        case = json.loads(case_arg)
+        # debugging only
+        from schema import load_qids
 
-    backend = DummyBackend()
+        class DummyBackend(LLMBackend):
+            def assess_round1(self, expert_ctx: Dict[str, Any]) -> Dict[str, Any]:
+                qids = load_qids(expert_ctx["questionnaire_path"])
+                return {
+                    "scores": {q: 7 for q in qids},
+                    "evidence": {q: "placeholder evidence" for q in qids},
+                    "clinical_reasoning": "placeholder reasoning",
+                    "p_iraki": 0.7,
+                    "ci_iraki": [0.6, 0.8],
+                    "confidence": 0.8,
+                    "differential_diagnosis": ["ATIN", "ATN"],
+                    "primary_diagnosis": "irAKI",
+                }
+
+            def assess_round3(self, expert_ctx: Dict[str, Any]) -> Dict[str, Any]:
+                qids = load_qids(expert_ctx["questionnaire_path"])
+                return {
+                    "scores": {q: 8 for q in qids},
+                    "evidence": {q: "updated evidence after debate" for q in qids},
+                    "p_iraki": 0.75,
+                    "ci_iraki": [0.65, 0.85],
+                    "confidence": 0.85,
+                    "changes_from_round1": {"overall": "nudged up after debate"},
+                    "debate_influence": "convinced by nephrology/rheum arguments",
+                    "verdict": True,
+                    "final_diagnosis": "irAKI",
+                    "confidence_in_verdict": 0.85,
+                    "recommendations": [
+                        "hold ICI",
+                        "consider steroids",
+                        "nephrology consult",
+                    ],
+                }
+
+            def debate(self, expert_ctx: Dict[str, Any]) -> Dict[str, Any]:
+                return {
+                    "text": "constructive rebuttal text",
+                    "citations": [],
+                    "satisfied": True,
+                }
+
+        backend = DummyBackend()
+
+    # experts (reused across cases)
     experts = [
         Expert(
             expert_id=ex["id"],
@@ -93,14 +257,37 @@ def main():
     ]
 
     router = SparseRouter() if args.router == "sparse" else FullRouter()
-    mod = Moderator(
+    moderator = Moderator(
         experts=experts,
-        questionnaire_path=qpath,
+        questionnaire_path=args.questionnaire,
         router=router,
         aggregator=WeightedMeanAggregator(),
     )
-    result = mod.run_case(case)
-    print(json.dumps(result, indent=2))
+
+    # prepare output dir if requested
+    outdir: Optional[Path] = None
+    if args.outdir:
+        outdir = Path(args.outdir)
+        outdir.mkdir(parents=True, exist_ok=True)
+
+    # run
+    results: List[Dict[str, Any]] = []
+    for idx, (case_id, case) in enumerate(
+        _iter_cases(args.case, args.cases, loader), start=1
+    ):
+        report = moderator.run_case(case)
+        report_with_id = {"case_id": case_id, **report}
+        if outdir:
+            out_path = outdir / f"report_{idx:03d}_{case_id}.json"
+            with out_path.open("w", encoding="utf-8") as f:
+                json.dump(report_with_id, f, indent=2)
+        else:
+            results.append(report_with_id)
+
+    # print to stdout if not writing to files
+    if not outdir:
+        is_batch = bool(args.cases)
+        print(json.dumps(results if is_batch else results[0], indent=2))
 
 
 if __name__ == "__main__":
