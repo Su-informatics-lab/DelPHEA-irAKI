@@ -52,7 +52,7 @@ from orchestration.messages import (
 
 
 class irAKIExpertAgent(RoutedAgent):
-    """Clinical expert agent for irAKI assessment."""
+    """Clinical expert agent for irAKI assessment (YAGNI version)."""
 
     def __init__(
         self,
@@ -80,7 +80,7 @@ class irAKIExpertAgent(RoutedAgent):
 
         self.logger = logging.getLogger(f"expert.{expert_id}")
 
-        # Fail fast if expert not found
+        # fail fast if expert not found
         self._expert_profile = next(
             ep
             for ep in self._config_loader.expert_panel["expert_panel"]["experts"]
@@ -101,42 +101,64 @@ class irAKIExpertAgent(RoutedAgent):
     async def handle_questionnaire(
         self, message: QuestionnaireMsg, ctx: MessageContext
     ) -> None:
-        """Handle Round 1 & 3 assessments."""
+        """Handle Round 1 & 3 assessments with strict schema."""
         self.logger.info(f"Received {message.round_phase} questionnaire")
 
-        # Prompt template (fail fast)
+        # strict inputs (YAGNI)
+        if not hasattr(message, "demographics"):
+            raise AttributeError("QuestionnaireMsg.demographics is required")
+        if not hasattr(message, "clinical_notes_text"):
+            raise AttributeError("QuestionnaireMsg.clinical_notes_text is required")
+
         if message.round_phase not in ("round1", "round3"):
             raise ValueError(f"Unknown round_phase: {message.round_phase!r}")
+
         tpl_name = "round1" if message.round_phase == "round1" else "round3"
-        prompt_template = self._config_loader.get_prompt_template(tpl_name)
-        if "base_prompt" not in prompt_template:
+        template = self._config_loader.get_prompt_template(tpl_name)
+        base = template.get("base_prompt")
+        if not base:
             raise KeyError(f"Prompt '{tpl_name}' missing required 'base_prompt'")
 
-        # Build prompt
-        prompt = self._build_assessment_prompt(message, prompt_template)
-        if message.round_phase == "round3" and self._round1_assessment:
-            prompt = self._add_round3_context(prompt, message)
+        # build prompt (only the two inputs + questions)
+        prompt = base.format(
+            expert_name=self._expert_profile["name"],
+            specialty=self._expert_profile["specialty"],
+            round_phase=message.round_phase,
+            case_id=message.case_id,
+            demographics=str(message.demographics),
+            clinical_notes=message.clinical_notes_text,
+            questions=self._format_questions(message.questions),
+        )
 
-        # Generate structured response
+        # per-round extra instructions
+        instructions = (
+            template.get("round3_instructions", "")
+            if message.round_phase == "round3"
+            else template.get("round1_instructions", "")
+        )
+        if instructions:
+            prompt = f"{prompt}\n\nINSTRUCTIONS\n{instructions}"
+
+        # generate structured response
         response_format = self._get_response_format(message.round_phase)
         llm_response = await self._vllm_client.generate_structured_response(
             prompt=prompt, response_format=response_format
         )
         self._log_first_tokens(llm_response, f"[{message.round_phase}]")
 
-        # Validate / normalize LLM output
         cleaned = self._validate_llm_response(llm_response, message.round_phase)
 
-        # Build reply message
+        # build reply pydantic object
         if message.round_phase == "round1":
             reply = self._create_round1_reply(cleaned, message)
             self._round1_assessment = reply
+            method = "record_round1"
         else:
             reply = self._create_round3_reply(cleaned, message)
+            method = "record_round3"
 
-        # Send to moderator via RPC
+        # RPC to moderator (strict)
         target = AgentId(type="moderator", key=message.case_id)
-        method = "record_round1" if message.round_phase == "round1" else "record_round3"
         ack = await self.call_rpc(ctx, target, method, reply)
         if not ack.ok:
             raise RuntimeError(f"Moderator rejected {method}: {ack.message}")
@@ -150,15 +172,34 @@ class irAKIExpertAgent(RoutedAgent):
         """Handle Round 2 debate participation."""
         self.logger.info(f"Entering debate for question {message.q_id}")
 
-        prompt_template = self._config_loader.get_prompt_template("debate")
-        if "base_prompt" not in prompt_template:
+        template = self._config_loader.get_prompt_template("debate")
+        base = template.get("base_prompt")
+        if not base:
             raise KeyError("Prompt 'debate' missing required 'base_prompt'")
 
-        prompt = self._build_debate_prompt(message, prompt_template)
+        # build debate prompt
+        own_score = message.score_distribution.get(self._expert_id, 5)
+        own_evidence = message.conflicting_evidence.get(self._expert_id, "")
+        opposing = []
+        for eid, sc in message.score_distribution.items():
+            if eid != self._expert_id and abs(sc - own_score) >= 3:
+                opposing.append(
+                    f"Expert {eid} (score={sc}): {message.conflicting_evidence.get(eid, '')}"
+                )
 
-        response_format = {"type": "json_object"}
+        prompt = base.format(
+            expert_name=self._expert_profile["name"],
+            specialty=self._expert_profile["specialty"],
+            question=message.question["question"],
+            own_score=own_score,
+            own_evidence=own_evidence,
+            score_range=message.score_range,
+            opposing_views="\n".join(opposing),
+            clinical_importance=message.clinical_importance,
+        )
+
         llm_response = await self._vllm_client.generate_structured_response(
-            prompt=prompt, response_format=response_format
+            prompt=prompt, response_format={"type": "json_object"}
         )
         self._log_first_tokens(llm_response, "[debate]")
 
@@ -187,108 +228,19 @@ class irAKIExpertAgent(RoutedAgent):
             await self._vllm_client.close()
 
     # =========================
-    # Prompt building helpers
+    # Helpers
     # =========================
-    def _build_assessment_prompt(
-        self, message: QuestionnaireMsg, template: Dict
-    ) -> str:
-        """
-        Build assessment prompt using the simplified QuestionnaireMsg:
-        - demographics: Dict[str, Any]
-        - clinical_notes: str (aggregated notes)
-        - questions: List[Dict]
-        """
-        # format sections
-        demographics_str = str(message.demographics or {})
-        clinical_notes_str = message.clinical_notes or ""
-        questions_str = self._format_questions(message.questions)
-
-        # base prompt
-        prompt = template["base_prompt"].format(
-            expert_name=self._expert_profile["name"],
-            specialty=self._expert_profile["specialty"],
-            round_phase=message.round_phase,
-            case_id=message.case_id,
-            demographics=demographics_str,
-            clinical_notes=clinical_notes_str,
-            questions=questions_str,
-        )
-
-        # round-specific instructions
-        round_instructions = (
-            template.get("round3_instructions", "")
-            if message.round_phase == "round3"
-            else template.get("round1_instructions", "")
-        )
-        prompt = f"{prompt}\n\nINSTRUCTIONS\n{round_instructions}"
-
-        # optional specialty addendum
-        spec_instr = template.get("specialty_instructions", {}).get(
-            self._expert_profile["specialty"]
-        )
-        if spec_instr:
-            prompt += f"\n\n{spec_instr}"
-
-        return prompt
-
-    def _format_patient_summary(self, message: QuestionnaireMsg) -> str:
-        """
-        Kept for compatibility with existing calls, but now only uses the new fields.
-        """
-        parts = []
-        demo = message.demographics or {}
-        age = demo.get("age")
-        gender = demo.get("gender")
-        if age is not None or gender:
-            parts.append(
-                f"Patient: {age if age is not None else 'Unknown'}-year-old {gender or 'Unknown'}"
-            )
-        notes = (message.clinical_notes or "").strip()
-        if notes:
-            parts.append(
-                f"Clinical Notes: {notes[:1200]}"
-            )  # guardrail to avoid flooding logs/prompts
-        return "\n".join(parts)
-
     def _format_questions(self, questions: List[Dict]) -> str:
-        out = []
+        lines = []
         for i, q in enumerate(questions, 1):
-            q_text = q["question"]
-            q_id = q["id"]
-            ctx = q.get("clinical_context", {})
-            if ctx:
-                relevance = ctx.get("relevance", "")
-                evidence_type = ctx.get("evidence_type", "")
-                extra = f" [Context: {relevance}; Evidence: {evidence_type}]"
-            else:
-                extra = ""
-            out.append(f"{i}. [{q_id}] {q_text}{extra}")
-        return "\n".join(out)
+            qid = q["id"]
+            qtext = q["question"]
+            lines.append(f"{i}. [{qid}] {qtext}")
+        return "\n".join(lines)
 
     def _log_first_tokens(self, response, context=""):
         text = str(response)
         self.logger.info(f"[{self._expert_id}]{context} First LLM output: {text[:200]}")
-
-    def _add_round3_context(self, prompt: str, message: QuestionnaireMsg) -> str:
-        sections = [prompt]
-        if self._round1_assessment:
-            sections.append(
-                f"\n\n=== YOUR ROUND 1 ASSESSMENT ===\n"
-                f"P(irAKI): {self._round1_assessment.p_iraki:.2f}\n"
-                f"Confidence: {self._round1_assessment.confidence:.2f}\n"
-                f"Primary Diagnosis: {self._round1_assessment.primary_diagnosis}\n"
-            )
-        if message.debate_summary:
-            sections.append(f"\n=== DEBATE INSIGHTS ===\n{message.debate_summary}")
-        sections.append(
-            "\n\n=== ROUND 3 INSTRUCTIONS ===\n"
-            "1. Reflect on debate insights\n"
-            "2. Update your assessment\n"
-            "3. Provide final verdict with confidence\n"
-            "4. Explain changes from Round 1\n"
-            "5. Provide specific recommendations"
-        )
-        return "\n".join(sections)
 
     # =========================
     # Response processing
@@ -331,84 +283,77 @@ class irAKIExpertAgent(RoutedAgent):
             },
         }
 
-    def _validate_llm_response(self, response: Dict, round_phase: str) -> Dict:
-        # CI tuple
-        if "ci_lower" in response and "ci_upper" in response:
-            lo = float(response.pop("ci_lower"))
-            hi = float(response.pop("ci_upper"))
-            if lo > hi:
-                lo, hi = hi, lo
-            response["ci_iraki"] = (max(0.0, min(1.0, lo)), max(0.0, min(1.0, hi)))
-        # p_iraki / confidence
-        if "p_iraki" in response:
-            response["p_iraki"] = max(0.0, min(1.0, float(response["p_iraki"])))
-        if "confidence" in response:
-            response["confidence"] = max(0.0, min(1.0, float(response["confidence"])))
-        # scores 1-10
-        if "scores" in response:
+    def _validate_llm_response(self, resp: Dict, round_phase: str) -> Dict:
+        # CI -> tuple
+        lo = float(resp.pop("ci_lower")) if "ci_lower" in resp else 0.25
+        hi = float(resp.pop("ci_upper")) if "ci_upper" in resp else 0.75
+        if lo > hi:
+            lo, hi = hi, lo
+        resp["ci_iraki"] = (max(0.0, min(1.0, lo)), max(0.0, min(1.0, hi)))
+
+        # clamp probabilities
+        if "p_iraki" in resp:
+            resp["p_iraki"] = max(0.0, min(1.0, float(resp["p_iraki"])))
+        if "confidence" in resp:
+            resp["confidence"] = max(0.0, min(1.0, float(resp["confidence"])))
+
+        # normalize scores
+        if "scores" in resp:
             cleaned = {}
-            for qid, sc in response["scores"].items():
-                try:
-                    cleaned[qid] = max(1, min(10, int(float(sc))))
-                except Exception:
-                    cleaned[qid] = 5
-            response["scores"] = cleaned
-        # required defaults
+            for qid, sc in resp["scores"].items():
+                cleaned[qid] = max(1, min(10, int(float(sc))))
+            resp["scores"] = cleaned
+
+        # minimal required defaults by round
         if round_phase == "round1":
-            if not response.get("differential_diagnosis"):
-                response["differential_diagnosis"] = ["irAKI", "ATN", "Prerenal AKI"]
-            if not response.get("primary_diagnosis"):
-                response["primary_diagnosis"] = response["differential_diagnosis"][0]
+            resp.setdefault("differential_diagnosis", ["irAKI", "ATN", "Prerenal AKI"])
+            resp.setdefault("primary_diagnosis", resp["differential_diagnosis"][0])
         else:
-            if not response.get("recommendations"):
-                response["recommendations"] = [
-                    "Monitor renal function closely",
-                    "Consider nephrology consultation",
-                ]
-            if "verdict" not in response:
-                response["verdict"] = response.get("p_iraki", 0.5) > 0.5
-            if not response.get("final_diagnosis"):
-                response["final_diagnosis"] = "irAKI" if response["verdict"] else "ATN"
-            if "confidence_in_verdict" not in response:
-                response["confidence_in_verdict"] = response.get("confidence", 0.7)
-        return response
+            resp.setdefault(
+                "recommendations",
+                ["Monitor renal function closely", "Consider nephrology consult"],
+            )
+            resp.setdefault("verdict", resp.get("p_iraki", 0.5) > 0.5)
+            resp.setdefault("final_diagnosis", "irAKI" if resp["verdict"] else "ATN")
+            resp.setdefault("confidence_in_verdict", resp.get("confidence", 0.7))
+        return resp
 
     def _create_round1_reply(
-        self, response: Dict, message: QuestionnaireMsg
+        self, resp: Dict, message: QuestionnaireMsg
     ) -> ExpertRound1Reply:
         return ExpertRound1Reply(
             case_id=message.case_id,
             expert_id=self._expert_id,
-            scores=response["scores"],
-            evidence=response.get("evidence", {}),
-            clinical_reasoning=response.get("clinical_reasoning", ""),
-            p_iraki=response["p_iraki"],
-            ci_iraki=response["ci_iraki"],
-            confidence=response["confidence"],
-            differential_diagnosis=response["differential_diagnosis"],
-            primary_diagnosis=response.get("primary_diagnosis"),
-            specialty_notes=response.get("specialty_notes"),
-            literature_citations=response.get("citations", []),
+            scores=resp["scores"],
+            evidence=resp.get("evidence", {}),
+            clinical_reasoning=resp.get("clinical_reasoning", ""),
+            p_iraki=resp["p_iraki"],
+            ci_iraki=resp["ci_iraki"],
+            confidence=resp["confidence"],
+            differential_diagnosis=resp["differential_diagnosis"],
+            primary_diagnosis=resp.get("primary_diagnosis"),
+            specialty_notes=resp.get("specialty_notes"),
+            literature_citations=resp.get("citations", []),
         )
 
     def _create_round3_reply(
-        self, response: Dict, message: QuestionnaireMsg
+        self, resp: Dict, message: QuestionnaireMsg
     ) -> ExpertRound3Reply:
         return ExpertRound3Reply(
             case_id=message.case_id,
             expert_id=self._expert_id,
-            scores=response["scores"],
-            evidence=response.get("evidence", {}),
-            p_iraki=response["p_iraki"],
-            ci_iraki=response["ci_iraki"],
-            confidence=response["confidence"],
-            changes_from_round1=response.get("changes_from_round1", {}),
-            debate_influence=response.get("debate_influence"),
-            verdict=response["verdict"],
-            final_diagnosis=response["final_diagnosis"],
-            confidence_in_verdict=response["confidence_in_verdict"],
-            recommendations=response["recommendations"],
-            biopsy_recommendation=response.get("biopsy_recommendation"),
-            steroid_recommendation=response.get("steroid_recommendation"),
-            ici_rechallenge_risk=response.get("ici_rechallenge_risk"),
+            scores=resp["scores"],
+            evidence=resp.get("evidence", {}),
+            p_iraki=resp["p_iraki"],
+            ci_iraki=resp["ci_iraki"],
+            confidence=resp["confidence"],
+            changes_from_round1=resp.get("changes_from_round1", {}),
+            debate_influence=resp.get("debate_influence"),
+            verdict=resp["verdict"],
+            final_diagnosis=resp["final_diagnosis"],
+            confidence_in_verdict=resp["confidence_in_verdict"],
+            recommendations=resp["recommendations"],
+            biopsy_recommendation=resp.get("biopsy_recommendation"),
+            steroid_recommendation=resp.get("steroid_recommendation"),
+            ici_rechallenge_risk=resp.get("ici_rechallenge_risk"),
         )
