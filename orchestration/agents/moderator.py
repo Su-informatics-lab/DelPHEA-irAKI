@@ -138,7 +138,7 @@ class irAKIModeratorAgent(RoutedAgent):
         self._patient_data = patient_data
         await self._run_round1(ctx)
 
-    async def _run_round1(self, ctx: MessageContext) -> None:
+    async def _run_round1(self) -> None:
         self.logger.info("=== ROUND 1: Independent Expert Assessments ===")
         questions = self._config_loader.get_questions()
         self._pending_round1 = set(self._expert_ids)
@@ -153,9 +153,8 @@ class irAKIModeratorAgent(RoutedAgent):
         )
         for ex_id in self._expert_ids:
             target = AgentId(type=f"expert_{ex_id}", key=self._case_id)
-            await self.send_message(ctx, questionnaire, target)
-            self.logger.info("→ sent Round 1 questionnaire to %s", ex_id)
-        await self._wait_for_round_completion("round1", ctx)
+            await self.send_message(questionnaire, target)
+        await self._wait_for_round_completion("round1")
 
     @rpc
     async def record_round1(
@@ -199,9 +198,7 @@ class irAKIModeratorAgent(RoutedAgent):
 
         return AckMsg(ok=True, message="Round 1 reply recorded")
 
-    async def _wait_for_round_completion(
-        self, round_phase: str, ctx: MessageContext
-    ) -> None:
+    async def _wait_for_round_completion(self, round_phase: str) -> None:
         event = self._round1_done if round_phase == "round1" else self._round3_done
         timeout = getattr(self._delphi_config, f"{round_phase}_timeout", 300)
         try:
@@ -217,11 +214,11 @@ class irAKIModeratorAgent(RoutedAgent):
                 f"Timeout in {round_phase} after {timeout}s. Missing experts: {pending}"
             )
         if round_phase == "round1":
-            await self._run_round2(ctx)
+            await self._run_round2()
         else:
             await self._compute_final_consensus()
 
-    async def _run_round2(self, ctx: MessageContext) -> None:
+    async def _run_round2(self) -> None:
         self.logger.info("=== ROUND 2: Conflict Resolution via Debate ===")
         conflicts = self._identify_conflicts()
         if not conflicts:
@@ -230,8 +227,8 @@ class irAKIModeratorAgent(RoutedAgent):
             return
         self.logger.info(f"Identified {len(conflicts)} questions with conflicts")
         for q_id, conflict_info in conflicts.items():
-            await self._run_single_debate(ctx, q_id, conflict_info)
-        await self._run_round3(ctx)
+            await self._run_single_debate(q_id, conflict_info)
+        await self._run_round3()
 
     async def _run_single_debate(
         self, ctx: MessageContext, q_id: str, conflict_info: Dict
@@ -252,15 +249,14 @@ class irAKIModeratorAgent(RoutedAgent):
         )
         for ex_id in participants:
             target = AgentId(type=f"expert_{ex_id}", key=self._case_id)
-            await self.send_message(ctx, debate_prompt, target)
+            await self.send_message(debate_prompt, target)
         await asyncio.sleep(min(30, self._delphi_config.debate_timeout))
         terminate_msg = TerminateDebate(
             case_id=self._case_id, q_id=q_id, reason="timeout"
         )
         for ex_id in participants:
             target = AgentId(type=f"expert_{ex_id}", key=self._case_id)
-            await self.send_message(ctx, terminate_msg, target)
-        self._debate_summaries[q_id] = f"Debate conducted on question {q_id}"
+            await self.send_message(terminate_msg, target)
 
     def _identify_conflicts(self) -> Dict[str, Dict]:
         """Identify questions with significant disagreement using category method.
@@ -356,7 +352,7 @@ class irAKIModeratorAgent(RoutedAgent):
 
         return conflicts
 
-    async def _run_round3(self, ctx: MessageContext) -> None:
+    async def _run_round3(self) -> None:
         self.logger.info("=== ROUND 3: Final Consensus Assessments ===")
         self._pending_round3 = set(self._expert_ids)
         self._round3_done.clear()
@@ -376,8 +372,8 @@ class irAKIModeratorAgent(RoutedAgent):
         )
         for ex_id in self._expert_ids:
             target = AgentId(type=f"expert_{ex_id}", key=self._case_id)
-            await self.send_message(ctx, questionnaire, target)
-        await self._wait_for_round_completion("round3", ctx)
+            await self.send_message(questionnaire, target)
+        await self._wait_for_round_completion("round3")
 
     @rpc
     async def record_round3(
