@@ -51,11 +51,24 @@ from orchestration.messages import (
     DebatePrompt,
     ExpertRound1Reply,
     ExpertRound3Reply,
-    HumanReviewExport,
     QuestionnaireMsg,
     StartCase,
     TerminateDebate,
 )
+
+
+def _to_builtin(x):
+    import numpy as np
+
+    if isinstance(x, np.ndarray):
+        return [_to_builtin(v) for v in x.tolist()]
+    if isinstance(x, (np.floating, np.integer)):
+        return x.item()
+    if isinstance(x, dict):
+        return {k: _to_builtin(v) for k, v in x.items()}
+    if isinstance(x, (list, tuple, set)):
+        return [_to_builtin(v) for v in x]
+    return x
 
 
 # helper local to _run_round1 and _run_round3
@@ -402,6 +415,16 @@ class irAKIModeratorAgent(RoutedAgent):
         votes_iraki = sum(1 for r in self._round3_replies if r.verdict)
         consensus_verdict = votes_iraki > len(self._round3_replies) / 2
 
+        label = "irAKI" if consensus_verdict else "Other AKI"
+        count = (
+            votes_iraki
+            if consensus_verdict
+            else (len(self._round3_replies) - votes_iraki)
+        )
+        self.logger.info(
+            f"Majority Vote:           {label} ({count}/{len(self._round3_replies)})"
+        )
+
         self.logger.info("=" * 80)
         self.logger.info(f"CASE {self._case_id} irAKI CONSENSUS RESULTS:")
         self.logger.info("-" * 80)
@@ -430,29 +453,28 @@ class irAKIModeratorAgent(RoutedAgent):
     async def _export_for_human_review(
         self, consensus_stats: Dict, consensus_verdict: bool
     ) -> None:
-        """Export complete case for human expert review."""
         self.logger.info("Exporting case for human review...")
 
-        export_data = HumanReviewExport(
-            case_id=self._case_id,
-            export_timestamp=time.strftime("%Y-%m-%d %H:%M:%S"),
-            delphea_version="1.0.0",
-            final_consensus={
-                "p_iraki": consensus_stats["pooled_mean"],
-                "ci_95": consensus_stats["pooled_ci"],
-                "confidence": consensus_stats["consensus_conf"],
-                "beta_pooling_stats": consensus_stats,
+        export_data = {
+            "case_id": self._case_id,
+            "export_timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "delphea_version": "1.0.0",
+            "final_consensus": {
+                "p_iraki": float(consensus_stats["pooled_mean"]),
+                "ci_95": [
+                    float(consensus_stats["pooled_ci"][0]),
+                    float(consensus_stats["pooled_ci"][1]),
+                ],
+                "confidence": float(consensus_stats["consensus_conf"]),
             },
-            majority_verdict=consensus_verdict,
-            expert_agreement_level=self._calculate_agreement_level(),
-            expert_assessments=[
+            "majority_verdict": bool(consensus_verdict),
+            "expert_agreement_level": float(self._calculate_agreement_level()),
+            "expert_assessments": [
                 {
                     "round": "round1",
                     "expert_id": r.expert_id,
-                    "p_iraki": r.p_iraki,
-                    "confidence": r.confidence,
-                    "primary_diagnosis": r.primary_diagnosis,
-                    "differential": r.differential_diagnosis,
+                    "p_iraki": float(r.p_iraki),
+                    "confidence": float(r.confidence),
                 }
                 for r in self._round1_replies
             ]
@@ -460,22 +482,19 @@ class irAKIModeratorAgent(RoutedAgent):
                 {
                     "round": "round3",
                     "expert_id": r.expert_id,
-                    "p_iraki": r.p_iraki,
-                    "verdict": r.verdict,
-                    "final_diagnosis": r.final_diagnosis,
-                    "recommendations": r.recommendations,
+                    "p_iraki": float(r.p_iraki),
+                    "confidence": float(r.confidence),
+                    "verdict": bool(r.verdict),
+                    "changes_from_round1": r.changes_from_round1,
                 }
                 for r in self._round3_replies
             ],
-            debate_transcripts=[
+            "debate_transcripts": [
                 {"q_id": q_id, "summary": summary}
                 for q_id, summary in self._debate_summaries.items()
             ],
-            reasoning_summary=self._synthesize_reasoning(),
-            clinical_timeline=self._patient_data.get("timeline", {}),
-            differential_summary=self._consolidate_differentials(),
-            consensus_recommendations=self._consolidate_recommendations(),
-            confidence_metrics={
+            "clinical_timeline": self._patient_data.get("timeline", {}),
+            "confidence_metrics": {
                 "mean_confidence": float(
                     np.mean([r.confidence for r in self._round3_replies])
                 ),
@@ -486,13 +505,15 @@ class irAKIModeratorAgent(RoutedAgent):
                     np.max([r.confidence for r in self._round3_replies])
                 ),
             },
-        )
+        }
+
+        export_data = _to_builtin(export_data)
 
         output_file = (
             f"iraki_consensus_{self._case_id}_{time.strftime('%Y%m%d_%H%M%S')}.json"
         )
         with open(output_file, "w") as f:
-            json.dump(export_data.model_dump(), f, indent=2)
+            json.dump(export_data, f, indent=2)
 
         self.logger.info(f"Exported consensus results to {output_file}")
 
