@@ -163,7 +163,9 @@ def main():
     # backend: default vllm
     parser.add_argument("--backend", choices=["vllm", "dummy"], default="vllm")
     parser.add_argument(
-        "--base-url", default=None, help="vllm base url, e.g., http://localhost:8000/v1"
+        "--base-url",
+        default=None,
+        help="vllm base url (no /v1), e.g., http://localhost:8000",
     )
     parser.add_argument("--model", default=None, help="model name as served by vllm")
     parser.add_argument("--api-key", default=None, help="optional bearer token")
