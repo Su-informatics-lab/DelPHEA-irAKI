@@ -1,38 +1,37 @@
 """
-Expert Agent for DelPHEA-irAKI Clinical Assessment
-===================================================
-Simulates individual medical experts evaluating irAKI cases with
-specialty-specific reasoning and evidence-based assessment.
+Expert agent: specialty-conditioned assessor that emits structured JSON.
 
-Architecture:
-------------
-    Patient Data ──┐
-    Questions ─────┼──> [Expert Brain] ──> Clinical Assessment
-    Specialty ─────┘         │                    │
-                            LLM                Scores
-                         Reasoning           Evidence
-                                           P(irAKI)
+Role
+----
+An Expert is a lightweight wrapper over an LLM/back-end prompt that:
+- consumes case context + questionnaire
+- emits Round-1 JSON (scores, evidence, p_iraki, ci_iraki, confidence, differentials)
+- emits Round-3 JSON (updated scores, changes_from_round1, debate_influence, verdict,
+    final_diagnosis, recommendations)
 
-Key Capabilities:
-----------------
-- Specialty-specific clinical reasoning (11 expert types)
-- Evidence-based scoring with citations
-- Probabilistic assessment with confidence intervals
-- Differential diagnosis generation
-- Debate participation with reasoned arguments
-- Literature integration (when enabled)
+Prompt & schema contracts
+-------------------------
+- Round 1/3 output schemas are defined in `iraki_assessment.json`. The Expert must
+  strictly conform (no extra keys, valid ranges, CI contains p_iraki).
+- Debate output follows `debate.json` (`text`, `citations`, `satisfied`).
 
-Clinical Context:
-----------------
-Each expert brings unique perspective to irAKI diagnosis:
-- Nephrologist: Renal pathophysiology focus
-- Oncologist: ICI timing and cancer treatment priorities
-- Pharmacist: Drug interactions and pharmacokinetics
-- etc. (see panel.json for full expert panel)
+Expert grounding
+-----------------
+- Expert identity and focus areas come from the panel config (e.g., oncologist,
+    nephrologist, pathologist). Use these fields to condition the system prompt and
+    retrieval hints.
 
-The expert agent ensures diverse, comprehensive assessment
-critical for distinguishing true irAKI from mimics.
+Error handling (fail fast)
+--------------------------
+- raise ValueError on invalid Likert scores (not 1..9), p_iraki ∉ [0,1], CI bounds
+    invalid, or CI not containing p_iraki
+- raise ValueError when required keys are missing
+
+Caching
+-------
+- experts should memoize (case_id, round_no, qid) → output to avoid duplicate LLM calls
 """
+
 
 import logging
 import re

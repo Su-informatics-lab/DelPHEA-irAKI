@@ -1,37 +1,49 @@
 """
-Moderator Agent for DelPHEA-irAKI Orchestration
-================================================
-Master agent coordinating the Delphi consensus process across all rounds.
-Manages expert interactions, conflict resolution, and consensus computation.
+Moderator: routes questions, runs debates, and computes consensus.
 
-Architecture:
-------------
-    Moderator (this module)
-         │
-    ┌────┼────┐
-    ▼    ▼    ▼
-  Round1 Round2 Round3
-    │     │     │
-    │  Debates  │
-    │     │     │
-    └─────┴─────┘
-         │
-    Beta Pooling
-    Consensus
+Role
+----
+The Moderator is the single orchestrator that:
+1) fan-outs Round-1 assessment requests to all Experts,
+2) detects per-question disagreement,
+3) launches targeted debates (Round-2) with minority prompts,
+4) fan-outs Round-3 reassessment requests,
+5) aggregates final consensus and writes the case report.
 
-Delphi Process Flow:
--------------------
-1. Round 1: Independent assessments from all experts
-2. Round 2: Debate on conflicting questions (if threshold exceeded)
-3. Round 3: Final assessments incorporating debate insights
-4. Consensus: Beta pooling to compute P(irAKI) with confidence
+ASCII: routing as sparse attention
+----------------------------------
+             Q set                         Experts (K)               Values (V)
+      +----------------+             +---------------------+     +--------------------+
+      | Q1 Q2 ... Q_M  |  ----->     | E1 E2 ... EN        |     | R1, Debate, R3     |
+      +----------------+    route    +---------------------+     +--------------------+
+                |          only if disagreement on Qi
+                v
+         Debate for Qi          -->  targeted specialists respond (minority prompt)
+                |
+                v
+          Reassess Qi           -->  all experts update with debate_influence
 
-Clinical Context:
+Protocol details
 ----------------
-The moderator ensures comprehensive evaluation by orchestrating
-diverse expert opinions, identifying key conflicts, and driving
-evidence-based consensus for irAKI classification.
+- Assessment payloads must match `iraki_assessment.json` schemas, including `ci_iraki`
+  and `confidence` fields. The Moderator validates JSON and rejects malformed outputs.
+- Debate turns must match `debate.json` (`text`, `citations`, `satisfied`).
+- Disagreement rule: see `questionnaire_full.json` →
+    `consensus_calculation.debate_threshold` and `minimum_agreement` targets.
+
+Aggregation
+-----------
+Default consensus guidance in config is a confidence-adjusted weighted average across
+experts; ensure interval logic respects individual `ci_iraki` and reported `confidence`.
+
+Notes on failure modes
+----------------------
+- schema mismatch -> raise ValueError with the offending key path
+- empty expert set -> raise ValueError
+- missing QIDs or duplicate QIDs -> raise ValueError
+- debate non-convergence (no `satisfied=True`) -> proceed with rationale recorded
 """
+
 
 import asyncio
 import json
