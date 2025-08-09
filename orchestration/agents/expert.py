@@ -194,27 +194,26 @@ class irAKIExpertAgent(RoutedAgent):
     ) -> str:
         patient_summary = self._format_patient_summary(message)
         formatted_questions = self._format_questions(message.questions)
-        specialty_focus = self._expert_profile.get(
-            "expertise", "comprehensive clinical assessment"
-        )
 
         prompt = template["base_prompt"].format(
             expert_name=self._expert_profile["name"],
             specialty=self._expert_profile["specialty"],
-            patient_summary=patient_summary,
-            questions=formatted_questions,
-            specialty_focus=specialty_focus,
             round_phase=message.round_phase,
+            case_id=message.case_id,
+            demographics=str(message.demographics)
+            if hasattr(message, "demographics")
+            else str(message.patient_info),
+            clinical_notes=patient_summary
+            if "clinical_notes" in template["base_prompt"]
+            else patient_summary,
+            questions=formatted_questions,
         )
-
-        if self._expert_profile["specialty"] in template.get(
-            "specialty_instructions", {}
-        ):
-            prompt += (
-                "\n\n"
-                + template["specialty_instructions"][self._expert_profile["specialty"]]
-            )
-        return prompt
+        instructions = (
+            template["round3_instructions"]
+            if message.round_phase == "round3"
+            else template["round1_instructions"]
+        )
+        return f"{prompt}\n\nINSTRUCTIONS\n{instructions}"
 
     def _format_patient_summary(self, message: QuestionnaireMsg) -> str:
         parts = []
