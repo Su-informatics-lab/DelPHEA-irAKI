@@ -192,28 +192,44 @@ class irAKIExpertAgent(RoutedAgent):
     def _build_assessment_prompt(
         self, message: QuestionnaireMsg, template: Dict
     ) -> str:
-        patient_summary = self._format_patient_summary(message)
-        formatted_questions = self._format_questions(message.questions)
+        """
+        Build assessment prompt using the simplified QuestionnaireMsg:
+        - demographics: Dict[str, Any]
+        - clinical_notes: str (aggregated notes)
+        - questions: List[Dict]
+        """
+        # format sections
+        demographics_str = str(message.demographics or {})
+        clinical_notes_str = message.clinical_notes or ""
+        questions_str = self._format_questions(message.questions)
 
+        # base prompt
         prompt = template["base_prompt"].format(
             expert_name=self._expert_profile["name"],
             specialty=self._expert_profile["specialty"],
             round_phase=message.round_phase,
             case_id=message.case_id,
-            demographics=str(message.demographics)
-            if hasattr(message, "demographics")
-            else str(message.patient_info),
-            clinical_notes=patient_summary
-            if "clinical_notes" in template["base_prompt"]
-            else patient_summary,
-            questions=formatted_questions,
+            demographics=demographics_str,
+            clinical_notes=clinical_notes_str,
+            questions=questions_str,
         )
-        instructions = (
-            template["round3_instructions"]
+
+        # round-specific instructions
+        round_instructions = (
+            template.get("round3_instructions", "")
             if message.round_phase == "round3"
-            else template["round1_instructions"]
+            else template.get("round1_instructions", "")
         )
-        return f"{prompt}\n\nINSTRUCTIONS\n{instructions}"
+        prompt = f"{prompt}\n\nINSTRUCTIONS\n{round_instructions}"
+
+        # optional specialty addendum
+        spec_instr = template.get("specialty_instructions", {}).get(
+            self._expert_profile["specialty"]
+        )
+        if spec_instr:
+            prompt += f"\n\n{spec_instr}"
+
+        return prompt
 
     def _format_patient_summary(self, message: QuestionnaireMsg) -> str:
         parts = []
