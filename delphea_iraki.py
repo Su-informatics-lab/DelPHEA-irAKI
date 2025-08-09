@@ -1,38 +1,90 @@
 """
-DelPHEA-irAKI: Delphi Personalized Health Explainable Agents for immune-related AKI
-====================================================================================
+DelPHEA-irAKI runner: orchestrates a 3-round Delphi process across N experts.
 
-Main entry point for the DelPHEA-irAKI clinical decision support system.
-This orchestrates the multi-agent Delphi consensus process for distinguishing
-immune-related AKI from alternative causes in patients receiving ICIs.
+Purpose
+-------
+This script is the CLI/entrypoint that wires configuration -> agents -> outcomes.
+It loads the expert panel and questionnaire, instantiates a Moderator and N Experts,
+then drives the 3-round interaction loop:
 
-Architecture:
-------------
-    Main (this file)
-         │
-    ┌────┴────┐
-    │ Runtime │──> Agents (Moderator + Experts)
-    └─────────┘         │
-         │              ▼
-    Configuration   Delphi Process
-    Data Loading    Consensus
+  Round 1: independent expert assessments per question (structured JSON)
+  Round 2: targeted debates only where disagreement exists (sparse routing)
+  Round 3: expert reassessment after debate; moderator aggregates consensus
 
-Usage:
-------
-    # run irAKI assessment for a case
-    python delphea_iraki.py --case-id iraki_case_001
+Key inputs
+----------
+- panel config: list of N expert personas/specialties and IDs
+- questionnaire: Q1..Q_N evidence questions and consensus rules
+- prompts/schemas: round1/round3 output spec; debate message schema
 
-    # health check
-    python delphea_iraki.py --health-check
+ASCII: control & data flow (single case)
+----------------------------------------
++------------------+         +-----------------+         +-------------------+
+|  delphea_iraki   |         |   Moderator     |         |    Expert[i]      |
+|  (this script)   |         |  (orchestrator) |         |  (LLM-backed)     |
++---------+--------+         +---------+-------+         +---------+---------+
+          |                            |                           ^
+          | load configs (panel, Qs)   |                           |
+          |--------------------------->|                           |
+          |                            |  R1: assess_all(Q set)    |
+          |                            +------------------------->>+  (for all i)
+          |                            |   returns JSON w/ scores, |
+          |                            |   p_iraki, CI, evidence   |
+          |                            |<<-------------------------+
+          |                            |  detect disagreement      |
+          |                            |  (per Q thresholds)       |
+          |                            |-- if any --> Debate (R2) -+
+          |                            |       minority prompts    |
+          |                            |  R3: reassess_all(Q set)  |
+          |                            +------------------------->>+
+          |                            |  returns updated JSON     |
+          |                            |<<-------------------------+
+          |                            |  aggregate consensus      |
+          |<---------------------------+  build report/artifacts
+          | write outputs (json, logs) |
+          v                            v
+        files                     results dict
 
-    # verbose mode
-    python delphea_iraki.py --case-id iraki_case_002 --verbose
+Protocol contracts (summarized)
+-------------------------------
+Round 1/3 assessment JSON (per expert):
+  - scores: {qid:int 1..9}
+  - evidence: {qid:str}
+  - p_iraki: float[0,1]
+  - ci_iraki: [lo, hi] with p_iraki ∈ [lo,hi]
+  - confidence: float[0,1]
+  - (R3 adds: changes_from_round1, debate_influence, verdict, final_diagnosis,
+    recommendations)
 
-Clinical Context:
-----------------
-Processes patient cases through expert panel simulation to distinguish
-true immune-related AKI from mimics, preventing unnecessary steroid
-treatment and cancer therapy interruption.
+Debate message (per Q with disagreement):
+  - returns { "text": str, "citations": [str], "satisfied": bool }
+
+See `iraki_assessment.json` for Round 1/3 schemas and keys, and `debate.json` for
+debate I/O.
+
+Attention analogy
+-----------------
+- Q (queries): the 16 evidence questions in the questionnaire
+- K (keys): the expert personas (panel)
+- V (values): the evolving context (R1 judgments, R2 debate turns, R3 judgments)
+
+Current run mode = sparse attention: Moderator routes debate only for questions
+exceeding a disagreement threshold (consensus_calculation.debate_threshold) rather than
+all pairs.
+
+CLI responsibilities
+--------------------
+- parse args; load panel (`panel.json`) & questionnaire (`questionnaire*.json`)
+- construct Moderator + Expert instances
+- call `Moderator.run_case(case_bundle)` and persist outputs
+- fail fast on schema violations
+
+References
+----------
+- Panel definitions: `panel.json` (or `panel_full.json`)
+- Questionnaire & consensus rules: `questionnaire_full.json`
+- Round prompts/schemas: `iraki_assessment.json`
+- Debate prompt: `debate.json`
 """
 
 import argparse
