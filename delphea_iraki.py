@@ -151,7 +151,11 @@ async def run_iraki_assessment(case_id: str, runtime_config: RuntimeConfig) -> D
     # load patient case
     try:
         patient_case = data_loader.load_patient_case(case_id)
-        logger.info(f"Loaded case: {patient_case['case_id']}")
+        logger.info(
+            f"Loaded case: {patient_case['case_id']}, "
+            f"data preview: {str(patient_case)[:200]}..."
+        )
+
     except ValueError as e:
         logger.error(f"Failed to load case {case_id}: {e}")
         raise
