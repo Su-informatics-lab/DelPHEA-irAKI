@@ -44,7 +44,6 @@ contracts
 - experts must return pydantic models: AssessmentR1/AssessmentR3/DebateTurn (via .model_dump()).
 - router.plan consumes r1 payloads and returns a DebatePlan.
 - aggregator.aggregate consumes r3 payloads and returns a Consensus object.
-
 """
 
 from __future__ import annotations
@@ -216,7 +215,7 @@ class Moderator:
         if not r1:
             raise ValueError("r1 assessments cannot be empty")
         # ensure all experts covered the same qids
-        for eid, a in r1:
+        for _, a in r1:
             self._validate_qids_exact(a)
 
     def _validate_r3_coherence(
@@ -233,5 +232,5 @@ class Moderator:
         r3_ids = [eid for eid, _ in r3]
         if set(r1_ids) != set(r3_ids):
             raise ValueError("r3 expert set must match r1 expert set")
-        for eid, a3 in r3:
+        for _, a3 in r3:
             self._validate_qids_exact(a3)
