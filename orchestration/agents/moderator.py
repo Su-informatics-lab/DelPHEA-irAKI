@@ -253,26 +253,23 @@ class irAKIModeratorAgent(RoutedAgent):
             await self.send_message(terminate_msg, target)
 
     def _identify_conflicts(self) -> Dict[str, Dict]:
-        """Identify questions with significant disagreement."""
         conflicts = {}
         questions = self._config_loader.get_questions()
 
         for question in questions:
             q_id = question["id"]
-
-            # collect scores for this question
             scores = []
             score_by_expert = {}
+
             for reply in self._round1_replies:
                 if q_id in reply.scores:
-                    score = reply.scores[q_id]
-                    scores.append(score)
-                    score_by_expert[reply.expert_id] = score
+                    sc = reply.scores[q_id]
+                    scores.append(sc)
+                    score_by_expert[reply.expert_id] = sc
 
             if len(scores) < 2:
                 continue
 
-            # Category-based conflict detection on a 1–9 scale
             low_scores = [s for s in scores if s <= 3]
             neutral_scores = [s for s in scores if 4 <= s <= 6]
             high_scores = [s for s in scores if s >= 7]
@@ -284,32 +281,21 @@ class irAKIModeratorAgent(RoutedAgent):
                 has_conflict = True
                 if len(low_scores) >= 2 and len(high_scores) >= 2:
                     conflict_severity = "severe"
-            elif (
-                len(
-                    set(
-                        [s <= 3 for s in scores]
-                        + [4 <= s <= 6 for s in scores]
-                        + [s >= 7 for s in scores]
-                    )
-                )
-                >= 3
-            ):
+            elif low_scores and neutral_scores and high_scores:
                 has_conflict = True
                 conflict_severity = "moderate"
 
-            # Optional: alternate methods
             if hasattr(self._delphi_config, "conflict_method"):
                 if self._delphi_config.conflict_method == "std":
                     std_dev = np.std(scores)
                     has_conflict = std_dev > 2.0
                     conflict_severity = "severe" if std_dev > 2.5 else "moderate"
                 elif self._delphi_config.conflict_method == "range":
-                    score_range = max(scores) - min(scores)
-                    has_conflict = score_range >= self._delphi_config.conflict_threshold
-                    conflict_severity = "severe" if score_range >= 5 else "moderate"
+                    rng = max(scores) - min(scores)
+                    has_conflict = rng >= self._delphi_config.conflict_threshold
+                    conflict_severity = "severe" if rng >= 5 else "moderate"
 
             if has_conflict:
-                # collect evidence from conflicting experts
                 conflicting_evidence = {}
                 for reply in self._round1_replies:
                     if q_id in reply.evidence:
@@ -385,24 +371,20 @@ class irAKIModeratorAgent(RoutedAgent):
         return AckMsg(ok=True, message="Round 3 reply recorded")
 
     async def _compute_final_consensus(self) -> None:
-        """Compute beta pooling consensus for irAKI classification."""
         self.logger.info("=== COMPUTING FINAL CONSENSUS ===")
 
         if not self._round3_replies:
             self.logger.error("No Round 3 replies received, cannot compute consensus")
             return
 
-        # extract data for beta pooling
         p_vec = np.array([r.p_iraki for r in self._round3_replies])
         ci_mat = np.array([list(r.ci_iraki) for r in self._round3_replies])
         w_vec = np.array([r.confidence for r in self._round3_replies])
 
-        # compute beta pooling consensus
         try:
             consensus_stats = beta_pool_confidence(p_vec, ci_mat, w_vec)
         except Exception as e:
             self.logger.error(f"Failed to compute beta pooling: {e}")
-            # fallback to simple average
             consensus_stats = {
                 "pooled_mean": float(np.mean(p_vec)),
                 "pooled_ci": [
@@ -421,9 +403,6 @@ class irAKIModeratorAgent(RoutedAgent):
             if consensus_verdict
             else (len(self._round3_replies) - votes_iraki)
         )
-        self.logger.info(
-            f"Majority Vote:           {label} ({count}/{len(self._round3_replies)})"
-        )
 
         self.logger.info("=" * 80)
         self.logger.info(f"CASE {self._case_id} irAKI CONSENSUS RESULTS:")
@@ -439,8 +418,7 @@ class irAKIModeratorAgent(RoutedAgent):
             f"Consensus Confidence:    {consensus_stats['consensus_conf']:.3f}"
         )
         self.logger.info(
-            f"Majority Vote:           {'irAKI' if consensus_verdict else 'Other AKI'} "
-            f"({votes_iraki}/{len(self._round3_replies)})"
+            f"Majority Vote:           {label} ({count}/{len(self._round3_replies)})"
         )
         self.logger.info(
             f"Expert Participation:    {len(self._round3_replies)}/{len(self._expert_ids)}"
