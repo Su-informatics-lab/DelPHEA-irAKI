@@ -280,16 +280,30 @@ class ConfigurationLoader:
         return prompts
 
     def _validate_prompts_required(self) -> None:
+        """
+        Validate presence of required prompt files and essential fields.
+        Supports iraki_assessment.json with nested round1/round3 sections.
+        """
         req = ["iraki_assessment", "debate", "confidence_instructions"]
         missing = [k for k in req if k not in self._prompts]
         if missing:
             raise ValueError(f"Missing required prompt files: {missing}")
 
         ia = self._prompts["iraki_assessment"]
-        if "base_prompt" not in ia or "json_schema" not in ia:
-            raise ValueError(
-                "iraki_assessment.json must include 'base_prompt' and 'json_schema'"
-            )
+        for rnd in ("round1", "round3"):
+            if rnd not in ia:
+                raise ValueError(
+                    f"iraki_assessment.json must include a '{rnd}' section"
+                )
+            sect = ia[rnd]
+            if "base_prompt" not in sect:
+                raise ValueError(
+                    f"iraki_assessment.json '{rnd}' must include 'base_prompt'"
+                )
+            if "json_schema" not in sect:
+                raise ValueError(
+                    f"iraki_assessment.json '{rnd}' must include 'json_schema'"
+                )
 
         db = self._prompts["debate"]
         if "base_prompt" not in db:
