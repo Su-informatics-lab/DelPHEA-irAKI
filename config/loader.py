@@ -117,7 +117,7 @@ class ConfigurationLoader:
                     f"Prompt '{name}' missing 'base_prompt' in {src}. "
                     "Add key 'base_prompt' (string) or rename your existing key to it."
                 )
-            # don’t mutate original; normalize key
+            # don't mutate original; normalize key
             out = dict(tpl)
             out["base_prompt"] = base
             return out
@@ -137,7 +137,7 @@ class ConfigurationLoader:
             if fname == "debate":
                 idx["debate"] = ensure_base("debate", data, f"{fname}.json")
 
-        # Fail fast: require all three
+        # fail fast: require all three
         missing = [k for k in ("round1", "round3", "debate") if k not in idx]
         if missing:
             raise ValueError(
