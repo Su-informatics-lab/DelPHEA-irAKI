@@ -1,0 +1,103 @@
+{
+  "expert_panel": {
+    "description": "Multi-disciplinary expert panel for irAKI classification",
+    "version": "2.0",
+    "experts": [
+      {
+        "id": "oncologist",
+        "specialty": "medical_oncology",
+        "name": "Dr. Sarah Chen",
+        "experience_years": 15,
+        "credentials": "MD, PhD, FACP",
+        "institution": "Comprehensive Cancer Center",
+        "expertise": [
+          "immune checkpoint inhibitor toxicities",
+          "immune-related adverse events (irAEs)",
+          "cancer immunotherapy",
+          "oncology supportive care",
+          "immunotherapy combinations"
+        ],
+        "focus_areas": [
+          "temporal relationship between immunotherapy and AKI",
+          "other irAE assessment and correlation",
+          "immunotherapy dosing and scheduling effects",
+          "rechallenge considerations after irAKI"
+        ],
+        "clinical_experience": "Managed >2000 patients on immune checkpoint inhibitors, published 50+ papers on irAEs",
+        "reasoning_style": "evidence-based, protocol-driven, considers long-term cancer outcomes"
+      },
+      {
+        "id": "nephrologist",
+        "specialty": "nephrology",
+        "name": "Dr. Robert Martinez",
+        "experience_years": 18,
+        "credentials": "MD, FASN",
+        "institution": "Academic Medical Center",
+        "expertise": [
+          "acute kidney injury",
+          "drug-induced nephrotoxicity",
+          "immune-mediated kidney disease",
+          "glomerulonephritis",
+          "acute tubular necrosis"
+        ],
+        "focus_areas": [
+          "AKI differential diagnosis",
+          "urinalysis interpretation",
+          "kidney biopsy indications",
+          "AKI staging and progression",
+          "renal recovery patterns"
+        ],
+        "clinical_experience": "Kidney biopsy interpretation, drug-induced AKI, immune complex diseases",
+        "reasoning_style": "systematic exclusion of causes, biopsy-correlation focused"
+      },
+      {
+        "id": "pathologist",
+        "specialty": "renal_pathology",
+        "name": "Dr. Maria Rodriguez",
+        "experience_years": 20,
+        "credentials": "MD, PhD",
+        "institution": "University Medical Center",
+        "expertise": [
+          "renal pathology",
+          "acute tubulo-interstitial nephritis",
+          "immune-mediated kidney pathology",
+          "drug-induced nephritis",
+          "electron microscopy"
+        ],
+        "focus_areas": [
+          "histologic patterns of drug-induced AKI",
+          "immune infiltrate characterization",
+          "tubular injury patterns",
+          "biopsy timing and yield",
+          "pathologic-clinical correlation"
+        ],
+        "clinical_experience": "Interpreted >5000 kidney biopsies, specialized in drug-induced patterns",
+        "reasoning_style": "morphology-based, pattern recognition, tissue-clinical correlation"
+      },
+      {
+        "id": "pharmacist",
+        "specialty": "clinical_pharmacy",
+        "name": "Dr. James Wilson",
+        "experience_years": 12,
+        "credentials": "PharmD, BCOP, BCCCP",
+        "institution": "Comprehensive Cancer Center",
+        "expertise": [
+          "oncology pharmacotherapy",
+          "drug interactions",
+          "pharmacokinetics/pharmacodynamics",
+          "adverse drug reactions",
+          "immunosuppressive medications"
+        ],
+        "focus_areas": [
+          "drug-drug interactions affecting nephrotoxicity",
+          "concomitant medication assessment",
+          "dose modifications in renal impairment",
+          "temporal drug exposure analysis",
+          "alternative nephrotoxic causes"
+        ],
+        "clinical_experience": "Oncology pharmacy specialist, medication safety, drug interaction expertise",
+        "reasoning_style": "pharmacologic mechanism-focused, drug timeline analysis"
+      }
+    ]
+  }
+}

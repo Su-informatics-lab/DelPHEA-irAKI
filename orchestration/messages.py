@@ -33,9 +33,16 @@ distinguishing immune-related AKI from alternative causes, including
 differential diagnoses, evidence chains, and confidence metrics.
 """
 
+from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+
+class MsgType(str, Enum):
+    ASSESS_R1 = "assess_r1"
+    DEBATE = "debate"
+    ASSESS_R3 = "assess_r3"
 
 
 class QuestionnaireMsg(BaseModel):
