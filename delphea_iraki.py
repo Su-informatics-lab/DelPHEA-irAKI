@@ -1,6 +1,6 @@
 # delphea_iraki.py
 # cli entrypoint wiring config → dataloader → agents → run (single or batch)
-# vllm-only client: require explicit --endpoint-url and --model-name. no env fallbacks.
+# vllm-only client with explicit endpoint/model args (defaults provided).
 
 from __future__ import annotations
 
@@ -175,17 +175,17 @@ def main() -> None:
         "--router", choices=["sparse", "full"], default="sparse", help="routing mode"
     )
 
+    # llm endpoint & model (local defaults)
     parser.add_argument(
         "--endpoint",
         dest="endpoint_url",
-        default="http://localhost:8000",  # default: local vLLM
+        default="http://localhost:8000",
         help="openai-compatible base URL (no trailing /v1), e.g., http://localhost:8000",
     )
-
     parser.add_argument(
         "--model",
         dest="model_name",
-        default="openai/gpt-oss-120b",  # default: oss model served in your cluster
+        default="openai/gpt-oss-120b",
         help="served model id as shown by /v1/models, e.g., openai/gpt-oss-120b",
     )
 
@@ -219,8 +219,6 @@ def main() -> None:
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="logging verbosity",
     )
-
-    # optional: just print served models and exit
     parser.add_argument(
         "--health-check",
         action="store_true",
@@ -356,6 +354,8 @@ def main() -> None:
             len(experts),
         )
 
+        # aggregate then log (fixes UnboundLocalError)
+        consensus = moderator.aggregator.aggregate([a for _, a in r3])
         p_hat = getattr(
             consensus, "iraki_probability", getattr(consensus, "p_iraki", None)
         )
@@ -363,13 +363,6 @@ def main() -> None:
             "[case %s] aggregation done — p=%.3f, ci=%s",
             case_id,
             p_hat,
-            consensus.ci_iraki,
-        )
-        consensus = moderator.aggregator.aggregate([a for _, a in r3])
-        log.info(
-            "[case %s] aggregation done — p=%.3f, ci=%s",
-            case_id,
-            consensus.p_iraki,
             consensus.ci_iraki,
         )
 
