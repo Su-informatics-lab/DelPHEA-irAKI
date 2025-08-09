@@ -52,7 +52,7 @@ from orchestration.messages import (
 
 
 class irAKIExpertAgent(RoutedAgent):
-    """Clinical expert agent for irAKI assessment (YAGNI version)."""
+    """Clinical expert agent for irAKI assessment."""
 
     def __init__(
         self,
@@ -80,7 +80,7 @@ class irAKIExpertAgent(RoutedAgent):
 
         self.logger = logging.getLogger(f"expert.{expert_id}")
 
-        # fail fast if expert not found
+        # Fail fast if expert not found
         self._expert_profile = next(
             ep
             for ep in self._config_loader.expert_panel["expert_panel"]["experts"]
@@ -101,14 +101,8 @@ class irAKIExpertAgent(RoutedAgent):
     async def handle_questionnaire(
         self, message: QuestionnaireMsg, ctx: MessageContext
     ) -> None:
-        """Handle Round 1 & 3 assessments with strict schema."""
+        """Handle Round 1 & 3 assessments with strict structured output."""
         self.logger.info(f"Received {message.round_phase} questionnaire")
-
-        # strict inputs (YAGNI)
-        if not hasattr(message, "demographics"):
-            raise AttributeError("QuestionnaireMsg.demographics is required")
-        if not hasattr(message, "clinical_notes_text"):
-            raise AttributeError("QuestionnaireMsg.clinical_notes_text is required")
 
         if message.round_phase not in ("round1", "round3"):
             raise ValueError(f"Unknown round_phase: {message.round_phase!r}")
@@ -119,18 +113,23 @@ class irAKIExpertAgent(RoutedAgent):
         if not base:
             raise KeyError(f"Prompt '{tpl_name}' missing required 'base_prompt'")
 
-        # build prompt (only the two inputs + questions)
+        # ---- Extract inputs from whatever fields exist (no brittle attrs) ----
+        demographics_str = self._extract_demographics(message)
+        notes_str = self._extract_notes(message)
+        questions_str = self._format_questions(message.questions)
+
+        # Build prompt
         prompt = base.format(
             expert_name=self._expert_profile["name"],
             specialty=self._expert_profile["specialty"],
             round_phase=message.round_phase,
             case_id=message.case_id,
-            demographics=str(message.demographics),
-            clinical_notes=message.clinical_notes_text,
-            questions=self._format_questions(message.questions),
+            demographics=demographics_str,
+            clinical_notes=notes_str,
+            questions=questions_str,
         )
 
-        # per-round extra instructions
+        # Per-round instructions (optional)
         instructions = (
             template.get("round3_instructions", "")
             if message.round_phase == "round3"
@@ -139,16 +138,15 @@ class irAKIExpertAgent(RoutedAgent):
         if instructions:
             prompt = f"{prompt}\n\nINSTRUCTIONS\n{instructions}"
 
-        # generate structured response
+        # Structured response
         response_format = self._get_response_format(message.round_phase)
         llm_response = await self._vllm_client.generate_structured_response(
             prompt=prompt, response_format=response_format
         )
         self._log_first_tokens(llm_response, f"[{message.round_phase}]")
-
         cleaned = self._validate_llm_response(llm_response, message.round_phase)
 
-        # build reply pydantic object
+        # Reply object
         if message.round_phase == "round1":
             reply = self._create_round1_reply(cleaned, message)
             self._round1_assessment = reply
@@ -157,7 +155,7 @@ class irAKIExpertAgent(RoutedAgent):
             reply = self._create_round3_reply(cleaned, message)
             method = "record_round3"
 
-        # RPC to moderator (strict)
+        # RPC to moderator
         target = AgentId(type="moderator", key=message.case_id)
         ack = await self.call_rpc(ctx, target, method, reply)
         if not ack.ok:
@@ -177,7 +175,6 @@ class irAKIExpertAgent(RoutedAgent):
         if not base:
             raise KeyError("Prompt 'debate' missing required 'base_prompt'")
 
-        # build debate prompt
         own_score = message.score_distribution.get(self._expert_id, 5)
         own_evidence = message.conflicting_evidence.get(self._expert_id, "")
         opposing = []
@@ -226,6 +223,49 @@ class irAKIExpertAgent(RoutedAgent):
     async def aclose(self):
         if self._owns_vllm_client:
             await self._vllm_client.close()
+
+    # =========================
+    # Extractors (YAGNI, deterministic)
+    # =========================
+    def _extract_demographics(self, message: QuestionnaireMsg) -> str:
+        """
+        Prefer message.patient_info (DataLoader shape), else message.demographics,
+        else empty string.
+        """
+        info = getattr(message, "patient_info", None) or getattr(
+            message, "demographics", None
+        )
+        if not info:
+            return ""
+        age = info.get("age", "Unknown")
+        gender = info.get("gender", "Unknown")
+        race = info.get("race", "Unknown")
+        eth = info.get("ethnicity", "Unknown")
+        return f"Age: {age} | Gender: {gender} | Race: {race} | Ethnicity: {eth}"
+
+    def _extract_notes(self, message: QuestionnaireMsg, max_chars: int = 4000) -> str:
+        """
+        Use message.clinical_notes_text if present;
+        else join message.clinical_notes list['text'];
+        else fallback to message.patient_summary;
+        else empty.
+        """
+        txt = getattr(message, "clinical_notes_text", None)
+        if isinstance(txt, str) and txt.strip():
+            return txt[:max_chars]
+
+        notes = getattr(message, "clinical_notes", None)
+        if isinstance(notes, list) and notes:
+            joined = "\n\n".join(
+                str(n.get("text", "")) for n in notes if isinstance(n, dict)
+            )
+            return joined[:max_chars]
+
+        summ = getattr(message, "patient_summary", None)
+        if isinstance(summ, str) and summ.strip():
+            return summ[:max_chars]
+
+        return ""
 
     # =========================
     # Helpers
@@ -284,27 +324,23 @@ class irAKIExpertAgent(RoutedAgent):
         }
 
     def _validate_llm_response(self, resp: Dict, round_phase: str) -> Dict:
-        # CI -> tuple
         lo = float(resp.pop("ci_lower")) if "ci_lower" in resp else 0.25
         hi = float(resp.pop("ci_upper")) if "ci_upper" in resp else 0.75
         if lo > hi:
             lo, hi = hi, lo
         resp["ci_iraki"] = (max(0.0, min(1.0, lo)), max(0.0, min(1.0, hi)))
 
-        # clamp probabilities
         if "p_iraki" in resp:
             resp["p_iraki"] = max(0.0, min(1.0, float(resp["p_iraki"])))
         if "confidence" in resp:
             resp["confidence"] = max(0.0, min(1.0, float(resp["confidence"])))
 
-        # normalize scores
         if "scores" in resp:
             cleaned = {}
             for qid, sc in resp["scores"].items():
                 cleaned[qid] = max(1, min(10, int(float(sc))))
             resp["scores"] = cleaned
 
-        # minimal required defaults by round
         if round_phase == "round1":
             resp.setdefault("differential_diagnosis", ["irAKI", "ATN", "Prerenal AKI"])
             resp.setdefault("primary_diagnosis", resp["differential_diagnosis"][0])
