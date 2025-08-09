@@ -6,8 +6,6 @@ from __future__ import annotations
 
 import argparse
 import json
-
-# defaults for backend config (env → hard defaults)
 import os
 import re
 import sys
@@ -22,7 +20,7 @@ from expert import Expert
 from llm_backend import LLMBackend
 from moderator import Moderator
 from router import FullRouter, SparseRouter
-from vllm_backend import VLLMBackend  # default backend
+from vllm_backend import VLLMBackend
 
 # -------------------- helpers: id parsing & dataloader glue --------------------
 
@@ -30,31 +28,46 @@ _ID_RE = re.compile(r"(\d+)")
 
 
 def _to_case_id_from_patient_id(x: str | int) -> str:
-    """Normalize arbitrary patient_id inputs (e.g., 'P123', '123') to 'iraki_case_123'."""
+    """normalize arbitrary patient_id inputs (e.g., 'P123', '123') to 'iraki_case_123'."""
     if isinstance(x, int):
         return f"iraki_case_{x}"
     s = str(x).strip()
     m = _ID_RE.search(s)
     if not m:
-        raise ValueError(f"Could not extract an integer patient_id from: {x!r}")
+        raise ValueError(f"could not extract an integer patient_id from: {x!r}")
     return f"iraki_case_{int(m.group(1))}"
 
 
-def _load_panel(panel_path: str):
-    with open(panel_path, "r", encoding="utf-8") as f:
-        return json.load(f)["expert_panel"]["experts"]
+def _load_panel(panel_path: str) -> List[Dict[str, Any]]:
+    """load expert panel entries and return the list of experts.
+
+    supports either:
+      {"expert_panel": {"experts": [...]}}  # legacy
+    or
+      {"experts": [...]}                    # preferred
+    """
+    p = Path(panel_path).expanduser().resolve()
+    if not p.exists():
+        raise FileNotFoundError(f"panel json not found: {p}")
+    with p.open("r", encoding="utf-8") as f:
+        data = json.load(f)
+    if isinstance(data, dict):
+        if "experts" in data and isinstance(data["experts"], list):
+            return data["experts"]
+        if "expert_panel" in data and isinstance(data["expert_panel"], dict):
+            ep = data["expert_panel"].get("experts")
+            if isinstance(ep, list):
+                return ep
+    raise ValueError(f"panel format must contain an experts list: {p}")
 
 
-def _read_json(path: Path):
-    with open(path, "r", encoding="utf-8") as f:
+def _read_json(path: Path) -> Any:
+    with path.open("r", encoding="utf-8") as f:
         return json.load(f)
 
 
 def _case_from_loader(case_like: Any, loader: DataLoader) -> Tuple[str, Dict[str, Any]]:
-    """
-    Accepts either a patient_id (string/int) or a full case dict.
-    Returns (case_id, case_dict) using DataLoader when an id is provided.
-    """
+    """accept either a patient_id (string/int) or a full case dict; return (case_id, case_dict)."""
     # full case dict path (already structured like DataLoader output)
     if isinstance(case_like, dict) and "clinical_notes" in case_like:
         cid = str(
@@ -80,7 +93,7 @@ def _case_from_loader(case_like: Any, loader: DataLoader) -> Tuple[str, Dict[str
         )
         if not any_id:
             raise ValueError(
-                "Case dict must include one of: case_id, person_id, patient_id"
+                "case dict must include one of: case_id, person_id, patient_id"
             )
         case_id = (
             any_id
@@ -90,24 +103,13 @@ def _case_from_loader(case_like: Any, loader: DataLoader) -> Tuple[str, Dict[str
         case_dict = loader.load_patient_case(case_id)
         return case_id, case_dict
 
-    raise ValueError(f"Unsupported case object type: {type(case_like)}")
+    raise ValueError(f"unsupported case object type: {type(case_like)}")
 
 
 def _iter_cases(
     case_arg: Optional[str], cases_path: Optional[str], loader: DataLoader
 ) -> Iterable[Tuple[str, Dict[str, Any]]]:
-    """
-    Yields (case_id, case_dict).
-
-    --case (single) accepts:
-      • plain patient_id string/int (fast path) -> DataLoader.load_patient_case(...)
-      • JSON string or path to .json -> if full case dict (has 'clinical_notes'), use as-is;
-        otherwise, extract id and load via DataLoader.
-
-    --cases (batch) accepts:
-      • path to .jsonl (each line: patient_id string/int OR full case dict)
-      • path to .json containing a list[patient_id or case_dict] or {"cases":[...]}
-    """
+    """yield (case_id, case_dict) for single or batch inputs."""
     if cases_path:
         p = Path(cases_path)
         if not p.exists():
@@ -137,7 +139,7 @@ def _iter_cases(
 
     # single-case mode
     if case_arg is None:
-        raise ValueError("Provide --case (patient_id) or --cases (file).")
+        raise ValueError("provide --case/--case-id (patient_id) or --cases (file).")
     p = Path(case_arg)
     if p.exists():
         obj = _read_json(p)
@@ -154,11 +156,27 @@ def _iter_cases(
 # -------------------- main --------------------
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--questionnaire", default="questionnaire_full.json")
-    parser.add_argument("--panel", default="panel.json")
-    parser.add_argument("--router", choices=["sparse", "full"], default="sparse")
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="DelPHEA-irAKI: run multi-agent Delphi consensus for irAKI"
+    )
+
+    # config: questionnaire/panel/router
+    parser.add_argument(
+        "-q",
+        "--questionnaire",
+        default=str((Path(__file__).parent / "questionnaire.json").resolve()),
+        help="path to questionnaire json (default: questionnaire.json)",
+    )
+    parser.add_argument(
+        "-p",
+        "--panel",
+        default=str((Path(__file__).parent / "panel.json").resolve()),
+        help="path to expert panel json (default: panel.json)",
+    )
+    parser.add_argument(
+        "--router", choices=["sparse", "full"], default="sparse", help="routing mode"
+    )
 
     # backend: default vllm
     parser.add_argument("--backend", choices=["vllm", "dummy"], default="vllm")
@@ -178,9 +196,11 @@ def main():
         "--use-dummy-loader", action="store_true", help="use DataLoader dummy mode"
     )
 
-    # input (choose one)
+    # input (choose one); support alias --case-id
     parser.add_argument(
         "--case",
+        "--case-id",
+        dest="case",
         default=None,
         help="patient_id string/int, JSON string, or path to .json (single case)",
     )
@@ -192,8 +212,20 @@ def main():
     parser.add_argument(
         "--outdir", default="out", help="directory to write one report per case"
     )
+
     args = parser.parse_args()
 
+    # resolve and sanity check questionnaire/panel
+    qpath = Path(args.questionnaire).expanduser().resolve()
+    ppath = Path(args.panel).expanduser().resolve()
+    if not qpath.exists():
+        raise FileNotFoundError(f"questionnaire json not found: {qpath}")
+    if not ppath.exists():
+        raise FileNotFoundError(f"panel json not found: {ppath}")
+    args.questionnaire = str(qpath)
+    args.panel = str(ppath)
+
+    # backend settings from env fallbacks
     if args.base_url is None:
         args.base_url = (
             os.getenv("VLLM_ENDPOINT")
@@ -211,7 +243,7 @@ def main():
             or "openai/gpt-oss-120b"
         )
 
-    # api key (if your vLLM server requires it)
+    # api key (if your vllm server requires it)
     if args.api_key is None:
         args.api_key = os.getenv("OPENAI_API_KEY") or os.getenv("VLLM_API_KEY")
 
@@ -224,29 +256,32 @@ def main():
     os.environ["OPENAI_MODEL"] = args.model
     os.environ["VLLM_MODEL"] = args.model
 
-    # fail fast if endpoint/model is wrong
-    try:
-        base = args.base_url.rstrip("/")
-        r = requests.get(f"{base}/v1/models", timeout=3)
-        r.raise_for_status()
-        served = {m.get("id") for m in r.json().get("data", []) if isinstance(m, dict)}
-        if args.model not in served:
-            raise RuntimeError(
-                f"requested model '{args.model}' not served at {base}. "
-                f"available: {sorted(served) or 'none'}"
-            )
-    except Exception as e:
-        print(f"[fatal] vllm endpoint/model check failed: {e}", file=sys.stderr)
-        sys.exit(2)
+    # fail fast if endpoint/model is wrong (only for vllm backend)
+    if args.backend == "vllm":
+        try:
+            base = args.base_url.rstrip("/")
+            r = requests.get(f"{base}/v1/models", timeout=3)
+            r.raise_for_status()
+            served = {
+                m.get("id") for m in r.json().get("data", []) if isinstance(m, dict)
+            }
+            if args.model not in served:
+                raise RuntimeError(
+                    f"requested model '{args.model}' not served at {base}. "
+                    f"available: {sorted(served) or 'none'}"
+                )
+        except Exception as e:
+            print(f"[fatal] vllm endpoint/model check failed: {e}", file=sys.stderr)
+            sys.exit(2)
 
     # dataloader (fail fast if data_dir missing and not using dummy)
     loader = DataLoader(data_dir=args.data_dir, use_dummy=args.use_dummy_loader)
     if not loader.is_available():
         raise RuntimeError(
-            "DataLoader is not available. Check --data-dir or pass --use-dummy-loader for quick tests."
+            "DataLoader is not available. check --data-dir or pass --use-dummy-loader for quick tests."
         )
 
-    # backend
+    # backend selection
     if args.backend == "vllm":
         backend = VLLMBackend(
             model=args.model, base_url=args.base_url, api_key=args.api_key
@@ -256,6 +291,8 @@ def main():
         from schema import load_qids
 
         class DummyBackend(LLMBackend):
+            """minimal backend that echoes neutral-but-valid payloads."""
+
             def assess_round1(self, expert_ctx: Dict[str, Any]) -> Dict[str, Any]:
                 qids = load_qids(expert_ctx["questionnaire_path"])
                 return {
@@ -309,6 +346,7 @@ def main():
         for ex in _load_panel(args.panel)
     ]
 
+    # router + moderator
     router = SparseRouter() if args.router == "sparse" else FullRouter()
     moderator = Moderator(
         experts=experts,
