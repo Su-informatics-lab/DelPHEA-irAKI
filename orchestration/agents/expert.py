@@ -360,7 +360,7 @@ class irAKIExpertAgent(RoutedAgent):
 
         # rpc to moderator
         target = AgentId(type="moderator", key=message.case_id)
-        ack = await self.call_rpc(ctx, target, method, reply)
+        ack = await ctx.call_rpc(target, method, reply)
         if not ack.ok:
             raise RuntimeError(f"moderator rejected {method}: {ack.message}")
 
