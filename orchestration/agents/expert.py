@@ -39,6 +39,12 @@ expert agent for delphea-iraki clinical assessment
 simulates individual medical experts evaluating iraki cases with
 specialty-specific reasoning and evidence-based assessment.
 """
+"""
+Expert Agent for DelPHEA-irAKI Clinical Assessment
+
+Simulates individual medical experts evaluating irAKI cases with
+specialty-specific reasoning and evidence-based assessment.
+"""
 
 import logging
 import re
@@ -76,19 +82,19 @@ _WORD_CONF: Dict[str, float] = {
 
 
 def _as_float(x: Any) -> float:
-    """coerce common textual numerics and hedges into float in [0,1] when sensible."""
+    """coerce common textual numerics/hedges into float in [0,1] when sensible."""
     if isinstance(x, (int, float)):
         return float(x)
     if isinstance(x, str):
         s = x.strip().lower()
         if s in _WORD_CONF:
             return _WORD_CONF[s]
-        # "65%" -> 0.65
+        # "65%" -> 0.65  or "0.65" -> 0.65
         m = re.match(r"^\s*([0-9]*\.?[0-9]+)\s*%?\s*$", s)
         if m:
             v = float(m.group(1))
             return v / 100.0 if "%" in s else v
-        # "0.6-0.8" -> take midpoint
+        # "0.6-0.8" -> midpoint
         if "-" in s:
             try:
                 a, b = s.split("-", 1)
@@ -140,18 +146,8 @@ def normalize_round1(
     else:
         raise ValueError("scores must be list or dict")
 
-    # evidence: list -> dict zip to question_ids, or passthrough dict
-    ev = raw.get("evidence", {})
-    if isinstance(ev, list):
-        ev_dict: Dict[str, str] = {}
-        for i, qid in enumerate(question_ids):
-            if i < len(ev) and isinstance(ev[i], str):
-                ev_dict[qid] = ev[i]
-        out["evidence"] = ev_dict
-    elif isinstance(ev, dict):
-        out["evidence"] = {str(k): str(v) for k, v in ev.items()}
-    else:
-        out["evidence"] = {}
+    # evidence: not used → keep empty
+    out["evidence"] = {}
 
     # reasoning
     out["clinical_reasoning"] = str(
@@ -226,7 +222,7 @@ def normalize_round1(
 def _normalize_scores_like(
     val: Any, question_ids: Optional[List[str]]
 ) -> Dict[str, int]:
-    """normalize scores/evidence keys when model returns a list."""
+    """normalize scores when model returns a list."""
     if isinstance(val, dict):
         return {str(k): int(float(v)) for k, v in val.items()}
     if isinstance(val, list) and question_ids:
@@ -340,7 +336,9 @@ class irAKIExpertAgent(RoutedAgent):
 
         q_ids = [q["id"] for q in message.questions]
 
-        # normalize/validate
+        # normalize/validate and send to moderator
+        target = AgentId(type="moderator", key=message.case_id)
+
         if message.round_phase == "round1":
             cleaned = normalize_round1(
                 raw=llm_response,
@@ -350,37 +348,20 @@ class irAKIExpertAgent(RoutedAgent):
             )
             reply = self._create_round1_reply(cleaned, message)
             self._round1_assessment = reply
-            method = "record_round1"
+            ack = await self.send_message(reply, target)
         else:
             cleaned = self._validate_llm_response(
                 llm_response, round_phase="round3", question_ids=q_ids
             )
             reply = self._create_round3_reply(cleaned, message)
-            method = "record_round3"
+            ack = await self.send_message(reply, target)
 
-        # rpc to moderator
-        target = AgentId(type="moderator", key=message.case_id)
-        ack = await self._rpc(ctx, target, method, reply)
-
-        if not ack.ok:
-            raise RuntimeError(f"moderator rejected {method}: {ack.message}")
+        if not ack or not getattr(ack, "ok", False):
+            raise RuntimeError(
+                f"moderator rejected {message.round_phase}: {getattr(ack, 'message', 'no ack')}"
+            )
 
         self.logger.info(f"Submitted {message.round_phase} assessment")
-
-    async def _rpc(
-        self, ctx: MessageContext, target: AgentId, method: str, payload: Any
-    ):
-        # autogen_core compatibility across versions
-        fn = getattr(ctx, "rpc", None) or getattr(ctx, "call_rpc", None)
-        if callable(fn):
-            return await fn(target, method, payload)
-        # some builds hang it off ctx.runtime
-        runtime = getattr(ctx, "runtime", None)
-        if runtime and hasattr(runtime, "rpc") and callable(runtime.rpc):
-            return await runtime.rpc(target, method, payload)
-        if runtime and hasattr(runtime, "call_rpc") and callable(runtime.call_rpc):
-            return await runtime.call_rpc(target, method, payload)
-        raise RuntimeError("RPC not available on MessageContext/runtime")
 
     @message_handler
     async def handle_debate_prompt(
@@ -531,6 +512,7 @@ class irAKIExpertAgent(RoutedAgent):
                 "final_diagnosis": "string",
                 "confidence_in_verdict": "float 0-1 or word",
                 "recommendations": "array string",
+                # optional round-3 extras are omitted in constructor; safe to ignore here
                 "biopsy_recommendation": "optional string",
                 "steroid_recommendation": "optional string",
                 "ici_rechallenge_risk": "optional string",
@@ -584,21 +566,10 @@ class irAKIExpertAgent(RoutedAgent):
         try:
             out["scores"] = _normalize_scores_like(out.get("scores", {}), question_ids)
         except Exception:
-            # last resort: empty dict to let pydantic raise if truly required
             out["scores"] = {}
 
-        # evidence
-        ev = out.get("evidence", {})
-        if isinstance(ev, dict):
-            out["evidence"] = {str(k): str(v) for k, v in ev.items()}
-        elif isinstance(ev, list) and question_ids:
-            ev_dict: Dict[str, str] = {}
-            for i, qid in enumerate(question_ids):
-                if i < len(ev) and isinstance(ev[i], str):
-                    ev_dict[qid] = ev[i]
-            out["evidence"] = ev_dict
-        else:
-            out["evidence"] = {}
+        # evidence: not used → keep empty
+        out["evidence"] = {}
 
         # defaults for round3-only fields
         if round_phase == "round3":
