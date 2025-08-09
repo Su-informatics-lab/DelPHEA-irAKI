@@ -1,6 +1,6 @@
 # llm_backend.py
 # single minimal backend for text generation against a vLLM/OpenAI-compatible server.
-# purpose: provide a tiny, reliable .generate(prompt) api and hide transport details.
+# provides a tiny, reliable .generate(prompt) api and hides transport details.
 
 from __future__ import annotations
 
@@ -13,17 +13,17 @@ import requests
 class LLMBackend:
     """thin client for vLLM/OpenAI-compatible inference servers.
 
-    the project expects only one capability at this layer: generate a completion
+    the project expects one capability at this layer: generate a completion
     for a raw prompt string. higher-level orchestration (round prompts, debate,
-    aggregation) should live outside this transport.
+    aggregation) lives outside this transport.
 
     Args:
-        endpoint_url: base http url of the server, e.g. "http://localhost:8000".
+        endpoint_url: base http url, e.g. "http://localhost:8000".
         model_name: model identifier; optional if 'model' is provided.
         model: alias for model_name for compatibility with upstream code.
         timeout: request timeout in seconds.
-        api_key: optional bearer token; included if provided.
-        **_: swallow unexpected kwargs to fail loudly at call-sites instead.
+        api_key: optional bearer token.
+        **_: ignore unexpected kwargs gracefully.
 
     Raises:
         ValueError: if neither model_name nor model is provided.
@@ -37,20 +37,17 @@ class LLMBackend:
         model: Optional[str] = None,
         timeout: float = 60.0,
         api_key: Optional[str] = None,
-        **_: Any,
+        **_: Any,  # ignore legacy kwargs gracefully
     ) -> None:
-        # normalize and validate model id
         model_id = model_name or model
         if not model_id:
             raise ValueError("LLMBackend requires 'model' (or 'model_name')")
-
-        # normalize base url (no trailing slash)
         self._base = endpoint_url.rstrip("/")
         self._model = model_id
         self._timeout = timeout
         self._api_key = api_key
 
-        # precompute endpoints
+        # endpoints
         self._completions = f"{self._base}/v1/completions"
         self._chat = f"{self._base}/v1/chat/completions"
 
@@ -68,12 +65,14 @@ class LLMBackend:
     ) -> str:
         """return raw text completion for a single prompt string.
 
-        tries /v1/completions first; on 404, falls back to /v1/chat/completions.
+        attempts /v1/completions first; if unavailable or blank, falls back to
+        /v1/chat/completions with json mode enabled.
 
         Raises:
-            RuntimeError: on network, http, or schema errors.
+            RuntimeError: on network, http, or schema errors, or if both routes
+            return no usable text.
         """
-        # try legacy completions
+        # try legacy text completions first
         payload = {
             "model": self._model,
             "prompt": prompt,
@@ -88,28 +87,31 @@ class LLMBackend:
             payload.update(extra)
 
         text = self._post_and_parse_text(self._completions, payload, mode="completions")
-        if text is not None:
+        if isinstance(text, str) and text.strip():
             return text
 
-        # fallback to chat api
-        chat_payload = {
+        # fallback to chat api; force json_object if server supports it
+        chat_payload: Dict[str, Any] = {
             "model": self._model,
             "messages": [{"role": "user", "content": prompt}],
             "max_tokens": max_tokens,
             "temperature": temperature,
+            # many vllm/openai-compatible servers honor this and yield strict json
+            "response_format": {"type": "json_object"},
         }
         if stop:
             chat_payload["stop"] = stop
         if seed is not None:
             chat_payload["seed"] = seed
         if isinstance(extra, dict):
+            # let caller override response_format or add server-specific args
             chat_payload.update(extra)
 
         text = self._post_and_parse_text(self._chat, chat_payload, mode="chat")
-        if text is not None:
+        if isinstance(text, str) and text.strip():
             return text
 
-        raise RuntimeError("LLMBackend.generate: server responded without usable text")
+        raise RuntimeError("LLMBackend.generate: no usable text from either route")
 
     # -------------------- internals --------------------
 
@@ -132,7 +134,7 @@ class LLMBackend:
                 return None
             raise RuntimeError(f"LLMBackend: request error for {url}: {e}") from e
 
-        # some servers return 404 for unsupported routes -> allow fallback
+        # allow fallback on missing route
         if resp.status_code == 404 and mode == "completions":
             return None
 
@@ -147,24 +149,41 @@ class LLMBackend:
         except json.JSONDecodeError as e:
             raise RuntimeError(f"LLMBackend: non-JSON response from {url}: {e}") from e
 
-        # parse both schemas defensively
         try:
             if mode == "completions":
                 choices = data.get("choices") or []
                 if not choices:
                     return None
                 text = choices[0].get("text")
-                return str(text) if text is not None else None
+                if isinstance(text, str) and text.strip():
+                    return text
+                return None
 
             # chat mode
             choices = data.get("choices") or []
             if not choices:
                 return None
             msg = choices[0].get("message") or {}
+
+            # primary: regular assistant content
             content = msg.get("content")
-            return str(content) if content is not None else None
+            if isinstance(content, str) and content.strip():
+                return content
+
+            # secondary: some servers/models emit function/tool calls with arguments json
+            tool_calls = msg.get("tool_calls") or []
+            for tc in tool_calls:
+                fn = tc.get("function") or {}
+                args = fn.get("arguments")
+                if isinstance(args, (dict, list)):
+                    return json.dumps(args)
+                if isinstance(args, str) and args.strip():
+                    return args
+
+            # nothing usable
+            return None
 
         except Exception as e:  # noqa: BLE001
             raise RuntimeError(
-                f"LLMBackend: failed to parse response from {url}: {e}"
+                f"LLMBackend: failed to parse response schema from {url}: {e}"
             ) from e
