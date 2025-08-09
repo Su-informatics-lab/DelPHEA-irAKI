@@ -1,29 +1,30 @@
 {
-  "base_prompt": "You are {expert_name}, a {expert_experience} specialist.\nClinical focus: {expert_focus}\n\nIMMUNE-RELATED AKI ASSESSMENT ({round_phase}):\nCase ID: {case_id}\n\nPatient Information:\n{patient_info}\n\nICU Summary:\n{icu_summary}\n\nImmunotherapy Timeline:\n{medication_history}\n\nLaboratory Values & Renal Function:\n{lab_values}\n\nImaging Reports:\n{imaging_reports}\n\nCLINICAL ASSESSMENT QUESTIONS (irAKI Focus):\nRate each question on a 9-point scale (1=strongly disagree, 9=strongly agree):\n\n{questions}\n\n{confidence_instructions}\n\nINSTRUCTIONS:\n- Focus specifically on immune-related vs. other AKI etiologies\n- Consider temporal relationship to immunotherapy\n- Evaluate alternative causes (prerenal, postrenal, other intrinsic)\n- Base probability estimate on clinical evidence and {specialty} expertise\n- Provide a realistic 95% confidence interval reflecting your uncertainty\n{round_specific_instructions}\n\nProvide detailed clinical reasoning reflecting your {specialty} expertise in immune-related complications.",
-
-  "round1_instructions": "",
-
-  "round3_instructions": "- Explain changes from Round 1 assessment\n- Provide final binary verdict (irAKI: true/false)\n- Suggest specific diagnosis and clinical recommendations",
-
+  "base_prompt": "You are {expert_name}, a {specialty} specialist.\n\nirAKI ASSESSMENT ({round_phase}) — Case {case_id}\n\nDEMOGRAPHICS\n{demographics}\n\nAGGREGATED CLINICAL NOTES\n{clinical_notes}\n\nASSESSMENT QUESTIONS (1–9 Likert)\n{questions}\n\nOUTPUT SPEC:\nReturn a strict JSON object matching the schema for {round_phase} below. Do not include extra keys.",
+  "round1_instructions": "- Judge irAKI vs alternatives using timing, UA pattern, other irAEs, and exclusion of pre/post-renal causes.\n- Provide concise evidence per question.\n- Give p_iraki with a realistic 95% CI and a confidence 0–1.\n- Include a differential list; set primary_diagnosis.",
+  "round3_instructions": "- Reassess after debate/peer insights.\n- Explain what changed from Round 1 (per question if applicable).\n- Provide final binary verdict (true=irAKI), final_diagnosis, recommendations, and confidence in verdict.",
   "json_schema": {
     "round1": {
-      "scores": "{{\"Q1\": <1-9>, \"Q2\": <1-9>, ...}}",
-      "evidence": "{{\"Q1\": \"<clinical reasoning>\", \"Q2\": \"<reasoning>\", ...}}",
-      "p_iraki": "<0.0-1.0 probability of immune-related AKI>",
-      "ci_iraki": "[<lower_bound>, <upper_bound>] (95% confidence interval)",
-      "confidence": "<0.0-1.0 in your assessment>",
-      "differential_diagnosis": "[\"<alternative etiology 1>\", \"<alternative 2>\", ...]"
+      "scores": "object {qid:int(1-9)}",
+      "evidence": "object {qid:str}",
+      "clinical_reasoning": "string",
+      "p_iraki": "float 0-1",
+      "ci_iraki": "[lower, upper] both 0-1",
+      "confidence": "float 0-1",
+      "differential_diagnosis": "string[]",
+      "primary_diagnosis": "string"
     },
     "round3": {
-      "scores": "{{\"Q1\": <1-9>, \"Q2\": <1-9>, ...}}",
-      "evidence": "{{\"Q1\": \"<clinical reasoning>\", \"Q2\": \"<reasoning>\", ...}}",
-      "p_iraki": "<0.0-1.0 probability of immune-related AKI>",
-      "ci_iraki": "[<lower_bound>, <upper_bound>] (95% confidence interval)",
-      "confidence": "<0.0-1.0 in your assessment>",
-      "changes_from_round1": "{{\"Q1\": \"<explanation>\", ...}}",
-      "verdict": "<true/false for irAKI>",
-      "final_diagnosis": "\"<most likely specific diagnosis>\"",
-      "recommendations": "[\"<clinical recommendation 1>\", \"<recommendation 2>\", ...]"
+      "scores": "object {qid:int(1-9)}",
+      "evidence": "object {qid:str}",
+      "p_iraki": "float 0-1",
+      "ci_iraki": "[lower, upper] both 0-1",
+      "confidence": "float 0-1",
+      "changes_from_round1": "object {qid or 'overall': str}",
+      "debate_influence": "string",
+      "verdict": "boolean",
+      "final_diagnosis": "string",
+      "confidence_in_verdict": "float 0-1",
+      "recommendations": "string[]"
     }
   }
 }
