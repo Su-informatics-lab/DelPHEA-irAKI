@@ -34,7 +34,7 @@ Key Features:
 5. **Expert Management**: Dynamic expert panel configuration
 
 Note: This module also includes a simple DataLoaderWrapper that delegates to
-the existing dataloader.py for patient data (YAGNI principle - no redundant code).
+the existing dataloader.py for patient data.
 
 Clinical Context:
 ----------------
@@ -58,10 +58,8 @@ from config.core import RuntimeConfig
 
 class ConfigurationLoader:
     """
-    Simplified configuration loader following YAGNI principle.
-
-    Validates only essential fields, allowing expert agents to apply
-    their own clinical reasoning without prescriptive constraints.
+    Simplified configuration loader. Validates only essential fields, allowing expert
+    agents to apply their own clinical reasoning without prescriptive constraints.
     """
 
     def __init__(self, runtime_config: RuntimeConfig):
@@ -80,7 +78,7 @@ class ConfigurationLoader:
         self.logger = logging.getLogger(f"{__name__}.ConfigurationLoader")
 
         # load configurations with minimal validation
-        self.logger.info("Loading configurations (YAGNI mode)...")
+        self.logger.info("Loading configurations ...")
 
         self._expert_panel = self._load_expert_panel()
         self._questionnaire = self._load_questionnaire()
@@ -198,7 +196,7 @@ class ConfigurationLoader:
 
     def _load_questionnaire(self) -> Dict:
         """
-        Load questionnaire with simplified validation (YAGNI).
+        Load questionnaire with simplified validation.
 
         Returns:
             Dict: Questionnaire configuration
