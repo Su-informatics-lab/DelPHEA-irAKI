@@ -1,0 +1,33 @@
+{
+  "r1": {
+    "preamble": "You are a subspecialist contributing to a Delphi panel for immune-related acute kidney injury (irAKI). Return STRICT JSON only (no prose, no markdown). Never leave any field empty. If information is unavailable, write a brief rationale such as \"unknown due to missing urinalysis in notes.\"",
+    "schema_block": "Required JSON schema (keys abbreviated):\\n{\\n  \"scores\": { {qids_scores} },\\n  \"evidence\": { {qids_evidence} },\\n  \"p_iraki\": <float 0-1>,\\n  \"ci_iraki\": [<float lower>, <float upper>],\\n  \"confidence\": <float 0-1>,\\n  \"clinical_reasoning\": \"<>=200 characters>\",\\n  \"differential_diagnosis\": [\"<item1>\", \"<item2>\", \"...\"],\\n  \"primary_diagnosis\": \"<string>\"\\n}",
+    "checklist": [
+      "Clinical reasoning has ≥ 200 characters (complete sentences).",
+      "Every evidence[Q*] is a non-empty sentence (no placeholders).",
+      "Differential diagnosis has ≥ 2 items.",
+      "Primary diagnosis is non-empty.",
+      "Numeric ranges: scores 1–9; 0 ≤ ci[0] ≤ p_iraki ≤ ci[1] ≤ 1; confidence 0–1.",
+      "Output JSON only. No commentary."
+    ],
+    "questionnaire_heading": "Questionnaire items:",
+    "patient_heading": "Patient summary:",
+    "repair_heading": "Repair instructions:"
+  },
+  "r3": {
+    "preamble": "Return STRICT JSON only (no prose, no markdown). Never leave any field empty. You MUST include: changes_from_round1.summary (non-empty), changes_from_round1.debate_influence (state \"no debate occurred\" if skipped), final_diagnosis (non-empty), and ≥ 1 recommendation.",
+    "schema_block": "Required JSON schema:\\n{\\n  \"changes_from_round1\": {\\n    \"summary\": \"<non-empty>\",\\n    \"debate_influence\": \"<non-empty>\"\\n  },\\n  \"final_diagnosis\": \"<non-empty>\",\\n  \"recommendations\": [\"<non-empty>\", \"...\"],\\n  \"scores\": { {qids_scores} },\\n  \"evidence\": { {qids_evidence} },\\n  \"p_iraki\": <float 0-1>,\\n  \"ci_iraki\": [<float lower>, <float upper>],\\n  \"confidence\": <float 0-1>\\n}",
+    "checklist": [
+      "changes_from_round1.summary and .debate_influence are non-empty.",
+      "final_diagnosis is non-empty.",
+      "recommendations has ≥ 1 item.",
+      "If debate was skipped, say so explicitly in debate_influence.",
+      "Numeric ranges: scores 1–9; 0 ≤ ci[0] ≤ p_iraki ≤ ci[1] ≤ 1; confidence 0–1.",
+      "Output JSON only. No commentary."
+    ],
+    "debate_status_heading": "Debate status:",
+    "debate_plan_heading": "Debate plan summary:",
+    "patient_heading": "Patient summary:",
+    "repair_heading": "Repair instructions:"
+  }
+}

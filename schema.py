@@ -5,7 +5,8 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from typing import List
+from pathlib import Path
+from typing import Dict, List
 
 
 @dataclass(frozen=True)
@@ -20,6 +21,23 @@ def load_qids(questionnaire_path: str) -> List[str]:
         data = json.load(f)
     q = data["questionnaire"]["questions"]
     return [item["id"] for item in q]
+
+
+def load_question_texts(path: str) -> Dict[str, str]:
+    """return mapping {qid: text}; robust to various questionnaire shapes."""
+    data = json.loads(Path(path).read_text())
+    out: Dict[str, str] = {}
+    if isinstance(data, dict) and "questions" in data:
+        for item in data["questions"]:
+            qid = item.get("id") or item.get("qid")
+            txt = item.get("text") or item.get("question") or ""
+            if qid:
+                out[qid] = txt
+    # fallback: echo qid if text not available
+    if not out:
+        for q in load_qids(path):
+            out[q] = ""
+    return out
 
 
 def load_consensus_rules(questionnaire_path: str) -> ConsensusRules:

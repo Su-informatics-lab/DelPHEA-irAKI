@@ -165,6 +165,7 @@ def main() -> None:
         default=str((Path(__file__).parent / "questionnaire.json").resolve()),
         help="path to questionnaire json (default: questionnaire.json)",
     )
+    parser.add_argument("--prompts", default="prompts/expert_prompts.json")
     parser.add_argument(
         "-p",
         "--panel",
