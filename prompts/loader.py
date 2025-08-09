@@ -1,29 +1,43 @@
 # prompts/loader.py
-# load prompt json configs with robust path resolution and simple caching.
-# defaults to the prompts/ directory; supports env override DELPHEA_PROMPTS_DIR.
+# single-file prompt loader for delphea-iraki.
+# expects prompts/assessment_prompts.json and nothing else.
 
 from __future__ import annotations
 
 import json
 import os
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Iterable, Optional
 
-# dirs
-_PKG_DIR = Path(__file__).resolve().parent  # .../prompts
-_ROOT_DIR = _PKG_DIR.parent  # repo root
+# base dir and filename
+_PKG_DIR = Path(__file__).resolve().parent
 _BASE_DIR = Path(os.getenv("DELPHEA_PROMPTS_DIR", str(_PKG_DIR)))
+_FILE = "assessment_prompts.json"
 
-# caches
-_expert_prompts: Optional[Dict[str, Any]] = None
-_iraki_assessment: Optional[Dict[str, Any]] = None
-_confidence_instructions: Optional[Dict[str, Any]] = None
+_cache_single: Optional[Dict[str, Any]] = None
+
+
+def set_prompts_dir(path: Path) -> None:
+    """override the prompts directory (clears cache)."""
+    global _BASE_DIR, _cache_single
+    p = Path(path).expanduser().resolve()
+    if not p.exists():
+        raise FileNotFoundError(f"prompts dir not found: {p}")
+    _BASE_DIR = p
+    _cache_single = None
+
+
+def _resolve_file() -> Path:
+    p = _BASE_DIR / _FILE
+    if not p.exists():
+        raise FileNotFoundError(
+            f"missing required {_FILE} at {_BASE_DIR}. "
+            "set DELPHEA_PROMPTS_DIR or call set_prompts_dir(...)."
+        )
+    return p
 
 
 def _read_json(path: Path) -> Dict[str, Any]:
-    """read a json file with explicit errors."""
-    if not path.exists():
-        raise FileNotFoundError(f"missing required json file: {path}")
     try:
         with path.open("r", encoding="utf-8") as f:
             return json.load(f)
@@ -31,99 +45,119 @@ def _read_json(path: Path) -> Dict[str, Any]:
         raise ValueError(f"invalid json in {path}: {e}") from e
 
 
-def _resolve_default(name: str) -> Path:
-    """resolve a default file path under the prompts dir."""
-    p = _BASE_DIR / name
-    if not p.exists():
-        # legacy flat layout fallback: repo root
-        alt = _ROOT_DIR / name
-        if alt.exists():
-            return alt
-    return p
+def _load_single() -> Dict[str, Any]:
+    global _cache_single
+    if _cache_single is None:
+        _cache_single = _read_json(_resolve_file())
+    return _cache_single
 
 
-def ensure_loaded() -> None:
-    """load all three json configs if not cached."""
-    global _expert_prompts, _iraki_assessment, _confidence_instructions
-    if _expert_prompts is None:
-        _expert_prompts = _read_json(_resolve_default("expert_prompts.json"))
-    if _iraki_assessment is None:
-        _iraki_assessment = _read_json(_resolve_default("iraki_assessment.json"))
-    if _confidence_instructions is None:
-        _confidence_instructions = _read_json(
-            _resolve_default("confidence_instructions.json")
+def _render_schema_block(
+    json_schema: Optional[Dict[str, Any]],
+    qids: Iterable[str],
+    fallback: Optional[str],
+) -> str:
+    """render a concise, human-readable schema block (single source of truth)."""
+    if isinstance(json_schema, dict):
+        qids_list = list(qids)
+        scores_items = (
+            ", ".join(f'"{q}": <int 1-9>' for q in qids_list)
+            if qids_list
+            else '"Q*": <int 1-9>'
         )
+        evid_items = (
+            ", ".join(f'"{q}": "<string>"' for q in qids_list)
+            if qids_list
+            else '"Q*": "<string>"'
+        )
+        rest_lines = [
+            '"p_iraki": <float 0-1>',
+            '"ci_iraki": [<float lower>, <float upper>]',
+            '"confidence": <float 0-1>',
+            '"clinical_reasoning": "<>=200 characters>"',
+            '"differential_diagnosis": ["<item1>", "<item2>", "..."]',
+            '"primary_diagnosis": "<string>"',
+        ]
+        rest_joined = ",\n  ".join(rest_lines)
+        part_scores = f'  "scores": {{ {scores_items} }},\n'
+        part_evid = f'  "evidence": {{ {evid_items} }},\n'
+        part_rest = f"  {rest_joined}\n"
+        header = "Required JSON schema (keys abbreviated):\n{\n"
+        footer = "}"
+        # no backslashes inside f-string expressions (precomputed above)
+        return f"{header}{part_scores}{part_evid}{part_rest}{footer}"
+
+    if isinstance(fallback, str) and fallback.strip():
+        return fallback
+
+    return (
+        "Required JSON schema (summary): keys = scores{Q*}, evidence{Q*}, "
+        "p_iraki, ci_iraki[2], confidence, clinical_reasoning, "
+        "differential_diagnosis[], primary_diagnosis"
+    )
 
 
-def get_expert_prompts() -> Dict[str, Any]:
-    """return expert_prompts.json content (cached)."""
-    ensure_loaded()
-    assert _expert_prompts is not None
-    return _expert_prompts
-
-
-def get_iraki_assessment() -> Dict[str, Any]:
-    """return iraki_assessment.json content (cached)."""
-    ensure_loaded()
-    assert _iraki_assessment is not None
-    return _iraki_assessment
-
-
-def get_confidence_instructions() -> Dict[str, Any]:
-    """return confidence_instructions.json content (cached)."""
-    ensure_loaded()
-    assert _confidence_instructions is not None
-    return _confidence_instructions
-
-
-def get_conf_instructions() -> Dict[str, Any]:
-    """back-compat shim; prefer get_confidence_instructions()."""
-    return get_confidence_instructions()
-
-
-def load_triplet(
+def load_unified_round(
     *,
-    expert_prompts_path: Optional[str | Path] = None,
-    iraki_assessment_path: Optional[str | Path] = None,
-    conf_instructions_path: Optional[str | Path] = None,
-) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
-    """load (expert_prompts, iraki_assessment, confidence_instructions).
+    round_key: str,  # 'r1' or 'r3'
+    qids: Iterable[str],  # questionnaire ids for schema rendering
+) -> Dict[str, str]:
+    """return a string bundle for the requested round.
 
-    if any explicit path is provided, each may be a file or a directory.
-    when a directory is given, the standard filename inside it is used.
-    any None path falls back to the default location under the prompts dir.
+    returns keys:
+      - preamble
+      - base_prompt
+      - instructions
+      - schema_block
+      - checklist
+      - repair_heading
+      - ci_instructions
     """
+    single = _load_single()
 
-    def _resolve(p: Optional[str | Path], default_name: str) -> Path:
-        if p is None:
-            return _resolve_default(default_name)
-        p = Path(p)
-        return (p / default_name) if p.is_dir() else p
+    rounds = single.get("rounds") or single
+    want = (
+        round_key
+        if round_key in rounds
+        else {"r1": "round1", "r3": "round3"}.get(round_key, round_key)
+    )
+    if want not in rounds or not isinstance(rounds[want], dict):
+        raise KeyError(f"{_FILE} missing rounds['{want}']")
 
-    ep = _read_json(_resolve(expert_prompts_path, "expert_prompts.json"))
-    ia = _read_json(_resolve(iraki_assessment_path, "iraki_assessment.json"))
-    ci = _read_json(_resolve(conf_instructions_path, "confidence_instructions.json"))
-    return ep, ia, ci
+    r = rounds[want]
+    for k in ("preamble", "base_prompt", "instructions"):
+        if k not in r:
+            raise KeyError(f"{_FILE}['{want}'] missing '{k}'")
+
+    checklist = single.get("checklist") or r.get("checklist")
+    if not isinstance(checklist, list) or not checklist:
+        raise KeyError(f"{_FILE} missing 'checklist' (list)")
+
+    ci = single.get("ci_instructions")
+    if ci is None:
+        raise KeyError(f"{_FILE} missing 'ci_instructions'")
+
+    repair = (
+        single.get("repair_heading")
+        or r.get("repair_heading")
+        or "Repair instructions:"
+    )
+
+    schema_block = _render_schema_block(
+        single.get("json_schema") or r.get("json_schema"),
+        qids,
+        single.get("schema_block") or r.get("schema_block"),
+    )
+
+    return {
+        "preamble": str(r["preamble"]),
+        "base_prompt": str(r["base_prompt"]),
+        "instructions": str(r["instructions"]),
+        "schema_block": schema_block,
+        "checklist": "\n".join(f"- {item}" for item in checklist),
+        "repair_heading": str(repair),
+        "ci_instructions": str(ci),
+    }
 
 
-def set_prompts_dir(path: str | Path) -> None:
-    """optional: override base prompts directory at runtime and clear caches."""
-    global _BASE_DIR, _expert_prompts, _iraki_assessment, _confidence_instructions
-    p = Path(path).expanduser().resolve()
-    if not p.exists():
-        raise FileNotFoundError(f"prompts dir not found: {p}")
-    _BASE_DIR = p
-    _expert_prompts = None
-    _iraki_assessment = None
-    _confidence_instructions = None
-
-
-__all__ = [
-    "ensure_loaded",
-    "get_expert_prompts",
-    "get_iraki_assessment",
-    "get_confidence_instructions",
-    "get_conf_instructions",
-    "load_triplet",
-    "set_prompts_dir",
-]
+__all__ = ["set_prompts_dir", "load_unified_round"]
