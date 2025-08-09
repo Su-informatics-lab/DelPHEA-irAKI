@@ -57,10 +57,18 @@ from aggregator import Aggregator
 from models import AssessmentR1, AssessmentR3, Consensus
 from router import DebatePlan, Router
 from schema import load_consensus_rules, load_qids
+from validators import (
+    ValidationError,
+    log_debate_status,
+    validate_round1_payload,
+    validate_round3_payload,
+)
 
 
 @dataclass
 class _CaseBuffers:
+    """in-memory buffers for a single case run."""
+
     r1: List[Tuple[str, AssessmentR1]]
     debate_ctx: Dict[str, Any]
     r3: List[Tuple[str, AssessmentR3]]
@@ -103,48 +111,106 @@ class Moderator:
         case: Dict[str, Any],
         debate_ctx: Dict[str, Any] | None = None,
     ) -> List[Tuple[str, AssessmentR1 | AssessmentR3]]:
-        """fan-out round requests to all experts; return structured pydantic models."""
+        """fan-out round requests to all experts; return structured pydantic models.
+
+        args:
+            round_no: 1 or 3.
+            case: case dict with patient/context fields.
+            debate_ctx: context dict from debate step (for round 3).
+
+        returns:
+            list of (expert_id, AssessmentR1|AssessmentR3).
+
+        raises:
+            ValidationError: when an expert's payload fails strict content checks.
+            ValueError: when qids do not match questionnaire.
+        """
         if round_no not in (1, 3):
             raise ValueError(f"unsupported round: {round_no}")
-        self.logger.info(f"assessing round {round_no} for {len(self.experts)} experts")
+        self.logger.info(
+            "assessing round %d for %d experts", round_no, len(self.experts)
+        )
 
         outputs: List[Tuple[str, AssessmentR1 | AssessmentR3]] = []
         if round_no == 1:
             for e in self.experts:
-                a1 = e.assess_round1(case, self.qpath)
+                a1 = e.assess_round1(case, self.qpath)  # pydantic model
+                # schema echo: ensure qids exactly match
                 self._validate_qids_exact(a1)
+                # content validation: enforce reasoning/evidence presence
+                try:
+                    validate_round1_payload(a1.model_dump(), required_evidence=12)
+                except ValidationError as ve:
+                    self.logger.error(
+                        "round1 validation failed for %s: %s", e.expert_id, ve
+                    )
+                    # fail fast so caller can re-prompt this expert with ve.errors()
+                    raise
                 outputs.append((e.expert_id, a1))
             return outputs
 
         # round 3
         ctx = debate_ctx or {}
         for e in self.experts:
-            a3 = e.assess_round3(case, self.qpath, ctx)
+            a3 = e.assess_round3(case, self.qpath, ctx)  # pydantic model
             self._validate_qids_exact(a3)
+            try:
+                validate_round3_payload(a3.model_dump())
+            except ValidationError as ve:
+                self.logger.error(
+                    "round3 validation failed for %s: %s", e.expert_id, ve
+                )
+                raise
             outputs.append((e.expert_id, a3))
         return outputs
 
     def detect_and_run_debates(
         self, r1: Sequence[Tuple[str, AssessmentR1]], case: Dict[str, Any]
     ) -> Dict[str, Any]:
-        """compute debate plan via router and collect debate turns."""
+        """compute debate plan via router and collect debate turns.
+
+        args:
+            r1: list of (expert_id, AssessmentR1) from round 1.
+            case: case dict.
+
+        returns:
+            dict with keys:
+              - debate_plan: mapping qid -> list[expert_id] asked to argue
+              - transcripts: mapping qid -> list[debate_turn dict]
+              - debate_skipped: bool indicating whether moderator skipped debate
+        """
         plan: DebatePlan = self.router.plan(r1, self.rules)
+        solicitations = sum(len(v) for v in plan.by_qid.values())
+        disagreement_present = solicitations > 0
+
+        # explicit log of debate status for operator visibility
+        log_debate_status(disagreement_present=disagreement_present, logger=self.logger)
+
         transcripts: Dict[str, List[Dict[str, Any]]] = {}
+        if not disagreement_present:
+            # no material disagreement → skip execution, return empty transcripts
+            return {
+                "debate_plan": plan.by_qid,
+                "transcripts": {},
+                "debate_skipped": True,
+            }
+
         self.logger.info(
-            f"debate planning complete: {sum(len(v) for v in plan.by_qid.values())} solicitations "
-            f"across {len(plan.by_qid)} qids"
+            "debate planning complete: %d solicitations across %d qids",
+            solicitations,
+            len(plan.by_qid),
         )
 
         # derive a simple minority_view summary per qid from r1 spread
         for qid, expert_ids in plan.by_qid.items():
             if not expert_ids:
                 continue
-            # textual minority view = highest-deviation explanation snippets
             minority_text = []
             for eid, a in r1:
                 if eid in expert_ids:
                     ev = a.evidence.get(qid, "")
-                    minority_text.append(f"{eid}: score={a.scores[qid]} evidence={ev}")
+                    score = a.scores.get(qid, None)
+                    minority_text.append(f"{eid}: score={score} evidence={ev}")
             mv = "\n".join(minority_text) or "minority perspective not available"
 
             transcripts[qid] = []
@@ -158,7 +224,11 @@ class Moderator:
                     )
                     transcripts[qid].append(turn.model_dump())
 
-        return {"debate_plan": plan.by_qid, "transcripts": transcripts}
+        return {
+            "debate_plan": plan.by_qid,
+            "transcripts": transcripts,
+            "debate_skipped": False,
+        }
 
     def run_case(self, case: Dict[str, Any]) -> Dict[str, Any]:
         """run the full r1 → debate → r3 → aggregate pipeline and return a report dict."""
@@ -168,7 +238,7 @@ class Moderator:
         buffers.r1 = self.assess_round(1, case)  # [(eid, AssessmentR1)]
         self._validate_r1_coherence(buffers.r1)
 
-        # debate
+        # debate (may be skipped)
         buffers.debate_ctx = self.detect_and_run_debates(buffers.r1, case)
 
         # round 3
@@ -186,7 +256,7 @@ class Moderator:
             "round3": [(eid, a.model_dump()) for eid, a in buffers.r3],
             "consensus": buffers.consensus.model_dump(),
         }
-        # optional pretty logging
+        # compact but helpful debug log of consensus
         self.logger.debug(json.dumps(report["consensus"], indent=2))
         return report
 
@@ -214,7 +284,6 @@ class Moderator:
         """basic coherence checks across experts for r1 payloads."""
         if not r1:
             raise ValueError("r1 assessments cannot be empty")
-        # ensure all experts covered the same qids
         for _, a in r1:
             self._validate_qids_exact(a)
 
