@@ -637,7 +637,4 @@ class irAKIExpertAgent(RoutedAgent):
             final_diagnosis=resp["final_diagnosis"],
             confidence_in_verdict=resp["confidence_in_verdict"],
             recommendations=resp["recommendations"],
-            biopsy_recommendation=resp.get("biopsy_recommendation"),
-            steroid_recommendation=resp.get("steroid_recommendation"),
-            ici_rechallenge_risk=resp.get("ici_rechallenge_risk"),
         )
