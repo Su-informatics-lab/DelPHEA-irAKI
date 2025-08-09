@@ -29,19 +29,19 @@ logger = logging.getLogger(__name__)
 
 
 class ClinicalSafetyError(Exception):
-    """Base exception for clinical safety-critical failures."""
+    """base exception for clinical safety-critical failures."""
 
 
 class ExpertReasoningError(ClinicalSafetyError):
-    """Expert failed to generate valid clinical reasoning."""
+    """expert failed to generate valid clinical reasoning."""
 
 
 class ConsensusComputationError(ClinicalSafetyError):
-    """Failed to compute consensus for patient case."""
+    """failed to compute consensus for patient case."""
 
 
 class VLLMClient:
-    """Enhanced vLLM client with fail-loud error handling for clinical safety."""
+    """openai-style vllm client with fail-loud handling."""
 
     def __init__(
         self, runtime_config: RuntimeConfig, http_client: httpx.AsyncClient = None
@@ -52,13 +52,12 @@ class VLLMClient:
         self.endpoint = runtime_config.get_vllm_endpoint()
         if not self.endpoint:
             raise ClinicalSafetyError(
-                "CRITICAL: vLLM endpoint not configured. "
-                "Set VLLM_ENDPOINT or use --vllm-endpoint."
+                "CRITICAL: vLLM endpoint not configured. set VLLM_ENDPOINT or --vllm-endpoint."
             )
 
         if not runtime_config.model_name:
             raise ClinicalSafetyError(
-                "CRITICAL: No model specified. Configure RuntimeConfig.model_name."
+                "CRITICAL: no model specified. set RuntimeConfig.model_name."
             )
 
         if http_client:
@@ -76,6 +75,9 @@ class VLLMClient:
             self.headers["Authorization"] = f"Bearer {runtime_config.api_key}"
 
         self.model_name = runtime_config.model_name
+        self.temperature = getattr(runtime_config, "temperature", 0.5)
+        self.max_tokens = getattr(runtime_config, "max_tokens", 2048)
+
         self.logger.info(
             f"Initialized vLLM client for clinical assessment "
             f"[endpoint: {self.endpoint}, model: {self.model_name}]"
@@ -83,11 +85,10 @@ class VLLMClient:
 
     async def _post_and_read_text(self, payload: Dict[str, Any]) -> str:
         """
-        Minimal, fail-loud POST to the server. Assumes a /generate style endpoint that
-        returns either {'text': '...'} or {'choices': [{'text': '...'}]}.
-        Adjust if your server is OpenAI-compatible (then point to /v1/completions or /v1/chat/completions).
+        minimal, fail-loud POST to openai-compatible /v1/chat/completions
+        returns text from choices[0].message.content
         """
-        url = f"{self.endpoint.rstrip('/')}/generate"
+        url = f"{self.endpoint.rstrip('/')}/v1/chat/completions"
         resp = await self.client.post(
             url, headers=self.headers, content=json.dumps(payload)
         )
@@ -100,18 +101,14 @@ class VLLMClient:
             data = resp.json()
         except Exception as e:
             raise ClinicalSafetyError(
-                f"Non-JSON response from LLM: {resp.text[:500]}"
+                f"non-json response from LLM: {resp.text[:500]}"
             ) from e
 
-        # YAGNI parse: prefer 'text', else first choice.text
-        if isinstance(data, dict) and "text" in data and isinstance(data["text"], str):
-            text = data["text"]
-        elif isinstance(data, dict) and "choices" in data and data["choices"]:
-            choice = data["choices"][0]
-            text = choice.get("text") or choice.get("message", {}).get("content")
-        else:
+        try:
+            text = data["choices"][0]["message"]["content"]
+        except Exception:
             raise ClinicalSafetyError(
-                f"Unexpected LLM payload shape. Keys: {list(data)[:10]}"
+                f"unexpected LLM payload shape. keys: {list(data)[:10]} payload: {str(data)[:500]}"
             )
 
         self.logger.debug(f"LLM raw (first 200): {text[:200]!r}")
@@ -124,20 +121,19 @@ class VLLMClient:
         temperature: float,
         max_tokens: int,
     ) -> str:
-        """
-        Replace with actual vLLM call format your server expects.
-        This version is a simple /generate with model + prompt.
-        """
-        payload = {
+        """openai chat-style call to vllm."""
+        payload: Dict[str, Any] = {
             "model": self.model_name,
-            "prompt": prompt,
-            "temperature": temperature,
-            "max_tokens": max_tokens,
+            "messages": [
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": float(temperature),
+            "max_tokens": int(max_tokens),
+            "stream": False,
         }
-        # If server supports JSON mode/guidance, pass it through
+        # vllm supports response_format={"type":"json_object"} in recent versions
         if response_format and response_format.get("type") == "json_object":
-            payload["response_format"] = response_format
-
+            payload["response_format"] = {"type": "json_object"}
         return await self._post_and_read_text(payload)
 
     async def generate_structured_response(
@@ -146,7 +142,7 @@ class VLLMClient:
         response_format: Optional[Dict[str, Any]] = None,
         max_retries: int = 2,
     ) -> Dict[str, Any]:
-        """Force strict JSON with retries and loud failures."""
+        """force strict json with retries and loud failures."""
         required_keys = []
         if response_format and isinstance(response_format.get("schema"), dict):
             required_keys = list(response_format["schema"].keys())
@@ -156,22 +152,22 @@ class VLLMClient:
             if attempt > 0:
                 prompt = base_prompt + (
                     "\n\nIMPORTANT:\n"
-                    "Return ONLY a single valid JSON object. No markdown, no prose, no code fences.\n"
-                    f"Required top-level keys: {required_keys or '[see spec]'}\n"
+                    "return ONLY a single valid JSON object. no markdown, no prose, no code fences.\n"
+                    f"required top-level keys: {required_keys or '[see spec]'}\n"
                 )
 
             text = await self._llm_call(
                 prompt=prompt,
                 response_format=response_format,
-                temperature=0.2 if attempt else 0.5,
-                max_tokens=2048,
+                temperature=0.2 if attempt else self.temperature,
+                max_tokens=self.max_tokens,
             )
 
-            # Try parse
+            # try parse
             try:
                 obj = json.loads(text)
             except Exception:
-                # Try first {...} window
+                # try first {...} window
                 try:
                     start = text.find("{")
                     end = text.rfind("}")
@@ -183,7 +179,7 @@ class VLLMClient:
                     if attempt < max_retries:
                         continue
                     raise StructuredOutputError(
-                        f"Model did not return valid JSON after {max_retries+1} attempts."
+                        f"model did not return valid json after {max_retries+1} attempts."
                     )
 
             if required_keys:
@@ -191,25 +187,30 @@ class VLLMClient:
                 if missing:
                     if attempt < max_retries:
                         base_prompt += (
-                            f"\n\nThe previous output was missing keys: {missing}. "
-                            "Return ONLY JSON with ALL required keys."
+                            f"\n\nprevious output was missing keys: {missing}. "
+                            "return ONLY json with ALL required keys."
                         )
                         continue
                     raise StructuredOutputError(
-                        f"Missing required keys after {max_retries+1} attempts: {missing}"
+                        f"missing required keys after {max_retries+1} attempts: {missing}"
                     )
 
             return obj
 
-        raise StructuredOutputError("Unknown structured output failure.")
+        raise StructuredOutputError("unknown structured output failure.")
 
     async def health_check(self) -> bool:
+        """probe openai-compatible endpoint."""
         try:
             response = await self.client.get(
-                f"{self.endpoint}/health", headers=self.headers, timeout=10.0
+                f"{self.endpoint.rstrip('/')}/v1/models",
+                headers=self.headers,
+                timeout=10.0,
             )
             if response.status_code == 200:
-                self.logger.info(f"vLLM service healthy at {self.endpoint}")
+                self.logger.info(
+                    f"vLLM service healthy (openai-compatible) at {self.endpoint}"
+                )
                 return True
             self.logger.warning(
                 f"vLLM service unhealthy: HTTP {response.status_code} from {self.endpoint}"
@@ -217,10 +218,10 @@ class VLLMClient:
             return False
         except httpx.NetworkError as e:
             raise ClinicalSafetyError(
-                f"CRITICAL: Cannot verify vLLM service health at {self.endpoint}. Network error: {e}"
+                f"CRITICAL: cannot verify vLLM service health at {self.endpoint}. network error: {e}"
             ) from e
         except Exception as e:
-            self.logger.error(f"Health check failed: {e}", exc_info=True)
+            self.logger.error(f"health check failed: {e}", exc_info=True)
             return False
 
     async def close(self):
@@ -230,29 +231,23 @@ class VLLMClient:
 
 
 class MockVLLMClient:
-    """Mock vLLM client for testing without infrastructure."""
+    """mock vllm client for testing without infrastructure."""
 
     def __init__(self, runtime_config: RuntimeConfig, http_client=None):
-        """Initialize mock client for testing."""
         self.config = runtime_config
         self.logger = logging.getLogger(f"{__name__}.MockVLLMClient")
         self.logger.warning(
-            "USING MOCK CLIENT: Not suitable for clinical use. "
-            "Only for testing DelPHEA-irAKI workflow."
+            "USING MOCK CLIENT: not suitable for clinical use. only for workflow testing."
         )
 
     async def generate_structured_response(
         self, prompt: str, response_format: Dict, expert_context: Optional[Dict] = None
     ) -> Dict:
-        """Generate mock response for testing."""
-        # return realistic mock data for testing
         import random
 
         expert_id = (
             expert_context.get("expert_id", "mock") if expert_context else "mock"
         )
-
-        # generate mock scores
         scores = {f"Q{i}": random.randint(3, 8) for i in range(1, 17)}
 
         return {
@@ -261,16 +256,15 @@ class MockVLLMClient:
             "p_iraki": random.uniform(0.3, 0.8),
             "ci_iraki": [random.uniform(0.2, 0.4), random.uniform(0.6, 0.9)],
             "confidence": random.uniform(0.6, 0.9),
-            "reasoning": "Mock clinical reasoning for testing purposes.",
+            "reasoning": "mock clinical reasoning for testing purposes.",
             "verdict": random.choice([True, False]),
             "differential": ["irAKI", "ATN", "Prerenal"],
-            "evidence": ["Temporal relationship", "Urinalysis findings"],
-            "next_steps": ["Consider biopsy", "Hold ICI", "Start steroids"],
+            "evidence": ["temporal relationship", "urinalysis findings"],
+            "next_steps": ["consider biopsy", "hold ICI", "start steroids"],
         }
 
     async def health_check(self) -> bool:
-        """Mock health check always returns True."""
         return True
 
     async def close(self):
-        """Mock cleanup."""
+        pass
