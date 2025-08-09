@@ -365,33 +365,6 @@
       },
       {
         "id": "Q14",
-        "category": "imaging_evidence",
-        "question": "Radiologic findings support immune-mediated kidney injury or exclude alternative structural causes",
-        "description": "Assessment of imaging evidence for intrinsic parenchymal injury patterns consistent with or contradicting irAKI",
-        "clinical_context": {
-          "supportive_findings": [
-            "Increased renal cortical echogenicity",
-            "Peri-renal inflammatory changes",
-            "Bilateral symmetric kidney involvement",
-            "No evidence of cortical necrosis or infarcts",
-            "Normal collecting system"
-          ],
-          "contradictory_findings": [
-            "Renal vein thrombosis",
-            "Cortical necrosis patterns",
-            "Asymmetric involvement suggesting vascular cause",
-            "Evidence of renal infarction",
-            "Structural abnormalities explaining AKI"
-          ]
-        },
-        "specialty_focus": {
-          "radiology": "Imaging pattern recognition for immune vs other causes",
-          "nephrology": "Correlation of imaging with clinical presentation",
-          "emergency_medicine": "Rapid imaging interpretation for alternative causes"
-        }
-      },
-      {
-        "id": "Q15",
         "category": "baseline_risk_factors",
         "question": "Baseline renal reserve, age-related changes, and frailty have been appropriately considered in AKI assessment",
         "description": "Assessment accounts for baseline CKD, geriatric factors, and individual patient vulnerability",
@@ -417,7 +390,7 @@
         }
       },
       {
-        "id": "Q16",
+        "id": "Q15",
         "category": "rechallenge_assessment",
         "question": "The risk-benefit profile supports rechallenge with ICI therapy after AKI recovery",
         "description": "Assessment of whether restarting ICI is appropriate based on AKI severity, recovery, and cancer prognosis",
