@@ -37,7 +37,7 @@ import asyncio
 import json
 import logging
 import time
-from typing import Dict, List, Set
+from typing import Any, Dict, List, Set
 
 import numpy as np
 from autogen_core import AgentId, MessageContext, RoutedAgent, message_handler, rpc
@@ -56,6 +56,26 @@ from orchestration.messages import (
     StartCase,
     TerminateDebate,
 )
+
+
+# helper local to _run_round1 and _run_round3
+def _build_documents(pd: Dict[str, Any]) -> Dict[str, List[str]]:
+    # Try common keys; fall back to empty lists. Convert scalars to single-item lists.
+    def as_list(x):
+        if x is None:
+            return []
+        if isinstance(x, list):
+            return [str(t) for t in x]
+        return [str(x)]
+
+    return {
+        "notes": as_list(pd.get("notes") or pd.get("clinical_notes")),
+        "labs_text": as_list(pd.get("labs_text") or pd.get("lab_values_text")),
+        "imaging_text": as_list(pd.get("imaging_text") or pd.get("imaging_reports")),
+        "meds_text": as_list(pd.get("meds_text") or pd.get("medication_history")),
+        # add other buckets as needed with zero cost:
+        # "path_text": as_list(pd.get("path_text")),
+    }
 
 
 class irAKIModeratorAgent(RoutedAgent):
@@ -128,12 +148,7 @@ class irAKIModeratorAgent(RoutedAgent):
             case_id=self._case_id,
             round_phase="round1",
             patient_info=self._patient_data.get("patient_info", {}),
-            icu_summary=self._patient_data.get(
-                "icu_summary", self._patient_data.get("patient_summary", "")
-            ),
-            medication_history=self._patient_data.get("medication_history", {}),
-            lab_values=self._patient_data.get("lab_values", {}),
-            imaging_reports=str(self._patient_data.get("imaging_reports", [])),
+            documents=_build_documents(self._patient_data),
             questions=questions,
         )
         for ex_id in self._expert_ids:
@@ -355,12 +370,7 @@ class irAKIModeratorAgent(RoutedAgent):
             case_id=self._case_id,
             round_phase="round3",
             patient_info=self._patient_data.get("patient_info", {}),
-            icu_summary=self._patient_data.get(
-                "icu_summary", self._patient_data.get("patient_summary", "")
-            ),
-            medication_history=self._patient_data.get("medication_history", {}),
-            lab_values=self._patient_data.get("lab_values", {}),
-            imaging_reports=str(self._patient_data.get("imaging_reports", [])),
+            documents=_build_documents(self._patient_data),
             questions=questions,
             debate_summary=debate_summary,
         )

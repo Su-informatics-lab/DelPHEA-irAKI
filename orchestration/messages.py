@@ -51,24 +51,20 @@ class QuestionnaireMsg(BaseModel):
     case_id: str
     round_phase: str  # "round1" or "round3"
 
-    # clinical data
-    patient_info: Dict[str, Any]
-    icu_summary: str
-    medication_history: Dict[str, Any]
-    lab_values: Dict[str, Any]
-    imaging_reports: str
+    # minimal clinical payload
+    patient_info: Dict[str, Any]  # demographics and small structured bits
+    documents: Dict[str, List[str]]  # buckets of raw text, grouped by type
 
     # assessment framework
     questions: List[Dict[str, Any]]
 
-    # optional fields for round 3
+    # optional for round 3
     prior_assessments: Optional[Dict[str, Any]] = None
     debate_summary: Optional[str] = None
 
     @field_validator("round_phase")
     @classmethod
     def validate_round_phase(cls, v: str) -> str:
-        """Ensure round phase is valid."""
         if v not in ["round1", "round3"]:
             raise ValueError(f"Invalid round phase: {v}. Must be 'round1' or 'round3'")
         return v
@@ -76,12 +72,20 @@ class QuestionnaireMsg(BaseModel):
     @field_validator("questions")
     @classmethod
     def validate_questions(cls, v: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Ensure questions have required structure."""
         if not v:
             raise ValueError("Questions list cannot be empty")
         for q in v:
             if "id" not in q or "question" not in q:
                 raise ValueError("Each question must have 'id' and 'question' fields")
+        return v
+
+    @field_validator("documents")
+    @classmethod
+    def validate_documents(cls, v: Dict[str, List[str]]) -> Dict[str, List[str]]:
+        # enforce lists of strings, but allow empty
+        for k, arr in v.items():
+            if not isinstance(arr, list) or any(not isinstance(x, str) for x in arr):
+                raise ValueError(f"documents['{k}'] must be a list of strings")
         return v
 
 
