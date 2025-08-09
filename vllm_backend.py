@@ -8,7 +8,7 @@ from __future__ import annotations
 import json
 import os
 import re
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 import requests
 
@@ -249,4 +249,67 @@ class VLLMBackend(LLMBackend):
             # any non-404 means the route exists (400 is fine for empty body)
             self._route = (tag, url)
             return self._route
-        raise RuntimeE
+        raise RuntimeError(
+            "no compatible openai route found. tried:\n" + "\n".join(tried)
+        )
+
+    def _parse_openai_response(self, tag: str, obj: Dict[str, Any]) -> str:
+        # unify text extraction for chat/responses/completions
+        if tag == "chat":
+            return obj.get("choices", [{}])[0].get("message", {}).get("content", "")
+        if tag == "comp":
+            return obj.get("choices", [{}])[0].get("text", "")
+        # responses api
+        if "output_text" in obj:
+            return obj.get("output_text", "")
+        out = obj.get("output", [])
+        try:
+            for seg in out:
+                for c in seg.get("content", []):
+                    if "text" in c:
+                        return c["text"]
+        except Exception:
+            pass
+        # some servers also echo chat-style choices
+        return obj.get("choices", [{}])[0].get("message", {}).get("content", "")
+
+    def _chat_json(self, messages: List[Dict[str, str]]) -> Dict[str, Any]:
+        """
+        send messages via whichever OpenAI-style route the server supports,
+        then parse reply text and return a python dict (json).
+        """
+        tag, url = self._detect_route()
+        if tag == "chat":
+            payload = {
+                "model": self.model,
+                "messages": messages,
+                "temperature": 0,
+                "stream": False,
+            }
+        elif tag == "responses":
+            payload = {
+                "model": self.model,
+                "input": self._messages_to_text(messages),
+                "temperature": 0,
+            }
+        else:  # "comp"
+            payload = {
+                "model": self.model,
+                "prompt": self._messages_to_text(messages),
+                "temperature": 0,
+            }
+
+        r = self._post_json(url, payload)
+
+        # retry once if a 404 slips in during server reload
+        if r.status_code == 404:
+            self._route = None
+            tag, url = self._detect_route()
+            r = self._post_json(url, payload)
+
+        if r.status_code >= 400:
+            raise RuntimeError(f"vllm backend http {r.status_code}: {r.text[:500]}")
+
+        obj = r.json()
+        text = self._parse_openai_response(tag, obj)
+        return self._extract_json_obj(text)
