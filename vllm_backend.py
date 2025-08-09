@@ -209,3 +209,159 @@ def _build_debate_prompt(
         {"role": "system", "content": system},
         {"role": "user", "content": "\n".join(user_lines)},
     ]
+
+
+def _normalize_base(self):
+    # strip trailing slash and any accidental /v1
+    import re
+
+    self.base_url = re.sub(r"/v1/?$", "", self.base_url.rstrip("/"))
+
+
+def _messages_to_text(self, messages):
+    # join chat messages into a plain prompt for legacy routes
+    if isinstance(messages, list):
+        parts = []
+        for m in messages:
+            role = m.get("role", "user")
+            content = m.get("content", "")
+            parts.append(f"{role}: {content}".strip())
+        parts.append("assistant:")
+        return "\n".join(parts)
+    return str(messages)
+
+
+def _extract_json_obj(self, text):
+    # be forgiving: try raw json, then fenced blocks, then first {...}
+    import json
+    import re
+
+    text = (text or "").strip()
+    # try direct parse
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+    # try ```json ... ```
+    m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, flags=re.S)
+    if m:
+        try:
+            return json.loads(m.group(1))
+        except Exception:
+            pass
+    # try first json object
+    m = re.search(r"(\{.*\})", text, flags=re.S)
+    if m:
+        try:
+            return json.loads(m.group(1))
+        except Exception:
+            pass
+    raise ValueError("model did not return valid json; got snippet: " + text[:300])
+
+
+def _post_json(self, url, payload):
+    import requests
+
+    headers = {"content-type": "application/json"}
+    if getattr(self, "api_key", None):
+        headers["authorization"] = f"Bearer {self.api_key}"
+    resp = requests.post(url, headers=headers, json=payload, timeout=self.timeout)
+    return resp
+
+
+def _detect_route(self):
+    # detect once: prefer chat → responses → completions
+    if getattr(self, "_route", None):
+        return self._route
+    self._normalize_base()
+    base = self.base_url
+    probes = [
+        ("chat", f"{base}/v1/chat/completions", {"model": self.model, "messages": []}),
+        ("responses", f"{base}/v1/responses", {"model": self.model, "input": ""}),
+        ("comp", f"{base}/v1/completions", {"model": self.model, "prompt": ""}),
+    ]
+    tried = []
+    for tag, url, body in probes:
+        try:
+            r = self._post_json(url, body)
+        except Exception as e:
+            tried.append(f"{url} -> {e}")
+            continue
+        if r.status_code == 404:
+            tried.append(f"{url} -> 404")
+            continue
+        # any non-404 means the route exists (400 is fine for empty body)
+        self._route = (tag, url)
+        return self._route
+    raise RuntimeError("no compatible openai route found. tried:\n" + "\n".join(tried))
+
+
+def _parse_openai_response(self, tag, obj):
+    # unify text extraction for chat/responses/completions
+    # returns plain text content
+    if tag == "chat":
+        # openai chat: choices[0].message.content
+        return obj.get("choices", [{}])[0].get("message", {}).get("content", "")
+    if tag == "comp":
+        # legacy completions: choices[0].text
+        return obj.get("choices", [{}])[0].get("text", "")
+    # responses api
+    # try openai-style 'output_text' first, then compact 'output' arrays
+    if "output_text" in obj:
+        return obj.get("output_text", "")
+    out = obj.get("output", [])
+    # vllm often returns [{"content":[{"type":"output_text","text": "..."}]}]
+    try:
+        for seg in out:
+            content = seg.get("content", [])
+            for c in content:
+                if "text" in c:
+                    return c["text"]
+    except Exception:
+        pass
+    # last resort: some servers also echo choices like chat
+    return obj.get("choices", [{}])[0].get("message", {}).get("content", "")
+
+
+def _chat_json(self, messages):
+    """
+    send messages to the server using whichever openai-style route it supports,
+    then parse the model's reply text and return it as a python dict (json).
+    """
+    tag, url = self._detect_route()
+
+    if tag == "chat":
+        payload = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": 0,
+            "stream": False,
+        }
+    elif tag == "responses":
+        payload = {
+            "model": self.model,
+            # responses api: safest is to pass a compact text input
+            "input": self._messages_to_text(messages),
+            "temperature": 0,
+        }
+    else:  # "comp"
+        payload = {
+            "model": self.model,
+            "prompt": self._messages_to_text(messages),
+            "temperature": 0,
+        }
+
+    r = self._post_json(url, payload)
+
+    # retry once if a 404 slips through due to server reloads
+    if r.status_code == 404:
+        self._route = None
+        tag, url = self._detect_route()
+        r = self._post_json(url, payload)
+
+    if r.status_code >= 400:
+        raise RuntimeError(f"vllm backend http {r.status_code}: {r.text}")
+
+    obj = r.json()
+    text = self._parse_openai_response(tag, obj)
+    return self._extract_json_obj(text)
