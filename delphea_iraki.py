@@ -6,9 +6,15 @@ from __future__ import annotations
 
 import argparse
 import json
+
+# defaults for backend config (env → hard defaults)
+import os
 import re
+import sys
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+import requests
 
 from aggregator import WeightedMeanAggregator
 from dataloader import DataLoader
@@ -185,11 +191,6 @@ def main():
         "--outdir", default="out", help="directory to write one report per case"
     )
     args = parser.parse_args()
-    # defaults for backend config (env → hard defaults)
-    import os
-    import sys
-
-    import requests
 
     if args.base_url is None:
         args.base_url = (
