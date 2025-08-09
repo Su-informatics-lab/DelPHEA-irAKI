@@ -35,6 +35,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict
 
+from expert_validation import PayloadValidationError, call_llm_with_schema
 from llm_backend import LLMBackend
 from models import AssessmentR1, AssessmentR3, DebateTurn
 from schema import load_qids
@@ -144,3 +145,13 @@ class Expert:
         except Exception:
             # never let logging break the pipeline
             pass
+
+    def assess(self, case, round_no: int) -> dict:
+        prompt = self._render_prompt(case, round_no)  # your existing prompt builder
+        try:
+            result = call_llm_with_schema(self.backend, prompt, round_no, max_retries=2)
+            result["_status"] = "ok"
+            return result
+        except PayloadValidationError as e:
+            # fail loud, let moderator decide to re-solicit or drop
+            return {"_status": "invalid_assessment", "_error": str(e)}
