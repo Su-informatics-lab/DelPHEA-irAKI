@@ -1,25 +1,22 @@
 # delphea_iraki.py
 # cli entrypoint wiring config → dataloader → agents → run (single or batch)
-# defaults to vllm backend; --case accepts a plain patient_id string for fast testing.
+# vllm-only client: require explicit --endpoint-url and --model-name. no env fallbacks.
 
 from __future__ import annotations
 
 import argparse
 import json
-import os
+import logging
 import re
-import sys
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
-
-import requests
 
 from aggregator import WeightedMeanAggregator
 from dataloader import DataLoader
 from expert import Expert
-from llm_backend import LLMBackend
 from moderator import Moderator
 from router import FullRouter, SparseRouter
+from schema import load_qids  # for early qid introspection
 from vllm_backend import VLLMBackend
 
 # -------------------- helpers: id parsing & dataloader glue --------------------
@@ -178,15 +175,21 @@ def main() -> None:
         "--router", choices=["sparse", "full"], default="sparse", help="routing mode"
     )
 
-    # backend: default vllm
-    parser.add_argument("--backend", choices=["vllm", "dummy"], default="vllm")
+    # llm endpoint (vllm openai server); explicit, no env fallbacks
     parser.add_argument(
+        "--endpoint-url",
         "--base-url",
-        default=None,
-        help="vllm base url (no /v1), e.g., http://localhost:8000",
+        dest="endpoint_url",
+        required=True,
+        help="openai-compatible endpoint, e.g., http://localhost:8000",
     )
-    parser.add_argument("--model", default=None, help="model name as served by vllm")
-    parser.add_argument("--api-key", default=None, help="optional bearer token")
+    parser.add_argument(
+        "--model-name",
+        "--model",
+        dest="model_name",
+        required=True,
+        help="served model id, e.g., openai/gpt-oss-120b",
+    )
 
     # data loader
     parser.add_argument(
@@ -208,12 +211,51 @@ def main() -> None:
         "--cases", default=None, help="path to .jsonl or .json with list/cases object"
     )
 
-    # output
+    # output & logging
     parser.add_argument(
         "--outdir", default="out", help="directory to write one report per case"
     )
+    parser.add_argument(
+        "--log-level",
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        help="logging verbosity",
+    )
+
+    # optional: just print served models and exit
+    parser.add_argument(
+        "--health-check",
+        action="store_true",
+        help="ping endpoint and print served models, then exit",
+    )
 
     args = parser.parse_args()
+
+    # logging config
+    logging.basicConfig(
+        level=getattr(logging, args.log_level),
+        format="%(asctime)s | %(levelname)s | %(message)s",
+    )
+    log = logging.getLogger("delphea")
+    log.info("starting delphea-iraki")
+    log.info("questionnaire=%s panel=%s", args.questionnaire, args.panel)
+    log.info("endpoint_url=%s model_name=%s", args.endpoint_url, args.model_name)
+
+    # health check mode
+    if args.health_check:
+        import requests
+
+        url = args.endpoint_url.rstrip("/") + "/v1/models"
+        r = requests.get(url, timeout=5)
+        r.raise_for_status()
+        data = r.json()
+        served = [m.get("id") for m in data.get("data", []) if isinstance(m, dict)]
+        print(
+            json.dumps(
+                {"endpoint": args.endpoint_url, "served_models": served}, indent=2
+            )
+        )
+        return
 
     # resolve and sanity check questionnaire/panel
     qpath = Path(args.questionnaire).expanduser().resolve()
@@ -225,115 +267,17 @@ def main() -> None:
     args.questionnaire = str(qpath)
     args.panel = str(ppath)
 
-    # backend settings from env fallbacks
-    if args.base_url is None:
-        args.base_url = (
-            os.getenv("VLLM_ENDPOINT")
-            or os.getenv("VLLM_BASE_URL")
-            or os.getenv("OPENAI_BASE_URL")
-            or "http://127.0.0.1:8000"
-        )
-    # normalize: users sometimes paste a base that already includes /v1
-    args.base_url = re.sub(r"/v1/?$", "", args.base_url.rstrip("/"))
-
-    if args.model is None:
-        args.model = (
-            os.getenv("OPENAI_MODEL")
-            or os.getenv("VLLM_MODEL")
-            or "openai/gpt-oss-120b"
-        )
-
-    # api key (if your vllm server requires it)
-    if args.api_key is None:
-        args.api_key = os.getenv("OPENAI_API_KEY") or os.getenv("VLLM_API_KEY")
-
-    # propagate to env for modules that read from environment
-    os.environ["VLLM_BASE_URL"] = args.base_url
-    os.environ["OPENAI_BASE_URL"] = args.base_url
-    if args.api_key:
-        os.environ["OPENAI_API_KEY"] = args.api_key
-        os.environ["VLLM_API_KEY"] = args.api_key
-    os.environ["OPENAI_MODEL"] = args.model
-    os.environ["VLLM_MODEL"] = args.model
-
-    # fail fast if endpoint/model is wrong (only for vllm backend)
-    if args.backend == "vllm":
-        try:
-            base = args.base_url.rstrip("/")
-            r = requests.get(f"{base}/v1/models", timeout=3)
-            r.raise_for_status()
-            served = {
-                m.get("id") for m in r.json().get("data", []) if isinstance(m, dict)
-            }
-            if args.model not in served:
-                raise RuntimeError(
-                    f"requested model '{args.model}' not served at {base}. "
-                    f"available: {sorted(served) or 'none'}"
-                )
-        except Exception as e:
-            print(f"[fatal] vllm endpoint/model check failed: {e}", file=sys.stderr)
-            sys.exit(2)
-
-    # dataloader (fail fast if data_dir missing and not using dummy)
+    # dataloader (fail fast if data_dir missing)
     loader = DataLoader(data_dir=args.data_dir, use_dummy=args.use_dummy_loader)
     if not loader.is_available():
         raise RuntimeError(
-            "DataLoader is not available. check --data-dir or pass --use-dummy-loader for quick tests."
+            "DataLoader is not available. check --data-dir to point at your dataset."
         )
 
-    # backend selection
-    if args.backend == "vllm":
-        backend = VLLMBackend(
-            model=args.model, base_url=args.base_url, api_key=args.api_key
-        )
-    else:
-        # debugging only
-        from schema import load_qids
-
-        class DummyBackend(LLMBackend):
-            """minimal backend that echoes neutral-but-valid payloads."""
-
-            def assess_round1(self, expert_ctx: Dict[str, Any]) -> Dict[str, Any]:
-                qids = load_qids(expert_ctx["questionnaire_path"])
-                return {
-                    "scores": {q: 7 for q in qids},
-                    "evidence": {q: "placeholder evidence" for q in qids},
-                    "clinical_reasoning": "placeholder reasoning",
-                    "p_iraki": 0.7,
-                    "ci_iraki": [0.6, 0.8],
-                    "confidence": 0.8,
-                    "differential_diagnosis": ["ATIN", "ATN"],
-                    "primary_diagnosis": "irAKI",
-                }
-
-            def assess_round3(self, expert_ctx: Dict[str, Any]) -> Dict[str, Any]:
-                qids = load_qids(expert_ctx["questionnaire_path"])
-                return {
-                    "scores": {q: 8 for q in qids},
-                    "evidence": {q: "updated evidence after debate" for q in qids},
-                    "p_iraki": 0.75,
-                    "ci_iraki": [0.65, 0.85],
-                    "confidence": 0.85,
-                    "changes_from_round1": {"overall": "nudged up after debate"},
-                    "debate_influence": "convinced by nephrology/rheum arguments",
-                    "verdict": True,
-                    "final_diagnosis": "irAKI",
-                    "confidence_in_verdict": 0.85,
-                    "recommendations": [
-                        "hold ICI",
-                        "consider steroids",
-                        "nephrology consult",
-                    ],
-                }
-
-            def debate(self, expert_ctx: Dict[str, Any]) -> Dict[str, Any]:
-                return {
-                    "text": "constructive rebuttal text",
-                    "citations": [],
-                    "satisfied": True,
-                }
-
-        backend = DummyBackend()
+    # backend
+    backend = VLLMBackend(
+        model=args.model_name, base_url=args.endpoint_url, api_key=None
+    )
 
     # experts (reused across cases)
     experts = [
@@ -345,6 +289,7 @@ def main() -> None:
         )
         for ex in _load_panel(args.panel)
     ]
+    log.info("constructed expert panel: %s", [e.expert_id for e in experts])
 
     # router + moderator
     router = SparseRouter() if args.router == "sparse" else FullRouter()
@@ -361,17 +306,71 @@ def main() -> None:
         outdir = Path(args.outdir)
         outdir.mkdir(parents=True, exist_ok=True)
 
+    # precompute qids for nicer logs
+    qids = load_qids(args.questionnaire)
+    log.debug("questionnaire qids: %s", qids)
+
     # run
     results: List[Dict[str, Any]] = []
     for idx, (case_id, case) in enumerate(
         _iter_cases(args.case, args.cases, loader), start=1
     ):
-        report = moderator.run_case(case)
+        log.info(
+            "[case %s] round 1 start — fan-out %d experts × %d qids",
+            case_id,
+            len(experts),
+            len(qids),
+        )
+        r1 = moderator.assess_round(1, case)
+        log.info(
+            "[case %s] round 1 done — received %d/%d assessments",
+            case_id,
+            len(r1),
+            len(experts),
+        )
+        log.debug("[case %s] r1 experts: %s", case_id, [eid for eid, _ in r1])
+
+        log.info("[case %s] debate planning & collection…", case_id)
+        debate_ctx = moderator.detect_and_run_debates(r1, case)
+        solicitations = sum(len(v) for v in debate_ctx.get("debate_plan", {}).values())
+        log.info(
+            "[case %s] debate done — %d solicitations across %d qids",
+            case_id,
+            solicitations,
+            len(debate_ctx.get("debate_plan", {})),
+        )
+
+        log.info("[case %s] round 3 start — reassess all experts", case_id)
+        r3 = moderator.assess_round(3, case, debate_ctx)
+        log.info(
+            "[case %s] round 3 done — received %d/%d assessments",
+            case_id,
+            len(r3),
+            len(experts),
+        )
+
+        log.info("[case %s] aggregation start — WeightedMeanAggregator", case_id)
+        consensus = moderator.aggregator.aggregate([a for _, a in r3])
+        log.info(
+            "[case %s] aggregation done — p=%.3f, ci=%s",
+            case_id,
+            consensus.p_iraki,
+            consensus.ci_iraki,
+        )
+
+        report = {
+            "round1": [(eid, a.model_dump()) for eid, a in r1],
+            "debate": debate_ctx,
+            "round3": [(eid, a.model_dump()) for eid, a in r3],
+            "consensus": consensus.model_dump(),
+        }
         report_with_id = {"case_id": case_id, **report}
+
         if outdir:
             out_path = outdir / f"report_{idx:03d}_{case_id}.json"
             with out_path.open("w", encoding="utf-8") as f:
                 json.dump(report_with_id, f, indent=2)
+            log.info("[case %s] wrote %s", case_id, out_path)
         else:
             results.append(report_with_id)
 
