@@ -195,8 +195,23 @@ async def run_iraki_assessment(case_id: str, runtime_config: RuntimeConfig) -> D
                 runtime_config=runtime_config,
             ),
         )
+        logging.getLogger("assessment").debug(
+            "registered agent %s for case %s", agent_type, case_id
+        )
 
-    logger.info(f"Registered ALL {len(expert_configs)} expert agents")
+    # subscribe each expert to the case topic that the moderator publishes to
+    topic = f"case/{case_id}"
+    for expert_config in expert_configs:
+        agent_type = f"expert_{expert_config['id']}"
+        expert_addr = AgentId(type=agent_type, key=case_id)
+        await runtime.subscribe(expert_addr, topic)
+        logging.getLogger("assessment").info(
+            "✓ subscribed %s to topic %s", f"{agent_type}/{case_id}", topic
+        )
+
+    logger.info(
+        f"Registered ALL {len(expert_configs)} expert agents and subscribed to {topic}"
+    )
 
     # start the runtime
     runtime.start()
