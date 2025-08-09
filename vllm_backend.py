@@ -1,6 +1,6 @@
 # vllm_backend.py
 # minimal openai-compatible client with a simple .generate(prompt) api
-# works with vLLM's server at e.g. http://localhost:8000
+# works with vLLM's server (e.g., http://localhost:8000)
 
 from __future__ import annotations
 
@@ -13,22 +13,25 @@ import requests
 class VLLMBackend:
     """thin client for vLLM's OpenAI-compatible server.
 
-    Args:
-        endpoint_url: base url to the server, e.g. "http://localhost:8000"
-        model_name: model id string exposed by the server
-        timeout: request timeout in seconds
-        api_key: optional bearer token if your server enforces it
+    accepts either 'model' or 'model_name' for compatibility.
     """
 
     def __init__(
         self,
         endpoint_url: str,
-        model_name: str,
+        model_name: Optional[str] = None,
+        *,
+        model: Optional[str] = None,
         timeout: float = 60.0,
         api_key: Optional[str] = None,
+        **_: Any,  # swallow unexpected kwargs from upstream
     ) -> None:
+        # normalize model arg
+        model_id = model_name or model
+        if not model_id:
+            raise ValueError("VLLMBackend requires 'model' (or 'model_name')")
         self.base = endpoint_url.rstrip("/")
-        self.model = model_name
+        self.model = model_id
         self.timeout = timeout
         self.api_key = api_key
 
@@ -53,7 +56,6 @@ class VLLMBackend:
         tries /v1/completions first; if unavailable, falls back to /v1/chat/completions.
         raises RuntimeError with helpful context on HTTP or schema errors.
         """
-        # 1) try /v1/completions
         payload = {
             "model": self.model,
             "prompt": prompt,
@@ -71,7 +73,6 @@ class VLLMBackend:
         if text is not None:
             return text
 
-        # 2) fallback to /v1/chat/completions
         chat_payload = {
             "model": self.model,
             "messages": [{"role": "user", "content": prompt}],
@@ -117,10 +118,9 @@ class VLLMBackend:
             return None
 
         if resp.status_code // 100 != 2:
-            # include small body snippet to aid debugging
-            body = resp.text[:500]
+            body_head = resp.text[:500]
             raise RuntimeError(
-                f"vLLMBackend: HTTP {resp.status_code} for {url}; body head: {body}"
+                f"vLLMBackend: HTTP {resp.status_code} for {url}; body head: {body_head}"
             )
 
         try:
@@ -128,7 +128,6 @@ class VLLMBackend:
         except json.JSONDecodeError as e:
             raise RuntimeError(f"vLLMBackend: non-JSON response from {url}: {e}") from e
 
-        # parse according to mode
         try:
             if mode == "completions":
                 choices = data.get("choices") or []
@@ -136,7 +135,6 @@ class VLLMBackend:
                     return None
                 text = choices[0].get("text")
                 return str(text) if text is not None else None
-            # chat mode
             choices = data.get("choices") or []
             if not choices:
                 return None
