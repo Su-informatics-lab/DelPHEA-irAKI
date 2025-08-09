@@ -19,13 +19,13 @@ Architecture:
 
 Usage:
 ------
-    # Run irAKI assessment for a case
+    # run irAKI assessment for a case
     python delphea_iraki.py --case-id iraki_case_001
 
-    # Health check
+    # health check
     python delphea_iraki.py --health-check
 
-    # Verbose mode
+    # verbose mode
     python delphea_iraki.py --case-id iraki_case_002 --verbose
 
 Clinical Context:
@@ -40,7 +40,7 @@ import asyncio
 import logging
 import sys
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Optional
 
 import httpx
 from autogen_core import AgentId, SingleThreadedAgentRuntime
@@ -55,7 +55,9 @@ from orchestration.agents.moderator import irAKIModeratorAgent
 from orchestration.clients import VLLMClient
 from orchestration.messages import StartCase
 
-# configure logging format
+# -----------------------
+# Logging configuration
+# -----------------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -79,15 +81,100 @@ for h in logging.getLogger().handlers:
     h.addFilter(_Trunc(300))
 
 
+# -----------------------
+# Helpers (CLI summary & export loading)
+# -----------------------
+def print_cli_summary(case_id: str) -> None:
+    import glob
+    import json
+    import os
+
+    pattern = f"iraki_consensus_{case_id}_*.json"
+    paths = sorted(glob.glob(pattern), key=os.path.getmtime, reverse=True)
+    if not paths:
+        print("\nNo export file found for CLI summary.")
+        print(f"Looked for: {pattern}")
+        return
+
+    path = paths[0]
+    with open(path, "r") as f:
+        data = json.load(f)
+
+    fc = data.get("final_consensus", {})
+    p = fc.get("p_iraki")
+    ci = fc.get("ci_95") or [None, None]
+    conf = fc.get("confidence")
+    maj = data.get("majority_verdict", None)
+
+    r3 = [r for r in data.get("expert_assessments", []) if r.get("round") == "round3"]
+    r1_by_expert = {
+        r["expert_id"]: r
+        for r in data.get("expert_assessments", [])
+        if r.get("round") == "round1"
+    }
+
+    # Prefer thresholded verdict if present; else fall back to llm verdict
+    votes = sum(1 for r in r3 if r.get("verdict_from_prob", r.get("verdict_llm")))
+    total = len(r3)
+    label = "irAKI" if maj else "Other AKI"
+
+    print("\n==================== irAKI CONSENSUS SUMMARY ====================")
+    print(f"Case: {case_id}")
+    if p is not None and ci[0] is not None and ci[1] is not None:
+        print(f"Pooled P(irAKI): {p:.3f}   95% CI [{ci[0]:.3f}, {ci[1]:.3f}]")
+    if conf is not None:
+        print(f"Consensus confidence: {conf:.3f}")
+    if total:
+        print(f"Majority vote: {label} ({votes}/{total})")
+    print("\nPer-expert Round 3:")
+    for r in r3:
+        ex = r["expert_id"]
+        p3 = r.get("p_iraki")
+        c3 = r.get("confidence")
+        v = r.get("verdict_from_prob", r.get("verdict_llm"))
+        # compute delta vs R1 if we have it
+        d_p = None
+        if ex in r1_by_expert and isinstance(p3, (int, float)):
+            p1 = r1_by_expert[ex].get("p_iraki")
+            if isinstance(p1, (int, float)):
+                d_p = p3 - p1
+
+        dp_str = ""
+        if isinstance(d_p, (int, float)):
+            sign = "+" if d_p >= 0 else ""
+            dp_str = f" ({sign}{d_p:.2f} vs R1)"
+
+        p_str = f"{p3:.2f}" if isinstance(p3, (int, float)) else "NA"
+        c_str = f"{c3:.2f}" if isinstance(c3, (int, float)) else "NA"
+        v_str = "irAKI" if v else "Other"
+
+        print(f"  - {ex:<12} p={p_str}{dp_str}  conf={c_str}  verdict={v_str}")
+
+    print("================================================================\n")
+    print(f"Loaded export: {path}")
+
+
+def load_latest_export(case_id: str) -> Optional[Dict]:
+    import glob
+    import json
+    import os
+
+    paths = sorted(
+        glob.glob(f"iraki_consensus_{case_id}_*.json"),
+        key=os.path.getmtime,
+        reverse=True,
+    )
+    if not paths:
+        return None
+    with open(paths[0], "r") as f:
+        return json.load(f)
+
+
+# -----------------------
+# Health check
+# -----------------------
 async def run_health_check(runtime_config: RuntimeConfig) -> bool:
-    """Run system health check.
-
-    Args:
-        runtime_config: Runtime configuration
-
-    Returns:
-        bool: True if all checks pass
-    """
+    """Run system health check."""
     logger = logging.getLogger("health_check")
     logger.info("Starting health check...")
 
@@ -95,7 +182,7 @@ async def run_health_check(runtime_config: RuntimeConfig) -> bool:
 
     # check 1: configuration files
     try:
-        config_loader = ConfigurationLoader(runtime_config)
+        _ = ConfigurationLoader(runtime_config)
         logger.info("✓ Configuration files loaded")
     except Exception as e:
         logger.error(f"✗ Configuration loading failed: {e}")
@@ -142,17 +229,11 @@ async def run_health_check(runtime_config: RuntimeConfig) -> bool:
     return checks_passed
 
 
+# -----------------------
+# Main assessment runner
+# -----------------------
 async def run_iraki_assessment(case_id: str, runtime_config: RuntimeConfig) -> Dict:
-    """Run irAKI assessment for a patient case.
-
-    Args:
-        case_id: Patient case identifier
-        runtime_config: Runtime configuration
-
-    Returns:
-        Dict: Assessment results with consensus probability and recommendations
-    """
-
+    """Run irAKI assessment for a patient case."""
     logger = logging.getLogger("assessment")
     logger.info(f"Starting irAKI assessment for case: {case_id}")
 
@@ -166,16 +247,11 @@ async def run_iraki_assessment(case_id: str, runtime_config: RuntimeConfig) -> D
     )
 
     # load patient case
-    try:
-        patient_case = data_loader.load_patient_case(case_id)
-        logger.info(
-            f"Loaded case: {patient_case['case_id']}, "
-            f"data preview: {str(patient_case)[:200]}..."
-        )
-
-    except ValueError as e:
-        logger.error(f"Failed to load case {case_id}: {e}")
-        raise
+    patient_case = data_loader.load_patient_case(case_id)
+    logger.info(
+        f"Loaded case: {patient_case['case_id']}, "
+        f"data preview: {str(patient_case)[:200]}..."
+    )
 
     # create runtime for agents
     runtime = SingleThreadedAgentRuntime()
@@ -247,14 +323,26 @@ async def run_iraki_assessment(case_id: str, runtime_config: RuntimeConfig) -> D
     await runtime.close()
     logger.info("Runtime closed; all agents cleaned up")
 
-    # return results (placeholder for now)
-    return {
-        "case_id": case_id,
-        "status": "completed",
-        "consensus": "Assessment complete - results would be here",
-    }
+    # Print CLI summary (safe)
+    try:
+        print_cli_summary(case_id)
+    except Exception as e:
+        print(f"\n[CLI summary] Skipped due to error: {e}")
+
+    # Return real results from the latest export (no more placeholder)
+    export = load_latest_export(case_id)
+    results: Dict = {"case_id": case_id, "status": "completed"}
+    if export:
+        results["final_consensus"] = export.get("final_consensus")
+        results["majority_verdict"] = export.get("majority_verdict")
+    else:
+        results["note"] = "No export found; summary unavailable."
+    return results
 
 
+# -----------------------
+# CLI
+# -----------------------
 def main():
     """Main entry point for DelPHEA-irAKI."""
     parser = argparse.ArgumentParser(
@@ -299,7 +387,7 @@ def main():
         logging.getLogger().setLevel(logging.DEBUG)
 
     # import here to avoid circular imports
-    from config.core import DelphiConfig, InfrastructureConfig
+    from config.core import InfrastructureConfig
 
     # create infrastructure config
     infrastructure_config = InfrastructureConfig()
@@ -308,18 +396,17 @@ def main():
     if args.local_model:
         infrastructure_config.endpoint_type = InfrastructureConfig.ENDPOINT_LOCAL
     elif args.vllm_endpoint:
-        # determine endpoint type based on the URL
+        # heuristic: pick a type based on url; default to local if unknown
         if "tempest" in args.vllm_endpoint:
             infrastructure_config.endpoint_type = InfrastructureConfig.ENDPOINT_TEMPEST
         elif "172.31" in args.vllm_endpoint:
             infrastructure_config.endpoint_type = InfrastructureConfig.ENDPOINT_AWS
             infrastructure_config.aws_endpoint = args.vllm_endpoint
         else:
-            # default to local for custom endpoints
             infrastructure_config.endpoint_type = InfrastructureConfig.ENDPOINT_LOCAL
             infrastructure_config.local_endpoint = args.vllm_endpoint
 
-    # create runtime configuration - CORRECT WAY
+    # create runtime configuration
     runtime_config = RuntimeConfig(
         infrastructure=infrastructure_config,
         use_real_data=args.use_real_data,
@@ -343,13 +430,11 @@ def main():
 
             # Show available patients
             try:
-                from dataloader import DataLoader
-
                 loader = DataLoader(use_dummy=not args.use_real_data)
                 patients = loader.get_available_patients(limit=5)
                 for pid in patients:
                     print(f"  - {pid}")
-            except:
+            except Exception:
                 print("  - iraki_case_001 (dummy)")
 
             sys.exit(0)
@@ -360,15 +445,11 @@ def main():
 
     elif args.case_id:
         try:
-            # Create DelphiConfig (no expert_count)
-            delphi_config = DelphiConfig()
-
             print(f"Starting assessment for case: {args.case_id}")
             print(f"Mode: {'Local/Mock' if args.local_model else 'vLLM'}")
             print(f"Data: {'Real' if args.use_real_data else 'Dummy'}")
 
             results = asyncio.run(run_iraki_assessment(args.case_id, runtime_config))
-
             print(f"\nAssessment Results:\n{results}")
         except Exception as e:
             logging.error(f"Assessment failed: {e}")
