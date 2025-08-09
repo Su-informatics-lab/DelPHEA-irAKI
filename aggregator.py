@@ -14,7 +14,7 @@ from typing import Any, Dict, Iterable, List, Tuple
 class AggregationResult:
     """lightweight container for consensus outputs.
 
-    Attributes:
+    attributes:
         iraki_probability: pooled probability of irAKI in [0, 1]
         ci_iraki: 95% interval as (lower, upper), clipped to [0, 1]
         verdict: boolean decision using a threshold on pooled probability
@@ -44,8 +44,8 @@ class WeightedMeanAggregator:
     statistical notes:
     - pooled mean: m = sum_i w_i * p_i / sum_i w_i
     - between-expert variance (B): sum_i w_i * (p_i - m)^2 / sum_i w_i
-    - within-expert variance (W): derived from each expert's ci via normal approx:
-        sigma_i ≈ (upper_i - lower_i) / (2 * z), with z = 1.96
+    - within-expert variance (W): from each expert's ci via normal approx:
+        sigma_i ≈ (upper_i - lower_i) / (2 * z), z = 1.96
       then W = sum_i w_i * sigma_i^2 / sum_i w_i
     - total variance V = B + W; 95% interval m ± z * sqrt(V), clipped to [0, 1]
     """
@@ -61,17 +61,17 @@ class WeightedMeanAggregator:
     def aggregate(self, expert_results: Iterable[Dict[str, Any]]) -> AggregationResult:
         """aggregate expert assessments into a consensus.
 
-        Args:
+        args:
             expert_results: iterable of expert payloads (dicts) with keys:
                 - "_status": "ok" when validated upstream
                 - "p_iraki": float in [0, 1]
                 - "ci_iraki": [lower, upper], both in [0, 1]
                 - "confidence": float in [0, 1]
 
-        Returns:
+        returns:
             AggregationResult with pooled probability and 95% interval.
 
-        Raises:
+        raises:
             ValueError: if no valid assessments are provided.
         """
         valid = [r for r in expert_results if self._is_valid(r)]
@@ -156,21 +156,47 @@ class WeightedMeanAggregator:
         """
         lo, hi = float(ci[0]), float(ci[1])
         width = max(0.0, hi - lo)
-        # if width is 0, return a small variance to prevent degenerate intervals
         if width <= 0.0:
             return 1e-6
         sigma = width / (2.0 * self.z)
-        # cap minimum sigma to avoid unrealistically tiny intervals
         return max(sigma * sigma, 1e-6)
 
 
-# optional convenience function for legacy callers
+# legacy-compatible wrapper expected by moderator.py
+class Aggregator:
+    """legacy facade so existing imports `from aggregator import Aggregator` keep working.
+
+    aggregate() returns a dict shaped like the historical 'consensus' block.
+    use aggregate_result() if you prefer the typed AggregationResult.
+    """
+
+    def __init__(self, decision_threshold: float = 0.5) -> None:
+        self._impl = WeightedMeanAggregator(decision_threshold=decision_threshold)
+
+    def aggregate(self, expert_results: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
+        res = self._impl.aggregate(expert_results)
+        return _result_as_dict(res)
+
+    # optional helper if callers want the object form
+    def aggregate_result(
+        self, expert_results: Iterable[Dict[str, Any]]
+    ) -> AggregationResult:
+        return self._impl.aggregate(expert_results)
+
+
+# convenience function for legacy callers
 def aggregate_consensus(
     expert_results: Iterable[Dict[str, Any]], decision_threshold: float = 0.5
 ) -> Dict[str, Any]:
-    """legacy api: returns dict shaped like previous 'consensus' block."""
     agg = WeightedMeanAggregator(decision_threshold=decision_threshold)
     res = agg.aggregate(expert_results)
+    return _result_as_dict(res)
+
+
+# ------------------------------ utils -----------------------------------------
+
+
+def _result_as_dict(res: AggregationResult) -> Dict[str, Any]:
     return {
         "iraki_probability": res.iraki_probability,
         "verdict": res.verdict,
@@ -186,8 +212,7 @@ if __name__ == "__main__":
     demo = [
         {"_status": "ok", "p_iraki": 0.8, "ci_iraki": [0.7, 0.86], "confidence": 0.8},
         {"_status": "ok", "p_iraki": 0.5, "ci_iraki": [0.3, 0.7], "confidence": 0.5},
-        {"_status": "ok", "p_iraki": 0.0, "ci_iraki": [0.0, 0.05], "confidence": 0.0},
-        {"_status": "invalid_assessment"},  # should be dropped
+        {"_status": "ok", "p_iraki": 0.0, "ci_iraki": [0.0, 0.05], "confidence": 0.2},
+        {"_status": "invalid_assessment"},  # dropped
     ]
-    consensus = aggregate_consensus(demo, decision_threshold=0.5)
-    print(consensus)
+    print(Aggregator().aggregate(demo))
