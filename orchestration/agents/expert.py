@@ -360,11 +360,27 @@ class irAKIExpertAgent(RoutedAgent):
 
         # rpc to moderator
         target = AgentId(type="moderator", key=message.case_id)
-        ack = await ctx.call_rpc(target, method, reply)
+        ack = await self._rpc(ctx, target, method, reply)
+
         if not ack.ok:
             raise RuntimeError(f"moderator rejected {method}: {ack.message}")
 
         self.logger.info(f"Submitted {message.round_phase} assessment")
+
+    async def _rpc(
+        self, ctx: MessageContext, target: AgentId, method: str, payload: Any
+    ):
+        # autogen_core compatibility across versions
+        fn = getattr(ctx, "rpc", None) or getattr(ctx, "call_rpc", None)
+        if callable(fn):
+            return await fn(target, method, payload)
+        # some builds hang it off ctx.runtime
+        runtime = getattr(ctx, "runtime", None)
+        if runtime and hasattr(runtime, "rpc") and callable(runtime.rpc):
+            return await runtime.rpc(target, method, payload)
+        if runtime and hasattr(runtime, "call_rpc") and callable(runtime.call_rpc):
+            return await runtime.call_rpc(target, method, payload)
+        raise RuntimeError("RPC not available on MessageContext/runtime")
 
     @message_handler
     async def handle_debate_prompt(
