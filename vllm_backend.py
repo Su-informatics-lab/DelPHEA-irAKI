@@ -16,6 +16,96 @@ from llm_backend import LLMBackend
 from schema import load_qids
 
 
+def _build_round_prompt(
+    phase: str,
+    persona: Dict[str, Any],
+    case: Dict[str, Any],
+    qids: list[str],
+    debate_context: Dict[str, Any] | None = None,
+) -> List[Dict[str, str]]:
+    system = (
+        "you are a clinical expert. respond in strict json only. "
+        "do not include any text outside valid json."
+    )
+    user_lines = [
+        f"specialty: {persona.get('specialty','unknown')}",
+        f"phase: {phase}",
+        "case: (summarized json below)",
+        json.dumps(case)[:4000],
+        "",
+        "question_ids (answer for each id):",
+        ", ".join(qids),
+        "",
+    ]
+    if phase == "round1":
+        user_lines += [
+            "output schema:",
+            json.dumps(
+                {
+                    "scores": {qid: "int 1..9" for qid in qids},
+                    "evidence": {qid: "string" for qid in qids},
+                    "clinical_reasoning": "string",
+                    "p_iraki": "float 0..1",
+                    "ci_iraki": [0.1, 0.9],
+                    "confidence": 0.7,
+                    "differential_diagnosis": ["string", "string"],
+                    "primary_diagnosis": "string",
+                }
+            ),
+        ]
+    else:
+        user_lines += [
+            "debate context:",
+            json.dumps(debate_context or {})[:2000],
+            "output schema:",
+            json.dumps(
+                {
+                    "scores": {qid: "int 1..9" for qid in qids},
+                    "evidence": {qid: "string" for qid in qids},
+                    "p_iraki": 0.5,
+                    "ci_iraki": [0.2, 0.8],
+                    "confidence": 0.7,
+                    "changes_from_round1": {"summary": "string"},
+                    "debate_influence": "string",
+                    "verdict": True,
+                    "final_diagnosis": "string",
+                    "confidence_in_verdict": 0.7,
+                    "recommendations": ["string"],
+                }
+            ),
+        ]
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": "\n".join(user_lines)},
+    ]
+
+
+def _build_debate_prompt(
+    persona: Dict[str, Any],
+    qid: str,
+    clinical_context: Dict[str, Any],
+    minority_view: str,
+) -> List[Dict[str, str]]:
+    system = (
+        "you are a clinical expert debating a disputed question. "
+        "respond in strict json only."
+    )
+    user_lines = [
+        f"specialty: {persona.get('specialty','unknown')}",
+        f"qid: {qid}",
+        "clinical context:",
+        json.dumps(clinical_context)[:3000],
+        "minority view summary:",
+        minority_view[:2000],
+        "output schema:",
+        json.dumps({"text": "string", "citations": ["string"], "satisfied": True}),
+    ]
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": "\n".join(user_lines)},
+    ]
+
+
 def _ensure_json_dict(s: str) -> Dict[str, Any]:
     try:
         obj = json.loads(s)
