@@ -1,40 +1,11 @@
 """
-expert agent: specialty‑conditioned assessor that emits strictly validated json.
-
-role
-----
-an expert is a lightweight wrapper over an llm/back‑end prompt that:
-- consumes case context + questionnaire
-- emits round‑1 json (scores, evidence, p_iraki, ci_iraki, confidence, differentials)
-- emits round‑3 json (updated scores, changes_from_round1, debate_influence, verdict,
-  final_diagnosis, recommendations)
-- emits debate turns (text, citations, satisfied)
-
-contracts (fail‑fast)
----------------------
-- round 1/3 outputs must conform to pydantic models in `models.py`
-  (AssessmentR1 / AssessmentR3), with:
-  - scores: dict[qid] -> int in 1..9
-  - evidence: dict[qid] -> str (non‑empty)
-  - p_iraki in [0,1], ci_iraki = [lo, hi] with 0<=lo<=p<=hi<=1
-  - confidence in [0,1]
-  - r3 adds: changes_from_round1, debate_influence, verdict, final_diagnosis,
-    confidence_in_verdict, recommendations
-- debate output follows `DebateTurn` (text, citations, satisfied)
-- strict schema echo: qids must exactly match those in the questionnaire; moderator enforces this
-
-implementation notes
---------------------
-- prompt text blocks live in json files under prompts/.
-- this class uses a guarded llm→json→validate loop via validators.call_llm_with_schema.
-- transport is abstracted behind `LLMBackend`; it must expose .generate(str)->str and .debate(payload)->dict.
-- errors fail fast; the moderator may retry with a repair hint or auto‑repair as a last resort.
+expert agent: specialty-conditioned assessor that emits strictly validated json.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from llm_backend import LLMBackend
 from models import AssessmentR1, AssessmentR3, DebateTurn
@@ -44,7 +15,7 @@ from validators import call_llm_with_schema
 
 
 class Expert:
-    """specialty‑conditioned assessor with strict schema validation."""
+    """specialty-conditioned assessor with strict schema validation."""
 
     def __init__(
         self,
@@ -54,15 +25,7 @@ class Expert:
         backend: LLMBackend,
         prompts_path: str = "prompts/expert_prompts.json",
     ) -> None:
-        """initialize an expert wrapper.
-
-        args:
-            expert_id: stable identifier for the expert.
-            specialty: clinical specialty (e.g., nephrology, oncology).
-            persona: dict carrying persona details from panel.json.
-            backend: llm transport with .generate() and .debate().
-            prompts_path: path to json prompt templates (kept for compatibility).
-        """
+        """initialize an expert wrapper."""
         if not expert_id:
             raise ValueError("expert_id cannot be empty")
         if backend is None:
@@ -82,11 +45,9 @@ class Expert:
         self,
         case: Dict[str, Any],
         questionnaire_path: str,
-        repair_hint: Optional[
-            str
-        ] = None,  # kept for api stability; unused by formatter
+        repair_hint: Optional[str] = None,  # reserved for future use
     ) -> AssessmentR1:
-        """produce a round‑1 assessment using json prompts + guarded validation."""
+        """produce a round-1 assessment using json prompts + guarded validation."""
         qids = load_qids(questionnaire_path)
         info = self._extract_case_strings(case)
         prompt = format_round1_prompt(
@@ -112,11 +73,9 @@ class Expert:
         case: Dict[str, Any],
         questionnaire_path: str,
         debate_context: Dict[str, Any],
-        repair_hint: Optional[
-            str
-        ] = None,  # kept for api stability; unused by formatter
+        repair_hint: Optional[str] = None,  # reserved for future use
     ) -> AssessmentR3:
-        """produce a round‑3 reassessment using json prompts + guarded validation."""
+        """produce a round-3 reassessment using json prompts + guarded validation."""
         qids = load_qids(questionnaire_path)
         info = self._extract_case_strings(case)
         prompt = format_round3_prompt(
@@ -165,53 +124,119 @@ class Expert:
     def _expert_name(self) -> str:
         """derive display name for prompts."""
         name = self.persona.get("name") or self.persona.get("display_name") or ""
-        return name if isinstance(name, str) and name.strip() else self.expert_id
+        return (
+            name.strip() if isinstance(name, str) and name.strip() else self.expert_id
+        )
 
-    def _extract_case_strings(self, case: Dict[str, Any]) -> Dict[str, str]:
-        """normalize required text fields from heterogeneous case dicts; fail fast."""
-        if not isinstance(case, dict):
-            raise ValueError("case must be a dict")
+    def _flatten_dict_lines(
+        self, d: Dict[str, Any], allow_keys: Optional[List[str]] = None
+    ) -> str:
+        """turn a small dict into stable 'k: v' lines; optionally filter keys."""
+        if not isinstance(d, dict):
+            return str(d)
+        items = d.items()
+        if allow_keys:
+            allow = set(allow_keys)
+            items = [(k, v) for k, v in d.items() if k in allow]
+        return "\n".join(
+            f"{k}: {v}" for k, v in items if v is not None and str(v).strip()
+        )
 
-        # id
-        cid = case.get("case_id") or case.get("id")
-        if not cid:
-            raise ValueError("case_id is required in case payload")
+    def _coerce_demographics(self, case: Dict[str, Any]) -> str:
+        """derive a demographics text block from multiple possible case layouts."""
+        # explicit text provided
+        if case.get("demographics_text"):
+            return str(case["demographics_text"]).strip()
 
-        # demographics: accept preformatted text or dict
-        if "demographics_text" in case and case["demographics_text"]:
-            demo = str(case["demographics_text"])
-        elif "demographics" in case and case["demographics"] is not None:
-            demo_val = case["demographics"]
-            if isinstance(demo_val, dict):
-                demo = "\n".join(f"{k}: {v}" for k, v in demo_val.items())
-            else:
-                demo = str(demo_val)
-        else:
-            raise ValueError(
-                "demographics_text|demographics is required in case payload"
-            )
+        # simple dict field
+        if isinstance(case.get("demographics"), dict):
+            return self._flatten_dict_lines(case["demographics"])
+        if "demographics" in case and isinstance(case["demographics"], str):
+            return case["demographics"].strip()
 
-        # clinical notes: prefer pre‑aggregated
-        notes: Optional[str]
+        # common fallbacks seen in loaders
+        candidates = [
+            ("person", None),
+            ("patient", None),
+            ("patient_info", None),
+            ("person_demographics", None),
+            ("summary", "demographics"),
+            ("meta", "demographics"),
+            ("profile", None),
+        ]
+        for top, sub in candidates:
+            if top in case and case[top] is not None:
+                node = case[top]
+                if sub and isinstance(node, dict) and node.get(sub):
+                    val = node[sub]
+                    if isinstance(val, dict):
+                        return self._flatten_dict_lines(val)
+                    return str(val).strip()
+                if isinstance(node, dict):
+                    # prefer common keys if present
+                    txt = self._flatten_dict_lines(
+                        node, allow_keys=["age", "sex", "gender", "race", "ethnicity"]
+                    )
+                    if txt:
+                        return txt
+
+        # last-resort, non-failing placeholder (we don't crash on missing demographics)
+        return "demographics: not available in source case"
+
+    def _coerce_notes(self, case: Dict[str, Any]) -> str:
+        """normalize aggregated clinical notes into a single bounded string."""
         if case.get("notes_agg"):
-            notes = str(case["notes_agg"])
+            notes_val = case["notes_agg"]
         elif case.get("clinical_notes"):
-            notes = str(case["clinical_notes"])
+            notes_val = case["clinical_notes"]
         elif case.get("notes_text"):
-            notes = str(case["notes_text"])
+            notes_val = case["notes_text"]
         else:
             raise ValueError(
                 "notes_agg|clinical_notes|notes_text is required in case payload"
             )
 
-        # clamp very long inputs to protect token budget while preserving signal
-        if isinstance(notes, str) and len(notes) > 16000:
+        if isinstance(notes_val, list):
+            # accept list[str] or list[dict-like] with 'text'
+            parts: List[str] = []
+            for item in notes_val:
+                if isinstance(item, str):
+                    parts.append(item)
+                elif isinstance(item, dict):
+                    t = item.get("text") or item.get("note") or ""
+                    if t:
+                        parts.append(str(t))
+            notes = "\n---\n".join(p for p in parts if p.strip())
+        else:
+            notes = str(notes_val)
+
+        if len(notes) > 16000:
             notes = notes[:16000] + "\n...[truncated]"
+        return notes
+
+    def _extract_case_strings(self, case: Dict[str, Any]) -> Dict[str, str]:
+        """normalize required text fields from heterogeneous case dicts."""
+        if not isinstance(case, dict):
+            raise ValueError("case must be a dict")
+
+        cid = (
+            case.get("case_id")
+            or case.get("id")
+            or case.get("patient_id")
+            or case.get("person_id")
+        )
+        if not cid:
+            raise ValueError(
+                "case_id|id|patient_id|person_id is required in case payload"
+            )
+
+        demo = self._coerce_demographics(case)
+        notes = self._coerce_notes(case)
 
         return {"case_id": str(cid), "demographics": demo, "clinical_notes": notes}
 
     def _log_preview(self, obj: Any, tag: str) -> None:
-        """log a short preview of backend output for debugging (best‑effort)."""
+        """log a short preview of backend output for debugging (best-effort)."""
         try:
             s = str(obj)
             self.logger.debug("%s %s", tag, s[:500])
