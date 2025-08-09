@@ -175,20 +175,18 @@ def main() -> None:
         "--router", choices=["sparse", "full"], default="sparse", help="routing mode"
     )
 
-    # llm endpoint (vllm openai server); explicit, no env fallbacks
     parser.add_argument(
-        "--endpoint-url",
-        "--base-url",
+        "--endpoint",
         dest="endpoint_url",
-        required=True,
-        help="openai-compatible endpoint, e.g., http://localhost:8000",
+        default="http://localhost:8000",  # default: local vLLM
+        help="openai-compatible base URL (no trailing /v1), e.g., http://localhost:8000",
     )
+
     parser.add_argument(
-        "--model-name",
         "--model",
         dest="model_name",
-        required=True,
-        help="served model id, e.g., openai/gpt-oss-120b",
+        default="openai/gpt-oss-120b",  # default: oss model served in your cluster
+        help="served model id as shown by /v1/models, e.g., openai/gpt-oss-120b",
     )
 
     # data loader
@@ -230,6 +228,15 @@ def main() -> None:
     )
 
     args = parser.parse_args()
+
+    # sanity
+    args.endpoint_url = re.sub(r"/v1/?$", "", args.endpoint_url.rstrip("/"))
+    if not re.match(r"^https?://", args.endpoint_url):
+        raise ValueError(
+            f"--endpoint must start with http:// or https:// (got {args.endpoint_url!r})"
+        )
+    if not args.model_name.strip():
+        raise ValueError("--model/--model-name cannot be empty")
 
     # logging config
     logging.basicConfig(
