@@ -40,7 +40,7 @@ import time
 from typing import Dict, List, Set
 
 import numpy as np
-from autogen_core import MessageContext, RoutedAgent, TopicId, message_handler, rpc
+from autogen_core import AgentId, MessageContext, RoutedAgent, message_handler, rpc
 
 from config.core import DelphiConfig
 from config.loader import ConfigurationLoader
@@ -85,6 +85,7 @@ class irAKIModeratorAgent(RoutedAgent):
         self._config_loader = config_loader
         self._data_loader = data_loader
         self._delphi_config = delphi_config
+        self._ctx = None
 
         # use expert_count from config to select subset
         all_expert_ids = [
@@ -121,6 +122,9 @@ class irAKIModeratorAgent(RoutedAgent):
         """
         self.logger.info(f"=== STARTING DELPHI PROCESS FOR CASE {message.case_id} ===")
 
+        # hold onto ctx for later direct sends
+        self._ctx = ctx
+
         # load patient data
         patient_data = self._data_loader.load_patient_case(message.case_id)
 
@@ -133,6 +137,9 @@ class irAKIModeratorAgent(RoutedAgent):
     async def _run_round1(self) -> None:
         """Execute Round 1: Independent expert assessments."""
         self.logger.info("=== ROUND 1: Independent Expert Assessments ===")
+
+        if self._ctx is None:
+            raise RuntimeError("moderator context not initialized before round 1")
 
         # load questions from configuration
         questions = self._config_loader.get_questions()
@@ -154,10 +161,19 @@ class irAKIModeratorAgent(RoutedAgent):
             questions=questions,
         )
 
-        # broadcast to all experts via topic
-        await self.publish_message(questionnaire, TopicId("case", self._case_id))
+        # direct-send to each expert (no pub/sub)
+        for ex_id in self._expert_ids:
+            target = AgentId(type=f"expert_{ex_id}", key=self._case_id)
+            await self._ctx.send_message(questionnaire, target)
+            self.logger.info(
+                "→ sent Round 1 questionnaire to %s (agent=%s/%s)",
+                ex_id,
+                target.type,
+                target.key,
+            )
+
         self.logger.info(
-            f"Broadcast Round 1 questionnaire to {len(self._expert_ids)} experts"
+            "Broadcast (direct) complete to %d experts", len(self._expert_ids)
         )
 
         # wait for responses with timeout
@@ -249,6 +265,68 @@ class irAKIModeratorAgent(RoutedAgent):
 
         # proceed to Round 3
         await self._run_round3()
+
+    async def _run_single_debate(self, q_id: str, conflict_info: Dict) -> None:
+        """Run debate for a single conflicting question.
+
+        Args:
+            q_id: Question identifier
+            conflict_info: Conflict details
+        """
+        self.logger.info(
+            f"Starting debate for question {q_id} "
+            f"(range: {conflict_info['score_range']}, "
+            f"severity: {conflict_info['conflict_severity']})"
+        )
+
+        if self._ctx is None:
+            raise RuntimeError("moderator context not initialized before debate")
+
+        # create debate prompt
+        debate_prompt = DebatePrompt(
+            case_id=self._case_id,
+            q_id=q_id,
+            question=conflict_info["question"],
+            score_distribution=conflict_info["score_distribution"],
+            score_range=conflict_info["score_range"],
+            conflict_severity=conflict_info["conflict_severity"],
+            conflicting_evidence=conflict_info["conflicting_evidence"],
+            clinical_importance=conflict_info["clinical_importance"],
+        )
+
+        # send only to experts actually involved in the conflict (fallback to all if empty)
+        participants = (
+            list(conflict_info["score_distribution"].keys()) or self._expert_ids
+        )
+        for ex_id in participants:
+            target = AgentId(type=f"expert_{ex_id}", key=self._case_id)
+            await self._ctx.send_message(debate_prompt, target)
+            self.logger.info(
+                "→ sent debate prompt for %s to %s (agent=%s/%s)",
+                q_id,
+                ex_id,
+                target.type,
+                target.key,
+            )
+
+        # simple debate timeout (in production, would track actual comments)
+        await asyncio.sleep(min(30, self._delphi_config.debate_timeout))
+
+        # terminate debate
+        terminate_msg = TerminateDebate(
+            case_id=self._case_id,
+            q_id=q_id,
+            reason="timeout",  # simplified for now
+        )
+        for ex_id in participants:
+            target = AgentId(type=f"expert_{ex_id}", key=self._case_id)
+            await self._ctx.send_message(terminate_msg, target)
+
+        # store debate summary (simplified)
+        self._debate_summaries[q_id] = (
+            f"Debate conducted on question {q_id} with {conflict_info['conflict_severity']} "
+            f"conflict (score range: {conflict_info['score_range']})"
+        )
 
     def _identify_conflicts(self) -> Dict[str, Dict]:
         """Identify questions with significant disagreement using category method.
@@ -344,54 +422,12 @@ class irAKIModeratorAgent(RoutedAgent):
 
         return conflicts
 
-    async def _run_single_debate(self, q_id: str, conflict_info: Dict) -> None:
-        """Run debate for a single conflicting question.
-
-        Args:
-            q_id: Question identifier
-            conflict_info: Conflict details
-        """
-        self.logger.info(
-            f"Starting debate for question {q_id} "
-            f"(range: {conflict_info['score_range']}, "
-            f"severity: {conflict_info['conflict_severity']})"
-        )
-
-        # create debate prompt
-        debate_prompt = DebatePrompt(
-            case_id=self._case_id,
-            q_id=q_id,
-            question=conflict_info["question"],
-            score_distribution=conflict_info["score_distribution"],
-            score_range=conflict_info["score_range"],
-            conflict_severity=conflict_info["conflict_severity"],
-            conflicting_evidence=conflict_info["conflicting_evidence"],
-            clinical_importance=conflict_info["clinical_importance"],
-        )
-
-        # broadcast to experts involved in conflict
-        await self.publish_message(debate_prompt, TopicId("case", self._case_id))
-
-        # simple debate timeout (in production, would track actual comments)
-        await asyncio.sleep(min(30, self._delphi_config.debate_timeout))
-
-        # terminate debate
-        terminate_msg = TerminateDebate(
-            case_id=self._case_id,
-            q_id=q_id,
-            reason="timeout",  # simplified for now
-        )
-        await self.publish_message(terminate_msg, TopicId("case", self._case_id))
-
-        # store debate summary (simplified)
-        self._debate_summaries[q_id] = (
-            f"Debate conducted on question {q_id} with {conflict_info['conflict_severity']} "
-            f"conflict (score range: {conflict_info['score_range']})"
-        )
-
     async def _run_round3(self) -> None:
         """Execute Round 3: Final consensus assessments."""
         self.logger.info("=== ROUND 3: Final Consensus Assessments ===")
+
+        if self._ctx is None:
+            raise RuntimeError("moderator context not initialized before round 3")
 
         # prepare for responses
         self._pending_round3 = set(self._expert_ids)
@@ -419,9 +455,20 @@ class irAKIModeratorAgent(RoutedAgent):
             debate_summary=debate_summary,
         )
 
-        # broadcast to all experts
-        await self.publish_message(questionnaire, TopicId("case", self._case_id))
-        self.logger.info("Broadcast Round 3 questionnaire to all experts")
+        # direct-send to all experts
+        for ex_id in self._expert_ids:
+            target = AgentId(type=f"expert_{ex_id}", key=self._case_id)
+            await self._ctx.send_message(questionnaire, target)
+            self.logger.info(
+                "→ sent Round 3 questionnaire to %s (agent=%s/%s)",
+                ex_id,
+                target.type,
+                target.key,
+            )
+
+        self.logger.info(
+            "Broadcast (direct) complete to %d experts", len(self._expert_ids)
+        )
 
         # wait for responses
         await self._wait_for_round_completion("round3")
