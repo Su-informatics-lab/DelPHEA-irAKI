@@ -145,6 +145,8 @@ class Moderator:
             outputs.append((e.expert_id, a3))
         return outputs
 
+    # --------- helpers: ids & logging ---------
+
     def _extract_case_id(self, case: Dict[str, Any]) -> str:
         if isinstance(case, dict):
             for k in ("case_id", "id", "patient_id", "person_id"):
@@ -153,18 +155,24 @@ class Moderator:
                     return str(v)
         return "unknown_case"
 
-    def detect_and_run_debates(self, r1, case):
+    # --------- debate orchestration ---------
+
+    def detect_and_run_debates(
+        self, r1: Sequence[Tuple[str, AssessmentR1]], case: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """compute debate plan via router and collect debate turns."""
         plan: DebatePlan = self.router.plan(r1, self.rules)
         solicitations = sum(len(v) for v in plan.by_qid.values())
         disagreement_present = solicitations > 0
 
-        # NEW: supply both required fields
+        # supply required fields to validator logger
         cid = self._extract_case_id(case)
         log_debate_status(
             disagreement_present=disagreement_present,
             logger=self.logger,
             case_id=cid,
             question_id="__summary__",  # summary-level status
+            expert_id="moderator",
         )
 
         transcripts: Dict[str, List[Dict[str, Any]]] = {}
@@ -186,12 +194,13 @@ class Moderator:
             if not expert_ids:
                 continue
 
-            # OPTIONAL but nice: per-question status line
+            # per-question status line
             log_debate_status(
                 disagreement_present=True,
                 logger=self.logger,
                 case_id=cid,
                 question_id=qid,
+                expert_id="moderator",
             )
 
             minority_text = []
@@ -307,6 +316,7 @@ class Moderator:
         return d
 
     def _call_round1_with_repair(self, expert, case: Dict[str, Any]) -> AssessmentR1:
+        """call expert.assess_round1 with one-shot retry and auto-repair fallback."""
         attempt = 0
         last_err: ValidationError | None = None
         self.current_expert_id = getattr(expert, "expert_id", None)
@@ -350,6 +360,7 @@ class Moderator:
     def _call_round3_with_repair(
         self, expert, case: Dict[str, Any], ctx: Dict[str, Any]
     ) -> AssessmentR3:
+        """call expert.assess_round3 with one-shot retry and auto-repair fallback."""
         attempt = 0
         last_err: ValidationError | None = None
         self.current_expert_id = getattr(expert, "expert_id", None)
