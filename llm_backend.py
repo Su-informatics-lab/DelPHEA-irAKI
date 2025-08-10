@@ -8,7 +8,7 @@ import json
 import os
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import requests
 
@@ -195,6 +195,31 @@ class LLMBackend:
         except Exception:
             pass
 
+    # ----------------------------- debate helpers ------------------------------
+
+    @staticmethod
+    def _format_peer_turns(
+        peer_turns: Any, max_turns: int = 8, max_chars: int = 320
+    ) -> str:
+        """Render a compact, readable transcript snippet for inclusion in the prompt."""
+        if not isinstance(peer_turns, list) or not peer_turns:
+            return ""
+        # keep last N in chronological order
+        tail: List[Dict[str, Any]] = peer_turns[-max_turns:]
+        lines: List[str] = []
+        for t in tail:
+            try:
+                speaker = str(t.get("expert_id") or t.get("speaker", "expert"))
+                role = str(t.get("speaker_role") or t.get("role") or "")
+                txt = str(t.get("text") or "").strip().replace("\n", " ")
+                if len(txt) > max_chars:
+                    txt = txt[: max_chars - 1].rstrip() + "…"
+                who = f"{speaker} ({role})" if role else speaker
+                lines.append(f"- {who}: {txt}")
+            except Exception:
+                continue
+        return "\n".join(lines)
+
     # ----------------------------- debate api ------------------------------
 
     def debate(self, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -205,7 +230,7 @@ class LLMBackend:
           - specialty: str
           - qid: str
           - round_no: int
-          - clinical_context: dict
+          - clinical_context: dict  (may include 'role' and 'peer_turns')
           - minority_view: str
           - temperature: float
 
@@ -227,6 +252,32 @@ class LLMBackend:
         clinical_context = payload.get("clinical_context") or {}
         temperature = float(payload.get("temperature") or self.temperature_r2 or 0.3)
 
+        role_hint = ""
+        try:
+            r = (
+                clinical_context.get("role")
+                if isinstance(clinical_context, dict)
+                else None
+            )
+            if r:
+                role_hint = str(r)
+        except Exception:
+            role_hint = ""
+
+        # peer history
+        peer_snippet = ""
+        try:
+            peer_turns = (
+                clinical_context.get("peer_turns")
+                if isinstance(clinical_context, dict)
+                else None
+            )
+            peer_snippet = self._format_peer_turns(
+                peer_turns, max_turns=8, max_chars=320
+            )
+        except Exception:
+            peer_snippet = ""
+
         # Best-effort case id (optional, for prompt context only)
         case_id = None
         try:
@@ -246,18 +297,24 @@ class LLMBackend:
 
         header = f"Debate turn for question {qid} (round {round_no})."
         role = f"Role: {expert_id} ({specialty})."
+        stage = f"Turn type: {role_hint or 'participant'}."
         cid = f"Case: {case_id or '(unspecified)'}."
         mv = (
-            f"Minority view:\n{minority_view}"
+            f"Minority view summary:\n{minority_view}"
             if minority_view
             else "Minority view: (not provided)."
         )
+        hist = (
+            f"\nPrior turns (most recent last):\n{peer_snippet}" if peer_snippet else ""
+        )
 
         prompt = (
-            f"{header}\n{role}\n{cid}\n\n"
-            f"{mv}\n\n"
-            "Write a concise, evidence-grounded argument (<= 180 words) that addresses the point. "
-            "Return PLAIN TEXT only — no lists, no markdown, no JSON."
+            f"{header}\n{role}\n{stage}\n{cid}\n\n"
+            f"{mv}{hist}\n\n"
+            "Write a concise, evidence-grounded argument (≈120–180 words) that advances the discussion.\n"
+            "- If you are majority: directly rebut the minority’s strongest claims with specific evidence.\n"
+            "- If you are minority (closing): address key rebuttals succinctly and clarify residual uncertainty.\n"
+            "Avoid repetition. No lists, no markdown, no JSON. Return PLAIN TEXT only."
         )
 
         # optional dump root
@@ -282,6 +339,10 @@ class LLMBackend:
                 "qid": qid,
                 "case_id": case_id,
                 "minority_view_len": len(minority_view),
+                "role": role_hint or "participant",
+                "peer_turn_count": len(peer_snippet.splitlines())
+                if peer_snippet
+                else 0,
             },
         )
 
@@ -291,7 +352,7 @@ class LLMBackend:
                 max_tokens=512,
                 temperature=temperature,
                 system="You are a clinical expert generating short, plain-text debate arguments. No markdown, no JSON.",
-                prefer_json=False,  # <-- critical: force plain completion
+                prefer_json=False,  # critical: force plain completion
             )
         except Exception:
             text = "Unable to generate debate content."
@@ -309,7 +370,6 @@ class LLMBackend:
                         s = obj[key].strip()
                         break
                 else:
-                    # fall back to a compact string of the object if no field looked good
                     s = json.dumps(obj, ensure_ascii=False)
             except Exception:
                 pass
