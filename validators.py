@@ -26,6 +26,14 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple, Type, TypeVar
 from pydantic import BaseModel, ValidationError
 from pydantic_core import InitErrorDetails, PydanticCustomError
 
+try:
+    # package mode (e.g., python -m delphea_iraki.delphea_iraki)
+    from . import validators as _self  # type: ignore
+except Exception:
+    # script mode (e.g., python delphea_iraki.py from repo root)
+    import sys as _sys
+
+    _self = _sys.modules[__name__]
 # -------------------------- helpers: error builders ---------------------------
 
 
