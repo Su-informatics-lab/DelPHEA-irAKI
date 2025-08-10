@@ -1,5 +1,6 @@
 # llm_backend.py
-# minimal openai-compatible client with optional json mode; tolerant init
+# minimal openai-compatible client with optional json mode; advertises capabilities
+# so validators can size prompts for large context windows.
 
 from __future__ import annotations
 
@@ -11,7 +12,7 @@ import requests
 
 
 class LLMBackend:
-    """thin client for an openai-compatible /v1/chat/completions endpoint.
+    """thin client for an OpenAI-compatible /v1/chat/completions endpoint.
 
     accepts multiple aliases so callers can pass model/model_name and endpoint/endpoint_url/api_base.
     unknown kwargs are ignored (yagni-friendly).
@@ -22,6 +23,8 @@ class LLMBackend:
         endpoint_url: Optional[str] = None,
         model_name: Optional[str] = None,
         api_key: Optional[str] = None,
+        *,
+        context_window: Optional[int] = None,
         **kwargs: Any,
     ) -> None:
         # accept common aliases without failing
@@ -38,19 +41,48 @@ class LLMBackend:
             or base_url
             or os.getenv("OPENAI_BASE_URL")
             or "http://localhost:8000"
-        ).rstrip(
-            "/"
-        )  # noqa: E501
+        ).rstrip("/")
         self.model_name = (
             model_name or model or os.getenv("OPENAI_MODEL") or "gpt-4o-mini"
         )
-        self.api_key = api_key or os.getenv("OPENAI_API_KEY", None)
+        self.api_key = api_key or os.getenv("OPENAI_API_KEY")
 
         # stash remaining kwargs in case future features want them (do not break)
         self._extra: Dict[str, Any] = kwargs
 
         self.session = requests.Session()
+
+        # capability advertisement for validators
+        env_ctx = os.getenv("CTX_WINDOW")
+        self._context_window: int = (
+            int(env_ctx) if (env_ctx and env_ctx.isdigit()) else 0
+        )
+        if context_window:
+            self._context_window = int(context_window)
         self.supports_json_mode: Optional[bool] = None  # unknown until first try
+
+        # optional per-round temps; safe for setattr from caller
+        self.temperature_r1: Optional[float] = None
+        self.temperature_r2: Optional[float] = None
+        self.temperature_r3: Optional[float] = None
+
+    # ------------------------ capabilities ------------------------
+
+    def set_context_window(self, tokens: int) -> None:
+        """set the advertised context window (tokens) for validators/prompt sizing."""
+        try:
+            self._context_window = int(tokens)
+        except Exception:
+            # keep prior value if parse fails
+            pass
+
+    def capabilities(self) -> Dict[str, Any]:
+        """Advertise backend limits so validators can size prompts correctly."""
+        ctx = int(self._context_window) if self._context_window else 32768
+        return {
+            "context_window": ctx,
+            "json_mode": bool(self.supports_json_mode),
+        }
 
     # ------------------------ internal helpers ------------------------
 
@@ -62,8 +94,9 @@ class LLMBackend:
 
     def _post(self, payload: Dict[str, Any]) -> requests.Response:
         url = f"{self.endpoint_url}/v1/chat/completions"
+        # generous timeout; tune per deployment as needed
         return self.session.post(
-            url, headers=self._headers(), data=json.dumps(payload), timeout=120
+            url, headers=self._headers(), data=json.dumps(payload), timeout=180
         )
 
     # ----------------------------- api -------------------------------
@@ -97,7 +130,7 @@ class LLMBackend:
                 self.supports_json_mode = True
                 data = r.json()
                 return data["choices"][0]["message"]["content"]
-            # if the server doesn’t support json mode, fall through
+            # if the server doesn’t support json mode (e.g., 400/404), fall through
             self.supports_json_mode = False
 
         # plain text fallback

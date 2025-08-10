@@ -1,6 +1,7 @@
 # delphea_iraki.py
 # cli entrypoint wiring config → dataloader → experts/moderator → run (single case)
-# keeps to yagni: minimal flags, fail fast, clear logs.
+# keeps to yagni: minimal flags, fail fast, clear logs. includes prompt budgeter and
+# true ctx-window reporting to validators via backend.capabilities().
 
 from __future__ import annotations
 
@@ -11,9 +12,9 @@ import os
 import re
 import sys
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
-from aggregator import WeightedMeanAggregator
+from aggregator import Aggregator
 from dataloader import DataLoader
 from expert import Expert
 from llm_backend import LLMBackend
@@ -26,11 +27,6 @@ _ID_RE = re.compile(r"(\d+)")
 
 
 def _configure_logging(verbosity: int) -> None:
-    """configure root logger with a simple, consistent format.
-
-    args:
-        verbosity: 0=warning, 1=info, 2+=debug
-    """
     level = (
         logging.WARNING
         if verbosity <= 0
@@ -46,7 +42,6 @@ def _configure_logging(verbosity: int) -> None:
 
 
 def _normalize_case_id(x: str) -> str:
-    """normalize arbitrary patient ids to canonical 'iraki_case_<digits>'."""
     if not x or not isinstance(x, str):
         raise ValueError("case id must be a non-empty string")
     if x.startswith("iraki_case_"):
@@ -57,15 +52,10 @@ def _normalize_case_id(x: str) -> str:
     return f"iraki_case_{m.group(1)}"
 
 
-def _load_panel(panel_path: str) -> List[Dict[str, Any]]:
-    """load and normalize expert panel config.
+# ------------------------ panel loader (tolerant) ------------------------
 
-    accepted shapes:
-      a) list of experts
-      b) {"experts": [...]}
-      c) {"expert_panel": {"experts": [...], <metadata>}}
-      d) dict-of-dicts keyed by id (top-level or nested)
-    """
+
+def _load_panel(panel_path: str) -> List[Dict[str, Any]]:
     p = Path(panel_path)
     if not p.exists():
         raise FileNotFoundError(f"panel file not found: {panel_path}")
@@ -74,6 +64,7 @@ def _load_panel(panel_path: str) -> List[Dict[str, Any]]:
     except Exception as e:
         raise ValueError(f"failed to parse panel json: {e}") from e
 
+    # unwrap {"expert_panel": {"experts": [...] , ...}}
     if (
         isinstance(cfg, dict)
         and "expert_panel" in cfg
@@ -149,10 +140,12 @@ def _load_panel(panel_path: str) -> List[Dict[str, Any]]:
     return normd
 
 
+# ------------------------ backend / experts / router ------------------------
+
+
 def _build_backend(
     endpoint_url: str, model_name: str, t_r1: float, t_r2: float, t_r3: float
 ) -> LLMBackend:
-    """construct llm backend and apply per-round temperatures if supported."""
     backend = LLMBackend(endpoint_url=endpoint_url, model_name=model_name)
     applied = []
     for attr, val in (
@@ -173,7 +166,6 @@ def _build_backend(
 def _build_experts(
     panel_cfg: List[Dict[str, Any]], backend: LLMBackend
 ) -> List[Expert]:
-    """instantiate expert objects from panel config."""
     experts: List[Expert] = []
     for e in panel_cfg:
         experts.append(
@@ -191,7 +183,6 @@ def _build_experts(
 
 
 def _select_router(name: str):
-    """select router strategy by name."""
     n = (name or "sparse").lower()
     if n == "sparse":
         return SparseRouter()
@@ -200,56 +191,196 @@ def _select_router(name: str):
     raise ValueError(f"unknown router: {name!r} (use 'sparse' or 'full')")
 
 
+# ------------------------ prompt budgeter (notes trimming) ------------------------
+
+_AKI_TERMS = [
+    "aki",
+    "acute kidney",
+    "creatinine",
+    "bump in cr",
+    "oliguria",
+    "anuria",
+    "urine output",
+    "uop",
+    "proteinuria",
+    "hematuria",
+    "casts",
+    "ain",
+    "atn",
+    # immune checkpoint & common brand/generics
+    "pembrolizumab",
+    "nivolumab",
+    "ipilimumab",
+    "atezolizumab",
+    "durvalumab",
+    "avelumab",
+    "cemiplimab",
+    "checkpoint inhibitor",
+    "ici",
+    # concomitant nephrotoxins & differentials
+    "ppi",
+    "omeprazole",
+    "pantoprazole",
+    "nsaid",
+    "ibuprofen",
+    "naproxen",
+    "vancomycin",
+    "zosyn",
+    "piperacillin",
+    "contrast",
+    "ct contrast",
+    "bactrim",
+    "tmp-smx",
+]
+
+_TEXT_KEYS = ("report_text", "text", "note", "content", "body")
+_TIME_KEYS = ("physiologic_time", "time", "timestamp", "date", "datetime", "note_time")
+
+
+def _find_notes_list(case: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
+    """heuristic: prefer explicit 'clinical_notes' or 'notes'; else scan for a list of dicts with long text."""
+    # explicit keys first
+    for k in ("clinical_notes", "notes"):
+        v = case.get(k)
+        if isinstance(v, list) and v and isinstance(v[0], dict):
+            return v
+    # scan any list that looks like notes
+    for _, v in case.items():
+        if isinstance(v, list) and v and isinstance(v[0], dict):
+            d0 = v[0]
+            lower_keys = {str(k).lower() for k in d0.keys()}
+            if any(tk in lower_keys for tk in _TEXT_KEYS):
+                return v
+    return None
+
+
+def _get_lower(d: Dict[str, Any], key: str) -> Any:
+    """case-insensitive dict get."""
+    for k, v in d.items():
+        if str(k).lower() == key:
+            return v
+    return None
+
+
+def _score_note(n: Dict[str, Any], recency_rank: int) -> float:
+    """simple relevance score: AKI/ICI term hits + recency bonus."""
+    txt = ""
+    for tk in _TEXT_KEYS:
+        val = _get_lower(n, tk)
+        if isinstance(val, str):
+            txt = val
+            break
+    hits = 0
+    if txt:
+        low = txt.lower()
+        for term in _AKI_TERMS:
+            if term in low:
+                hits += 1
+    return hits + 0.1 * recency_rank  # mild recency bonus
+
+
+def _trim_notes_for_prompt(
+    case: Dict[str, Any],
+    max_notes: int,
+    note_char_cap: int,
+    total_chars_cap: int,
+) -> List[Dict[str, Any]]:
+    """select a compact, high-signal subset of notes and truncate long texts."""
+    notes = _find_notes_list(case) or []
+    if not notes:
+        return []
+
+    # sort by time if possible; newest first
+    def _to_time(n: Dict[str, Any]) -> Any:
+        for tk in _TIME_KEYS:
+            v = _get_lower(n, tk)
+            if v is not None:
+                return v
+        return None
+
+    try:
+        notes_sorted = sorted(notes, key=_to_time)
+    except Exception:
+        notes_sorted = notes[:]
+    notes_sorted = list(reversed(notes_sorted))  # newest first
+
+    # score by relevance + recency
+    scored = [(n, _score_note(n, i)) for i, n in enumerate(notes_sorted)]
+    scored.sort(key=lambda t: t[1], reverse=True)
+
+    # take top-k, then enforce character budgets
+    selected: List[Dict[str, Any]] = []
+    total = 0
+    for n, _ in scored[: max_notes * 3]:  # slight over-select before char budgeting
+        n2 = dict(n)
+        for tk in _TEXT_KEYS:
+            v = _get_lower(n2, tk)
+            if isinstance(v, str):
+                s = v
+                if len(s) > note_char_cap:
+                    s = s[:note_char_cap].rstrip() + " …[truncated]"
+                for k in list(n2.keys()):
+                    if str(k).lower() == tk:
+                        n2[k] = s
+                        break
+        lens = [len(str(_get_lower(n2, tk)) or "") for tk in _TEXT_KEYS]
+        add = max(lens) if lens else 0
+        if total + add > total_chars_cap:
+            break
+        selected.append(n2)
+        total += add
+        if len(selected) >= max_notes:
+            break
+
+    return selected
+
+
+def _apply_prompt_budget(
+    case: Dict[str, Any], max_notes: int, note_char_cap: int, total_chars_cap: int
+) -> Dict[str, Any]:
+    """non-destructive: returns a shallow-copied case with a compact 'clinical_notes' field."""
+    compact = dict(case)
+    compact["clinical_notes"] = _trim_notes_for_prompt(
+        compact, max_notes, note_char_cap, total_chars_cap
+    )
+    compact["_prompt_budget_applied"] = {
+        "max_notes": max_notes,
+        "note_char_cap": note_char_cap,
+        "total_chars_cap": total_chars_cap,
+        "selected_notes": len(compact["clinical_notes"]),
+    }
+    return compact
+
+
+# ------------------------ case io & output helpers ------------------------
+
+
 def _fetch_case(loader: Any, case_id: str) -> Dict[str, Any]:
     """fetch a single case dict using the dataloader's public api.
 
     prefers .load_patient_case(case_id); falls back to a few legacy names.
-    emits a helpful error with sample ids if the case isn't available.
     """
-    # check availability first if the loader exposes it
-    if hasattr(loader, "is_available"):
-        try:
-            if not loader.is_available():
-                raise RuntimeError(
-                    "dataloader reports data not available; ensure data_dir exists or run with use_dummy=True"
-                )
-        except Exception as e:
-            # don't mask attribute errors from below; only surface availability issues
-            LOG.debug("availability check raised: %s", e)
-
-    # preferred modern api
     if hasattr(loader, "load_patient_case"):
         return loader.load_patient_case(case_id)
-
-    # legacy fallbacks
     for fn_name in ("get_case", "load_case", "fetch_case"):
         if hasattr(loader, fn_name):
             return getattr(loader, fn_name)(case_id)
-
-    # offer hints with a few available ids if possible
-    sample_ids: List[str] = []
-    if hasattr(loader, "get_available_patients"):
-        try:
-            sample_ids = loader.get_available_patients(limit=5)
-        except Exception:
-            pass
-
     raise AttributeError(
         "dataloader must expose one of: .load_patient_case(case_id), .get_case(case_id), "
         ".load_case(case_id), .fetch_case(case_id)"
-        + (f". sample ids: {sample_ids}" if sample_ids else "")
     )
 
 
 def _write_json(path: str, obj: Any) -> None:
-    """write json to path with pretty formatting."""
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps(obj, indent=2))
 
 
+# ------------------------ cli ------------------------
+
+
 def parse_args(argv: List[str]) -> argparse.Namespace:
-    """parse command line flags."""
     ap = argparse.ArgumentParser(
         prog="delphea-iraki",
         description="run delphea irAKI multi-expert consensus for a single case",
@@ -281,19 +412,45 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     )
 
     # per-round temperatures
-    ap.add_argument("--temperature-r1", type=float, default=0.2)
+    ap.add_argument("--temperature-r1", type=float, default=0.3)
     ap.add_argument("--temperature-r2", type=float, default=0.6)
-    ap.add_argument("--temperature-r3", type=float, default=0.2)
+    ap.add_argument("--temperature-r3", type=float, default=0.3)
 
     # moderator behavior
     ap.add_argument(
         "--max-retries",
         type=int,
-        default=1,
+        default=5,
         help="per-expert retry attempts on validation failure",
     )
 
-    # logging
+    # context window and prompt budget knobs (defaults sized for big-context backends)
+    ap.add_argument(
+        "--ctx-window",
+        type=int,
+        default=102400,
+        help="context window tokens supported by the backend/model",
+    )
+    ap.add_argument(
+        "--max-notes",
+        type=int,
+        default=1024,
+        help="max number of notes to pass into prompts",
+    )
+    ap.add_argument(
+        "--note-char-cap",
+        type=int,
+        default=10240,
+        help="truncate each note to this many chars",
+    )
+    ap.add_argument(
+        "--total-chars-cap",
+        type=int,
+        default=600000,
+        help="overall char budget across all notes",
+    )
+
+    # logging / consensus
     ap.add_argument(
         "-v",
         "--verbose",
@@ -301,11 +458,19 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
         default=1,
         help="increase verbosity (-v info, -vv debug)",
     )
+    ap.add_argument(
+        "--decision-threshold",
+        type=float,
+        default=0.5,
+        help="consensus threshold for irAKI verdict (default 0.5)",
+    )
     return ap.parse_args(argv)
 
 
+# ------------------------ main ------------------------
+
+
 def main(argv: List[str] | None = None) -> None:
-    """main cli entrypoint."""
     args = parse_args(argv or sys.argv[1:])
     _configure_logging(args.verbose)
 
@@ -313,12 +478,10 @@ def main(argv: List[str] | None = None) -> None:
     LOG.info("questionnaire=%s panel=%s", args.questionnaire, args.panel)
     LOG.info("endpoint_url=%s model_name=%s", args.endpoint_url, args.model_name)
 
-    # fail early on questionnaire path; moderator will load qids/rules from it
+    # questionnaire sanity
     qpath = Path(args.questionnaire)
     if not qpath.exists():
         raise FileNotFoundError(f"questionnaire file not found: {args.questionnaire}")
-
-    # load qids only for visibility; moderator enforces later
     try:
         qids = load_qids(args.questionnaire)
         LOG.info("questionnaire qids: %d", len(qids))
@@ -327,7 +490,7 @@ def main(argv: List[str] | None = None) -> None:
             f"failed to load questionnaire ids from {args.questionnaire}: {e}"
         ) from e
 
-    # build backend and experts
+    # backend + experts
     backend = _build_backend(
         endpoint_url=args.endpoint_url,
         model_name=args.model_name,
@@ -335,15 +498,26 @@ def main(argv: List[str] | None = None) -> None:
         t_r2=args.temperature_r2,
         t_r3=args.temperature_r3,
     )
+    # advertise true context window to validators
+    if hasattr(backend, "set_context_window"):
+        backend.set_context_window(args.ctx_window)
+    elif not hasattr(backend, "capabilities"):
+
+        def _caps(_ctx=args.ctx_window):
+            return {
+                "context_window": int(_ctx),
+                "json_mode": getattr(backend, "supports_json_mode", False),
+            }
+
+        backend.capabilities = _caps  # type: ignore[attr-defined]
+
     panel_cfg = _load_panel(args.panel)
     experts = _build_experts(panel_cfg, backend)
     LOG.info("constructed expert panel: %s", [e.expert_id for e in experts])
 
-    # router + aggregator
+    # router + aggregator + moderator
     router = _select_router(args.router)
-    aggregator = WeightedMeanAggregator()
-
-    # moderator expects questionnaire_path
+    aggregator = Aggregator(decision_threshold=getattr(args, "decision_threshold", 0.5))
     moderator = Moderator(
         experts=experts,
         questionnaire_path=args.questionnaire,
@@ -353,24 +527,37 @@ def main(argv: List[str] | None = None) -> None:
         max_retries=args.max_retries,
     )
 
-    # dataloader should self-log its own 'loading data' messages; instantiate once
+    # dataloader
     loader = DataLoader()
 
-    # normalize case id and fetch case dict
+    # case fetch + prompt budget
     case_id = _normalize_case_id(args.case)
-    case = _fetch_case(loader, case_id)
-    if not isinstance(case, dict) or not case:
+    raw_case = _fetch_case(loader, case_id)
+    if not isinstance(raw_case, dict) or not raw_case:
         raise ValueError(f"case not found or invalid structure for id: {case_id}")
+
+    case = _apply_prompt_budget(
+        raw_case,
+        max_notes=args.max_notes,
+        note_char_cap=args.note_char_cap,
+        total_chars_cap=args.total_chars_cap,
+    )
+    b = case.get("_prompt_budget_applied", {})
+    LOG.info(
+        "prompt budget applied: selected_notes=%s max_notes=%s note_char_cap=%s total_chars_cap=%s",
+        b.get("selected_notes"),
+        b.get("max_notes"),
+        b.get("note_char_cap"),
+        b.get("total_chars_cap"),
+    )
 
     LOG.info("[case %s] running r1 → debate → r3 → aggregate", case_id)
     report = moderator.run_case(case)
 
-    # dump output
     if args.out:
         _write_json(args.out, report)
         LOG.info("wrote results to %s", args.out)
     else:
-        # compact stdout summary for quick inspection
         summary = {
             "case_id": case_id,
             "consensus": report.get("consensus", {}),
