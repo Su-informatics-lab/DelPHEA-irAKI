@@ -138,25 +138,19 @@ class ExpertRound1Reply(BaseModel):
                 raise ValueError(f"Score for {q_id} must be 1-10, got {score}")
         return v
 
-    @field_validator("ci_iraki")
+    @field_validator("ci_iraki", mode="before")
     @classmethod
-    def validate_ci_bounds(cls, v: Tuple[float, float]) -> Tuple[float, float]:
-        """Ensure CI bounds are valid and ordered."""
-        lower, upper = v
-        if not (0.0 <= lower <= 1.0 and 0.0 <= upper <= 1.0):
-            raise ValueError(f"CI bounds must be in [0,1], got [{lower}, {upper}]")
-        if lower > upper:
-            # auto-correct inverted bounds
-            return (upper, lower)
+    def _coerce_ci(cls, v: Any) -> Tuple[float, float]:
+        if isinstance(v, (list, tuple)) and len(v) == 2:
+            return (float(v[0]), float(v[1]))
         return v
 
     @field_validator("differential_diagnosis")
     @classmethod
     def validate_differential(cls, v: List[str]) -> List[str]:
         """Ensure differential diagnosis is provided."""
-        if not v:
-            raise ValueError("Must provide at least one differential diagnosis")
-        return v
+        if not v or len([x for x in v if isinstance(x, str) and x.strip()]) < 2:
+            raise ValueError("Provide ≥2 differential diagnoses")
 
 
 class DebatePrompt(BaseModel):
@@ -261,20 +255,15 @@ class ExpertRound3Reply(BaseModel):
     def validate_scores(cls, v: Dict[str, int]) -> Dict[str, int]:
         """Ensure scores are in valid range."""
         for q_id, score in v.items():
-            if not 1 <= score <= 10:
-                raise ValueError(f"Score for {q_id} must be 1-10, got {score}")
+            if not 1 <= score <= 9:  # was <= 10
+                raise ValueError(f"Score for {q_id} must be 1-9, got {score}")
         return v
 
-    @field_validator("ci_iraki")
+    @field_validator("ci_iraki", mode="before")
     @classmethod
-    def validate_ci_bounds(cls, v: Tuple[float, float]) -> Tuple[float, float]:
-        """Ensure CI bounds are valid and ordered."""
-        lower, upper = v
-        if not (0.0 <= lower <= 1.0 and 0.0 <= upper <= 1.0):
-            raise ValueError(f"CI bounds must be in [0,1], got [{lower}, {upper}]")
-        if lower > upper:
-            # auto-correct inverted bounds
-            return (upper, lower)
+    def _coerce_ci_r3(cls, v: Any) -> Tuple[float, float]:
+        if isinstance(v, (list, tuple)) and len(v) == 2:
+            return (float(v[0]), float(v[1]))
         return v
 
     @field_validator("recommendations")

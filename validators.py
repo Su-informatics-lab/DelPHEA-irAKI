@@ -140,22 +140,18 @@ def call_llm_with_schema(
     max_tokens: int = 1400,
     max_retries: int = 1,
 ) -> T:
-    """call backend, extract json, validate with response_model; one-shot repair on partial json.
-
-    args:
-        response_model: pydantic model class (e.g., messages.ExpertRound1Reply).
-        prompt_text: fully-rendered prompt to send to the backend.
-        backend: object exposing `.generate(prompt, ...)` or `.get_completions(...)`.
-        temperature: decoding temperature.
-        max_tokens: generation cap.
-        max_retries: total tries minus one initial (i.e., 1 ⇒ two total attempts).
-
-    returns:
-        validated instance of `response_model`.
-
-    raises:
-        ValidationError on extraction/parse/validation errors; RuntimeError on backend issues.
-    """
+    """call backend, extract json, validate with response_model; one-shot repair on partial json."""
+    REQUIRED_KEYS = [
+        "case_id",
+        "expert_id",
+        "scores",
+        "evidence",
+        "clinical_reasoning",
+        "differential_diagnosis",
+        "p_iraki",
+        "ci_iraki",
+        "confidence",
+    ]
 
     def _gen_once(prompt: str) -> str:
         if hasattr(backend, "generate"):
@@ -164,32 +160,39 @@ def call_llm_with_schema(
             return backend.get_completions(prompt, temperature=temperature, max_tokens=max_tokens)  # type: ignore[attr-defined]
         raise RuntimeError("llm backend does not expose a known generation method")
 
+    def _contract_suffix() -> str:
+        return (
+            "\n\nOUTPUT CONTRACT — READ CAREFULLY:\n"
+            "- Return ONLY a single valid JSON object (no prose, no markdown fences).\n"
+            f"- Top-level keys MUST be exactly: {REQUIRED_KEYS}.\n"
+            "- Echo the provided case_id and your expert_id exactly.\n"
+            "- 'ci_iraki' must be an array of two floats: [lower, upper].\n"
+        )
+
+    from . import validators as _self  # this file; ok in a module context
+
+    _extract_first_json_object = _self._extract_first_json_object  # type: ignore[attr-defined]
+
     last_err: Optional[ValidationError] = None
     last_raw: Optional[str] = None
 
     for attempt in range(max_retries + 1):
         if attempt == 0:
-            prompt = prompt_text
+            prompt = f"{prompt_text}{_contract_suffix()}"
         else:
-            # structured repair if we previously saw unbalanced/missing json object
             err_types = {e["type"] for e in (last_err.errors() if last_err else [])}
             if {"json_unbalanced", "json_missing_object"} & err_types and last_raw:
                 partial = last_raw.strip()
                 partial = partial[-3000:] if len(partial) > 3000 else partial
                 prompt = (
-                    f"{prompt_text}\n\n"
-                    "the previous output was a PARTIAL json object. "
-                    "complete it to a SINGLE valid json object that strictly matches the expected schema. "
-                    "return ONLY the final json object, with no markdown or prose.\n\n"
+                    f"{prompt_text}{_contract_suffix()}\n"
+                    "The previous output was a PARTIAL JSON object. "
+                    "Complete it to a SINGLE valid JSON object that matches the contract exactly.\n\n"
                     "partial_json:\n```json\n"
                     f"{partial}\n```"
                 )
             else:
-                prompt = (
-                    f"{prompt_text}\n\n"
-                    "IMPORTANT: return ONLY a valid JSON object that exactly matches the schema. "
-                    "do not include markdown fences, prose, or any extra keys."
-                )
+                prompt = f"{prompt_text}{_contract_suffix()}"
 
         raw = _gen_once(prompt)
         last_raw = raw
@@ -197,6 +200,16 @@ def call_llm_with_schema(
         try:
             json_text = _extract_first_json_object(raw)
             data = json.loads(json_text)
+
+            # --- type normalization (not a semantic fallback) ---
+            ci = data.get("ci_iraki")
+            if isinstance(ci, list) and len(ci) == 2:
+                data["ci_iraki"] = (
+                    float(ci[0]),
+                    float(ci[1]),
+                )  # Pydantic v2 strict configs want a tuple
+            # -----------------------------------------------------
+
             return response_model.model_validate(data)
         except ValidationError as ve:
             last_err = ve

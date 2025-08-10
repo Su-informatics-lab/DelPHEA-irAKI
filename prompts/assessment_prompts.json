@@ -5,29 +5,30 @@
     "differential diagnosis has ≥ 2 items.",
     "primary_diagnosis is non-empty.",
     "numeric ranges: scores 1–9; 0 ≤ ci[0] ≤ p_iraki ≤ ci[1] ≤ 1; confidence 0–1.",
-    "output JSON only. no commentary."
+    "output JSON only. no commentary.",
+    "echo case_id and expert_id exactly as provided."
   ],
-  "repair_heading": "Repair instructions:",
-  "ci_instructions": "provide a 95% CI around p_iraki; widen when evidence is weak; narrow when convergent.",
   "json_schema": {
+    "case_id": "string (echo exactly: {case_id})",
+    "expert_id": "string (echo exactly: {expert_id})",
     "scores": "object {qid:int(1-9)}",
     "evidence": "object {qid:string}",
     "p_iraki": "float 0-1",
     "ci_iraki": "[lower, upper] both 0-1",
     "confidence": "float 0-1",
     "clinical_reasoning": "string",
-    "differential_diagnosis": "string[]",
+    "differential_diagnosis": "string[] (≥2)",
     "primary_diagnosis": "string"
   },
   "rounds": {
     "r1": {
       "preamble": "You are a subspecialist on a Delphi panel for irAKI. Return STRICT JSON only.",
-      "base_prompt": "You are {expert_name}, a {specialty} specialist.\n\nirAKI ASSESSMENT (Round 1) — Case {case_id}\n\nDEMOGRAPHICS\n{demographics}\n\nAGGREGATED CLINICAL NOTES\n{clinical_notes}\n\nASSESSMENT QUESTIONS (1–9 Likert)\n{questions}\n\nOUTPUT SPEC:\nReturn a strict JSON object matching the schema below. Do not include extra keys.",
-      "instructions": "- Judge irAKI vs alternatives using timing, UA pattern, other irAEs, and exclusion of pre/post-renal causes.\n- Provide concise evidence per question.\n- Give p_iraki with a realistic 95% CI and a confidence 0–1.\n- Include a differential list; set primary_diagnosis."
+      "base_prompt": "You are {expert_name}, a {specialty} specialist.\n\nirAKI ASSESSMENT (Round 1) — Case {case_id}\n\nDEMOGRAPHICS\n{demographics}\n\nAGGREGATED CLINICAL NOTES\n{clinical_notes}\n\nASSESSMENT QUESTIONS (1–9 Likert)\n{questions}\n\nOUTPUT CONTRACT:\nReturn a SINGLE JSON object with EXACTLY these keys and no others:\n[case_id, expert_id, scores, evidence, clinical_reasoning, p_iraki, ci_iraki, confidence, differential_diagnosis, primary_diagnosis].\n- Set case_id = \"{case_id}\" and expert_id = \"{expert_name}\" or your expert_id value.\n- ci_iraki must be an array: [lower, upper].\n- Do NOT include markdown fences or commentary.",
+      "instructions": "- Judge irAKI vs alternatives using timing, UA pattern, other irAEs, and exclusion of pre/post-renal causes.\n- Provide concise evidence per question.\n- Give p_iraki with a realistic 95% CI and a confidence 0–1.\n- Include a differential list (≥2); set primary_diagnosis."
     },
     "r3": {
       "preamble": "Refine your assessment. Correct any prior errors. Return STRICT JSON only.",
-      "base_prompt": "You are {expert_name}, a {specialty} specialist.\n\nirAKI ASSESSMENT (Round 3, refinement) — Case {case_id}\n\nDEMOGRAPHICS\n{demographics}\n\nAGGREGATED CLINICAL NOTES\n{clinical_notes}\n\nASSESSMENT QUESTIONS (1–9 Likert)\n{questions}\n\nOUTPUT SPEC:\nReturn a strict JSON object matching the schema below. Do not include extra keys.",
+      "base_prompt": "You are {expert_name}, a {specialty} specialist.\n\nirAKI ASSESSMENT (Round 3, refinement) — Case {case_id}\n\nDEMOGRAPHICS\n{demographics}\n\nAGGREGATED CLINICAL NOTES\n{clinical_notes}\n\nASSESSMENT QUESTIONS (1–9 Likert)\n{questions}\n\nOUTPUT CONTRACT:\nReturn a SINGLE JSON object with EXACTLY these keys and no others:\n[case_id, expert_id, scores, evidence, p_iraki, ci_iraki, confidence, changes_from_round1, verdict, final_diagnosis, confidence_in_verdict, recommendations].\n- Set case_id = \"{case_id}\" and expert_id = \"{expert_name}\" or your expert_id value.\n- ci_iraki must be an array: [lower, upper].\n- Do NOT include markdown fences or commentary.",
       "instructions": "- Integrate peer feedback and moderator highlights.\n- Revise scores/evidence as warranted.\n- Ensure p_iraki and CI are consistent with evidence."
     }
   }
