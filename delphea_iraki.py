@@ -533,6 +533,7 @@ def main(argv: List[str] | None = None) -> None:
     # case fetch + prompt budget
     case_id = _normalize_case_id(args.case)
     raw_case = _fetch_case(loader, case_id)
+    raw_case.setdefault("case_id", case_id)  # ensure present for downstream use
     if not isinstance(raw_case, dict) or not raw_case:
         raise ValueError(f"case not found or invalid structure for id: {case_id}")
 

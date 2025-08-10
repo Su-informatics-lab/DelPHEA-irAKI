@@ -5,7 +5,7 @@ purpose
 -------
 single orchestrator for n experts × m questions with pluggable routing (sparse/full)
 and pluggable aggregation. validates io contracts, fails fast but attempts a
-one‑shot repair per expert, and returns a serializable run report.
+one-shot repair per expert, and returns a serializable run report.
 
 ascii: control & data flow (single case)
 ----------------------------------------
@@ -100,6 +100,10 @@ class Moderator:
             raise ValueError("all experts must expose .expert_id")
         if len(set(ids)) != len(ids):
             raise ValueError("duplicate expert_id detected")
+
+        # transient context used for autopatching identifiers
+        self.current_case_id: str | None = None
+        self.current_expert_id: str | None = None
 
     # --------- public api ---------
 
@@ -233,12 +237,45 @@ class Moderator:
 
     # --------- private: robust r1/r3 callers with repair ---------
 
+    def _ensure_ids(
+        self, assessed: AssessmentR1 | AssessmentR3, expert, case: Dict[str, Any]
+    ):
+        """guarantee presence of case_id/expert_id in assessed payloads."""
+        d = assessed.model_dump()
+        cid = None
+        try:
+            if isinstance(case, dict):
+                cid = (
+                    case.get("case_id")
+                    or case.get("id")
+                    or case.get("patient_id")
+                    or case.get("person_id")
+                )
+        except Exception:
+            pass
+        if not d.get("case_id"):
+            d["case_id"] = (
+                cid or getattr(self, "current_case_id", None) or "unknown_case"
+            )
+        if not d.get("expert_id"):
+            d["expert_id"] = (
+                getattr(expert, "expert_id", None)
+                or getattr(self, "current_expert_id", None)
+                or "unknown_expert"
+            )
+        return assessed.__class__(**d)
+
     def _call_round1_with_repair(self, expert, case: Dict[str, Any]) -> AssessmentR1:
         """call expert.assess_round1 with one-shot retry and auto-repair fallback."""
         attempt = 0
         last_err: ValidationError | None = None
+        self.current_expert_id = getattr(expert, "expert_id", None)
+        self.current_case_id = case.get("case_id") if isinstance(case, dict) else None
+
         while attempt <= self.max_retries:
             a1 = expert.assess_round1(case, self.qpath)
+            # ensure identifiers before validation
+            a1 = self._ensure_ids(a1, expert, case)
             try:
                 validate_round1_payload(a1.model_dump(), required_evidence=12)
                 if attempt > 0:
@@ -258,17 +295,21 @@ class Moderator:
                 # build a short repair hint and try to re-ask the expert
                 hint = self._build_repair_hint(ve, round_no=1)
                 a1 = self._retry_assess_round1(expert, case, hint)
+                a1 = self._ensure_ids(a1, expert, case)
                 # loop will validate again
+
         # auto-repair as last resort
         self.logger.warning(
             "auto-repairing round1 payload for %s (last error: %s)",
             expert.expert_id,
             last_err,
         )
+        # we assume the assessed object is structurally close; patch deterministically
         patched = self._autopatch_round1(
-            expert.assess_round1(case, self.qpath).model_dump()
+            a1.model_dump()
+            if last_err
+            else expert.assess_round1(case, self.qpath).model_dump()
         )
-        # ensure it builds into our pydantic model (qids validated later by caller)
         return AssessmentR1(**patched)
 
     def _call_round3_with_repair(
@@ -277,8 +318,12 @@ class Moderator:
         """call expert.assess_round3 with one-shot retry and auto-repair fallback."""
         attempt = 0
         last_err: ValidationError | None = None
+        self.current_expert_id = getattr(expert, "expert_id", None)
+        self.current_case_id = case.get("case_id") if isinstance(case, dict) else None
+
         while attempt <= self.max_retries:
             a3 = expert.assess_round3(case, self.qpath, ctx)
+            a3 = self._ensure_ids(a3, expert, case)
             try:
                 validate_round3_payload(a3.model_dump())
                 if attempt > 0:
@@ -297,13 +342,17 @@ class Moderator:
                     break
                 hint = self._build_repair_hint(ve, round_no=3)
                 a3 = self._retry_assess_round3(expert, case, ctx, hint)
+                a3 = self._ensure_ids(a3, expert, case)
+
         self.logger.warning(
             "auto-repairing round3 payload for %s (last error: %s)",
             expert.expert_id,
             last_err,
         )
         patched = self._autopatch_round3(
-            expert.assess_round3(case, self.qpath, ctx).model_dump()
+            a3.model_dump()
+            if last_err
+            else expert.assess_round3(case, self.qpath, ctx).model_dump()
         )
         return AssessmentR3(**patched)
 
@@ -357,6 +406,19 @@ class Moderator:
     def _autopatch_round1(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         """make a minimal, explicit placeholder fix so downstream code can proceed."""
         patched = dict(payload)
+
+        # identifiers (deterministic, not LLM-dependent)
+        if not isinstance(patched.get("case_id"), str) or not patched["case_id"]:
+            patched["case_id"] = (
+                getattr(self, "current_case_id", None)
+                or payload.get("case_id")
+                or "unknown_case"
+            )
+        if not isinstance(patched.get("expert_id"), str) or not patched["expert_id"]:
+            patched["expert_id"] = (
+                getattr(self, "current_expert_id", None) or "unknown_expert"
+            )
+
         # ensure evidence values are non-empty
         ev = dict(patched.get("evidence") or {})
         for q in self.qids:
@@ -373,15 +435,13 @@ class Moderator:
             cr = ""
         cr = cr.strip()
         if len(cr) < 200:
-            # synthesize from evidence and scores to exceed 200 chars
             parts = [
                 "[auto-repair] clinical reasoning synthesized due to empty expert response."
             ]
-            for q in self.qids[:8]:  # keep it short
+            for q in self.qids[:8]:
                 s = payload.get("scores", {}).get(q, None)
                 parts.append(f"{q}: score={s}, ev={ev.get(q)}")
             cr = " ".join(parts)
-            # if still short, pad with a standard audit note
             if len(cr) < 200:
                 cr = (
                     cr
@@ -412,6 +472,19 @@ class Moderator:
     def _autopatch_round3(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         """minimal placeholder fixes for round 3 structure."""
         patched = dict(payload)
+
+        # identifiers, same rationale as R1
+        if not isinstance(patched.get("case_id"), str) or not patched["case_id"]:
+            patched["case_id"] = (
+                getattr(self, "current_case_id", None)
+                or payload.get("case_id")
+                or "unknown_case"
+            )
+        if not isinstance(patched.get("expert_id"), str) or not patched["expert_id"]:
+            patched["expert_id"] = (
+                getattr(self, "current_expert_id", None) or "unknown_expert"
+            )
+
         ch = dict(patched.get("changes_from_round1") or {})
         if (
             not isinstance(ch.get("summary", ""), str)

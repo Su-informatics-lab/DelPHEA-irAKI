@@ -71,6 +71,13 @@ class Expert:
             clinical_notes=info["clinical_notes"],
             qpath=questionnaire_path,
         )
+        # belt-and-suspenders: require identifiers in the JSON output
+        prompt_text += (
+            f"\n\nIMPORTANT: In your JSON output, you MUST include precisely these keys:\n"
+            f'- "case_id": "{info["case_id"]}"\n'
+            f'- "expert_id": "{self.expert_id}"\n'
+            f"Return ONLY valid JSON."
+        )
 
         reply = call_llm_with_schema(
             response_model=AssessmentR1,
@@ -78,6 +85,14 @@ class Expert:
             backend=self.backend,
             temperature=self.temperature_r1,
         )
+
+        # harden: inject identifiers if the model omitted them
+        if hasattr(reply, "model_dump"):
+            d = reply.model_dump()
+            d.setdefault("case_id", info["case_id"])
+            d.setdefault("expert_id", self.expert_id)
+            reply = AssessmentR1(**d)
+
         self._log_preview(reply, "r1-validated")
         return reply  # already a validated AssessmentR1
 
@@ -101,6 +116,13 @@ class Expert:
             qpath=questionnaire_path,
             debate_ctx=debate_context,
         )
+        # require identifiers again for consistency
+        prompt_text += (
+            f"\n\nIMPORTANT: In your JSON output, you MUST include precisely these keys:\n"
+            f'- "case_id": "{info["case_id"]}"\n'
+            f'- "expert_id": "{self.expert_id}"\n'
+            f"Return ONLY valid JSON."
+        )
 
         reply = call_llm_with_schema(
             response_model=AssessmentR3,
@@ -108,6 +130,14 @@ class Expert:
             backend=self.backend,
             temperature=self.temperature_r3,
         )
+
+        # harden: inject identifiers if the model omitted them
+        if hasattr(reply, "model_dump"):
+            d = reply.model_dump()
+            d.setdefault("case_id", info["case_id"])
+            d.setdefault("expert_id", self.expert_id)
+            reply = AssessmentR3(**d)
+
         self._log_preview(reply, "r3-validated")
         return reply  # already a validated AssessmentR3
 
@@ -220,7 +250,7 @@ class Expert:
     def _coerce_notes(self, case: Dict[str, Any]) -> str:
         """normalize aggregated clinical notes into a single string (no truncation here).
 
-        input-size control is handled upstream via --max-input-chars and centrally
+        input-size control is handled upstream via budgeting and centrally
         in validators via token budgeting. this function only normalizes.
         """
         if case.get("notes_agg") is not None:
