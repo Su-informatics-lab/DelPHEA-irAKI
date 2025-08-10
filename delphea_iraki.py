@@ -1,23 +1,33 @@
 # delphea_iraki.py
 # cli entrypoint wiring config → dataloader → agents → run (single or batch)
-# vllm-only client with explicit endpoint/model args (defaults provided).
+# token policy is controlled via cli (ctx window, output budget, retries, etc).
 
 from __future__ import annotations
 
 import argparse
 import json
 import logging
+import os
 import re
+import sys
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
+import validators as _validators  # to set token policy defaults
 from aggregator import WeightedMeanAggregator
 from dataloader import DataLoader
 from expert import Expert
 from llm_backend import LLMBackend
 from moderator import Moderator
 from router import FullRouter, SparseRouter
-from schema import load_qids  # for early qid introspection
+
+# ------------------------------- logging setup -------------------------------
+
+LOG = logging.getLogger("delphea_iraki")
+logging.basicConfig(
+    level=os.environ.get("DELPHEA_LOGLEVEL", "INFO"),
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
 
 # -------------------- helpers: id parsing & dataloader glue --------------------
 
@@ -28,368 +38,329 @@ def _to_case_id_from_patient_id(x: str | int) -> str:
     """normalize arbitrary patient_id inputs (e.g., 'P123', '123') to 'iraki_case_123'."""
     if isinstance(x, int):
         return f"iraki_case_{x}"
-    s = str(x).strip()
+    s = str(x)
     m = _ID_RE.search(s)
     if not m:
-        raise ValueError(f"could not extract an integer patient_id from: {x!r}")
-    return f"iraki_case_{int(m.group(1))}"
+        raise ValueError(f"cannot parse patient/case id from {x!r}")
+    return f"iraki_case_{m.group(1)}"
 
 
-def _load_panel(panel_path: str) -> List[Dict[str, Any]]:
-    """load expert panel entries and return the list of experts.
+def _patch_backend_caps(backend: Any, ctx_window: int) -> None:
+    """ensure backend.capabilities() reports our chosen context window."""
 
-    supports either:
-      {"expert_panel": {"experts": [...]}}  # legacy
-    or
-      {"experts": [...]}                    # preferred
+    def _caps() -> Dict[str, Any]:
+        base: Dict[str, Any] = {}
+        try:
+            if hasattr(backend, "capabilities"):
+                got = backend.capabilities()
+                if isinstance(got, dict):
+                    base.update(got)
+        except Exception:
+            pass
+        base["context_window"] = int(ctx_window)
+        return base
+
+    # attach/wrap
+    setattr(backend, "capabilities", _caps)
+
+
+def _prune_case_text(case: Dict[str, Any], max_chars: int) -> Tuple[int, int]:
+    """trim total free-text in case['notes'] to <= max_chars (best-effort, in-place).
+
+    returns:
+        (chars_before, chars_after)
     """
-    p = Path(panel_path).expanduser().resolve()
-    if not p.exists():
-        raise FileNotFoundError(f"panel json not found: {p}")
-    with p.open("r", encoding="utf-8") as f:
-        data = json.load(f)
-    if isinstance(data, dict):
-        if "experts" in data and isinstance(data["experts"], list):
-            return data["experts"]
-        if "expert_panel" in data and isinstance(data["expert_panel"], dict):
-            ep = data["expert_panel"].get("experts")
-            if isinstance(ep, list):
-                return ep
-    raise ValueError(f"panel format must contain an experts list: {p}")
+    if max_chars <= 0:
+        return (0, 0)
+
+    # discover note list
+    notes = None
+    for key in ("notes", "clinical_notes", "CLINICAL_NOTES"):
+        if isinstance(case.get(key), list):
+            notes = case[key]
+            break
+    if notes is None:
+        return (0, 0)
+
+    text_keys = ("REPORT_TEXT", "report_text", "NOTE_TEXT", "text")
+    before = 0
+    for n in notes:
+        if isinstance(n, dict):
+            for tk in text_keys:
+                v = n.get(tk)
+                if isinstance(v, str):
+                    before += len(v)
+
+    # short-circuit if already within budget
+    if before <= max_chars:
+        return (before, before)
+
+    # greedy trim: walk notes in order and truncate spillover
+    budget = max_chars
+    for n in notes:
+        if not isinstance(n, dict):
+            continue
+        for tk in text_keys:
+            v = n.get(tk)
+            if not isinstance(v, str) or not v:
+                continue
+            if budget <= 0:
+                n[tk] = ""
+                continue
+            if len(v) <= budget:
+                budget -= len(v)
+            else:
+                n[tk] = v[:budget]
+                budget = 0
+
+    # recount
+    after = 0
+    for n in notes:
+        if isinstance(n, dict):
+            for tk in text_keys:
+                v = n.get(tk)
+                if isinstance(v, str):
+                    after += len(v)
+
+    return (before, after)
 
 
-def _read_json(path: Path) -> Any:
-    with path.open("r", encoding="utf-8") as f:
-        return json.load(f)
+def _load_panel(panel_path: Path) -> List[Tuple[str, Dict[str, Any]]]:
+    """load expert panel config; supports dict{specialty: persona} or list of entries."""
+    with panel_path.open("r", encoding="utf-8") as f:
+        raw = json.load(f)
+
+    panel: List[Tuple[str, Dict[str, Any]]] = []
+    if isinstance(raw, dict):
+        for spec, persona in raw.items():
+            panel.append((str(spec), persona or {}))
+    elif isinstance(raw, list):
+        for item in raw:
+            if isinstance(item, dict):
+                spec = item.get("specialty") or item.get("name") or item.get("id")
+                persona = item.get("persona", {})
+                if not spec:
+                    raise ValueError(f"panel entry missing specialty: {item}")
+                panel.append((str(spec), persona or {}))
+    else:
+        raise ValueError("panel.json must be an object or array")
+    return panel
 
 
-def _case_from_loader(case_like: Any, loader: DataLoader) -> Tuple[str, Dict[str, Any]]:
-    """accept either a patient_id (string/int) or a full case dict; return (case_id, case_dict)."""
-    # full case dict path (already structured like DataLoader output)
-    if isinstance(case_like, dict) and "clinical_notes" in case_like:
-        cid = str(
-            case_like.get("case_id")
-            or case_like.get("person_id")
-            or case_like.get("patient_id")
-            or "case_001"
-        )
-        return cid, case_like
-
-    # patient_id string/int path → use DataLoader
-    if isinstance(case_like, (str, int)):
-        case_id = _to_case_id_from_patient_id(case_like)
-        case_dict = loader.load_patient_case(case_id)
-        return case_id, case_dict
-
-    # minimal dict with id fields (load via DataLoader)
-    if isinstance(case_like, dict):
-        any_id = (
-            case_like.get("case_id")
-            or case_like.get("person_id")
-            or case_like.get("patient_id")
-        )
-        if not any_id:
-            raise ValueError(
-                "case dict must include one of: case_id, person_id, patient_id"
-            )
-        case_id = (
-            any_id
-            if str(any_id).startswith("iraki_case_")
-            else _to_case_id_from_patient_id(any_id)
-        )
-        case_dict = loader.load_patient_case(case_id)
-        return case_id, case_dict
-
-    raise ValueError(f"unsupported case object type: {type(case_like)}")
+def _build_router(kind: str) -> Any:
+    if kind.lower() == "sparse":
+        try:
+            return SparseRouter()
+        except Exception:
+            LOG.warning("failed to init SparseRouter; falling back to FullRouter")
+    return FullRouter()
 
 
-def _iter_cases(
-    case_arg: Optional[str], cases_path: Optional[str], loader: DataLoader
-) -> Iterable[Tuple[str, Dict[str, Any]]]:
-    """yield (case_id, case_dict) for single or batch inputs."""
-    if cases_path:
-        p = Path(cases_path)
-        if not p.exists():
-            raise FileNotFoundError(f"--cases path not found: {p}")
-        if p.suffix.lower() == ".jsonl":
-            with p.open("r", encoding="utf-8") as f:
-                for i, line in enumerate(f, 1):
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        obj = json.loads(line)
-                    except Exception:
-                        obj = line  # treat as a plain patient_id
-                    yield _case_from_loader(obj, loader)
-            return
-        if p.suffix.lower() == ".json":
-            obj = _read_json(p)
-            seq = obj.get("cases") if isinstance(obj, dict) and "cases" in obj else obj
-            if isinstance(seq, list):
-                for item in seq:
-                    yield _case_from_loader(item, loader)
-                return
-            yield _case_from_loader(obj, loader)
-            return
-        raise ValueError(f"--cases only supports .jsonl or .json, got {p.suffix}")
-
-    # single-case mode
-    if case_arg is None:
-        raise ValueError("provide --case/--case-id (patient_id) or --cases (file).")
-    p = Path(case_arg)
-    if p.exists():
-        obj = _read_json(p)
-        yield _case_from_loader(obj, loader)
-        return
-    # try JSON first; if it fails, treat as patient_id string
-    try:
-        obj = json.loads(case_arg)
-        yield _case_from_loader(obj, loader)
-    except Exception:
-        yield _case_from_loader(case_arg, loader)
+# --------------------------------- argument io ---------------------------------
 
 
-# -------------------- main --------------------
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="DelPHEA-irAKI: run multi-agent Delphi consensus for irAKI"
+def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="DelPHEA-irAKI — multi-expert Delphi consensus for irAKI"
     )
-
-    # config: questionnaire/panel/router
-    parser.add_argument(
-        "-q",
-        "--questionnaire",
-        default=str((Path(__file__).parent / "questionnaire.json").resolve()),
-        help="path to questionnaire json (default: questionnaire.json)",
-    )
-    parser.add_argument("--prompts", default="prompts/expert_prompts.json")
-    parser.add_argument(
-        "-p",
-        "--panel",
-        default=str((Path(__file__).parent / "panel.json").resolve()),
-        help="path to expert panel json (default: panel.json)",
-    )
-    parser.add_argument(
-        "--router", choices=["sparse", "full"], default="sparse", help="routing mode"
-    )
-
-    # llm endpoint & model (local defaults)
-    parser.add_argument(
-        "--endpoint",
-        dest="endpoint_url",
-        default="http://localhost:8000",
-        help="openai-compatible base URL (no trailing /v1), e.g., http://localhost:8000",
-    )
-    parser.add_argument(
-        "--model",
-        dest="model_name",
-        default="openai/gpt-oss-120b",
-        help="served model id as shown by /v1/models, e.g., openai/gpt-oss-120b",
-    )
-
-    # data loader
-    parser.add_argument(
-        "--data-dir", default="irAKI_data", help="root directory for patient data"
-    )
-    parser.add_argument(
-        "--use-dummy-loader", action="store_true", help="use DataLoader dummy mode"
-    )
-
-    # input (choose one); support alias --case-id
-    parser.add_argument(
+    p.add_argument(
         "--case",
-        "--case-id",
-        dest="case",
-        default=None,
-        help="patient_id string/int, JSON string, or path to .json (single case)",
+        required=True,
+        help="case id or patient id (e.g., iraki_case_123 or P123)",
     )
-    parser.add_argument(
-        "--cases", default=None, help="path to .jsonl or .json with list/cases object"
+    p.add_argument("--q", required=True, help="path to questionnaire json")
+    p.add_argument("--panel", default="panel.json", help="path to expert panel json")
+    p.add_argument(
+        "--router", choices=["full", "sparse"], default="full", help="routing strategy"
+    )
+    p.add_argument(
+        "--endpoint-url", default=os.getenv("DELPHEA_ENDPOINT", "http://localhost:8000")
+    )
+    p.add_argument(
+        "--model-name", default=os.getenv("DELPHEA_MODEL", "openai/gpt-oss-120b")
+    )
+    p.add_argument(
+        "--out", default="delphea_run.json", help="where to write the run report (json)"
+    )
+    # token policy knobs (centralized in validators via defaults we set below)
+    p.add_argument(
+        "--ctx-window",
+        type=int,
+        default=200000,
+        help="model context window tokens (e.g., 200000)",
+    )
+    p.add_argument(
+        "--out-tokens-init",
+        type=int,
+        default=6000,
+        help="initial output token budget per attempt",
+    )
+    p.add_argument(
+        "--retries",
+        type=int,
+        default=2,
+        help="number of repair retries on schema/JSON errors",
+    )
+    p.add_argument(
+        "--retry-factor",
+        type=float,
+        default=1.75,
+        help="geometric escalation factor per retry",
+    )
+    p.add_argument(
+        "--reserve-tokens",
+        type=int,
+        default=1024,
+        help="safety buffer tokens not used by output",
+    )
+    # optional input length control (best-effort)
+    p.add_argument(
+        "--max-input-chars",
+        type=int,
+        default=0,
+        help="cap total free-text chars from notes (0=off)",
+    )
+    return p.parse_args(argv)
+
+
+# ------------------------------------- main ------------------------------------
+
+
+def main(argv: Optional[List[str]] = None) -> None:
+    args = _parse_args(argv)
+
+    LOG.info("starting delphea-iraki")
+    LOG.info("questionnaire=%s panel=%s", args.q, args.panel)
+    LOG.info("endpoint_url=%s model_name=%s", args.endpoint_url, args.model_name)
+
+    # set validator token policy defaults based on cli (no env control)
+    _validators.DEFAULT_CTX_WINDOW = int(args.ctx_window)
+    _validators.DEFAULT_OUT_TOKENS_INIT = int(args.out_tokens_init)
+    _validators.DEFAULT_RETRIES = int(args.retries)
+    _validators.DEFAULT_RETRY_FACTOR = float(args.retry_factor)
+    _validators.DEFAULT_RESERVE_TOKENS = int(args.reserve_tokens)
+
+    # init backend and patch reported context window
+    backend = LLMBackend(endpoint_url=args.endpoint_url, model_name=args.model_name)
+    _patch_backend_caps(backend, ctx_window=args.ctx_window)
+
+    # load data
+    LOG.info("Loading patient data...")
+    loader = DataLoader()
+    # the dataloader prints its own info about counts; we just proceed
+    case_id = (
+        args.case
+        if str(args.case).startswith("iraki_case_")
+        else _to_case_id_from_patient_id(args.case)
     )
 
-    # output & logging
-    parser.add_argument(
-        "--outdir", default="out", help="directory to write one report per case"
-    )
-    parser.add_argument(
-        "--log-level",
-        default="INFO",
-        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
-        help="logging verbosity",
-    )
-    parser.add_argument(
-        "--health-check",
-        action="store_true",
-        help="ping endpoint and print served models, then exit",
+    # fetch the case (support both get_case / load_case names)
+    case: Optional[Dict[str, Any]] = None
+    for fn in ("get_case", "load_case", "get_patient_case", "select_case"):
+        if hasattr(loader, fn):
+            try:
+                case = getattr(loader, fn)(case_id)
+                break
+            except TypeError:
+                case = getattr(loader, fn)(case_id=case_id)
+                break
+            except Exception:
+                continue
+    if case is None:
+        raise RuntimeError(f"could not load case {case_id!r} via DataLoader")
+
+    LOG.info(
+        "Loaded %d patients",
+        getattr(loader, "n_patients", 0) or getattr(loader, "num_patients", 0) or 0,
     )
 
-    args = parser.parse_args()
-
-    # sanity
-    args.endpoint_url = re.sub(r"/v1/?$", "", args.endpoint_url.rstrip("/"))
-    if not re.match(r"^https?://", args.endpoint_url):
-        raise ValueError(
-            f"--endpoint must start with http:// or https:// (got {args.endpoint_url!r})"
+    # optional input pruning to keep giant notes sane
+    if args.max_input_chars and args.max_input_chars > 0:
+        before, after = _prune_case_text(case, args.max_input_chars)
+        LOG.info(
+            "pruned case text: %d → %d chars (limit=%d)",
+            before,
+            after,
+            args.max_input_chars,
         )
-    if not args.model_name.strip():
-        raise ValueError("--model/--model-name cannot be empty")
 
-    # logging config
-    logging.basicConfig(
-        level=getattr(logging, args.log_level),
-        format="%(asctime)s | %(levelname)s | %(message)s",
-    )
-    log = logging.getLogger("delphea")
-    log.info("starting delphea-iraki")
-    log.info("questionnaire=%s panel=%s", args.questionnaire, args.panel)
-    log.info("endpoint_url=%s model_name=%s", args.endpoint_url, args.model_name)
-
-    # health check mode
-    if args.health_check:
-        import requests
-
-        url = args.endpoint_url.rstrip("/") + "/v1/models"
-        r = requests.get(url, timeout=5)
-        r.raise_for_status()
-        data = r.json()
-        served = [m.get("id") for m in data.get("data", []) if isinstance(m, dict)]
-        print(
-            json.dumps(
-                {"endpoint": args.endpoint_url, "served_models": served}, indent=2
-            )
-        )
-        return
-
-    # resolve and sanity check questionnaire/panel
-    qpath = Path(args.questionnaire).expanduser().resolve()
-    ppath = Path(args.panel).expanduser().resolve()
-    if not qpath.exists():
-        raise FileNotFoundError(f"questionnaire json not found: {qpath}")
-    if not ppath.exists():
-        raise FileNotFoundError(f"panel json not found: {ppath}")
-    args.questionnaire = str(qpath)
-    args.panel = str(ppath)
-
-    # dataloader (fail fast if data_dir missing)
-    loader = DataLoader(data_dir=args.data_dir, use_dummy=args.use_dummy_loader)
-    if not loader.is_available():
-        raise RuntimeError(
-            "DataLoader is not available. check --data-dir to point at your dataset."
-        )
-
-    # backend
-    backend = LLMBackend(
-        endpoint_url=args.endpoint_url,
-        model=args.model_name,
-        api_key=None,
-    )
-
-    # experts (reused across cases)
-    experts = [
+    # build expert panel
+    panel = _load_panel(Path(args.panel))
+    LOG.info("constructed expert panel: %s", [spec for spec, _ in panel])
+    experts: List[Expert] = [
         Expert(
-            expert_id=ex["id"],
-            specialty=ex["specialty"],
-            persona=ex,
+            expert_id=str(spec),
+            specialty=str(spec),
+            persona=(persona or {}),
             backend=backend,
         )
-        for ex in _load_panel(args.panel)
+        for spec, persona in panel
     ]
-    log.info("constructed expert panel: %s", [e.expert_id for e in experts])
 
-    # router + moderator
-    router = SparseRouter() if args.router == "sparse" else FullRouter()
+    # router & aggregator
+    router = _build_router(args.router)
+    aggregator = WeightedMeanAggregator()
+
+    # moderator orchestrates rounds w/ questionnaire path
     moderator = Moderator(
-        experts=experts,
-        questionnaire_path=args.questionnaire,
-        router=router,
-        aggregator=WeightedMeanAggregator(),
+        experts=experts, router=router, aggregator=aggregator, qpath=args.q
     )
 
-    # prepare output dir if requested
-    outdir: Optional[Path] = None
-    if args.outdir:
-        outdir = Path(args.outdir)
-        outdir.mkdir(parents=True, exist_ok=True)
+    # run rounds (r1 → debate → r3) — keep the same entry as before to avoid regressions
+    LOG.info(
+        "[case %s] round 1 start — fan-out %d experts × qids", case_id, len(experts)
+    )
+    r1 = moderator.assess_round(1, case)
 
-    # precompute qids for nicer logs
-    qids = load_qids(args.questionnaire)
-    log.debug("questionnaire qids: %s", qids)
+    # debate and r3 may be no-ops depending on Moderator’s implementation;
+    # we call them if available to preserve the 3-round contract.
+    r_debate = None
+    if hasattr(moderator, "run_debate"):
+        LOG.info("[case %s] debate start", case_id)
+        try:
+            r_debate = moderator.run_debate(case, r1)
+        except TypeError:
+            r_debate = moderator.run_debate(case_id=case_id, r1=r1)
+    r3 = None
+    if hasattr(moderator, "assess_round"):
+        LOG.info("[case %s] round 3 start", case_id)
+        r3 = moderator.assess_round(3, case)
 
-    # run
-    results: List[Dict[str, Any]] = []
-    for idx, (case_id, case) in enumerate(
-        _iter_cases(args.case, args.cases, loader), start=1
-    ):
-        log.info(
-            "[case %s] round 1 start — fan-out %d experts × %d qids",
-            case_id,
-            len(experts),
-            len(qids),
-        )
-        r1 = moderator.assess_round(1, case)
-        log.info(
-            "[case %s] round 1 done — received %d/%d assessments",
-            case_id,
-            len(r1),
-            len(experts),
-        )
-        log.debug("[case %s] r1 experts: %s", case_id, [eid for eid, _ in r1])
+    # aggregate to consensus if Moderator doesn’t already do it
+    consensus = None
+    if hasattr(moderator, "aggregate"):
+        try:
+            consensus = moderator.aggregate(case_id, r1=r1, debate=r_debate, r3=r3)
+        except TypeError:
+            consensus = moderator.aggregate(case_id, r1, r_debate, r3)  # old signature
 
-        log.info("[case %s] debate planning & collection…", case_id)
-        debate_ctx = moderator.detect_and_run_debates(r1, case)
-        solicitations = sum(len(v) for v in debate_ctx.get("debate_plan", {}).values())
-        log.info(
-            "[case %s] debate done — %d solicitations across %d qids",
-            case_id,
-            solicitations,
-            len(debate_ctx.get("debate_plan", {})),
-        )
+    # build a serializable report
+    report = {
+        "case_id": case_id,
+        "model_name": args.model_name,
+        "endpoint_url": args.endpoint_url,
+        "token_policy": {
+            "ctx_window": args.ctx_window,
+            "out_tokens_init": args.out_tokens_init,
+            "retries": args.retries,
+            "retry_factor": args.retry_factor,
+            "reserve_tokens": args.reserve_tokens,
+        },
+        "round1": r1,
+        "debate": r_debate,
+        "round3": r3,
+        "consensus": consensus,
+    }
 
-        log.info("[case %s] round 3 start — reassess all experts", case_id)
-        r3 = moderator.assess_round(3, case, debate_ctx)
-        log.info(
-            "[case %s] round 3 done — received %d/%d assessments",
-            case_id,
-            len(r3),
-            len(experts),
-        )
-
-        # aggregate then log (fixes UnboundLocalError)
-        consensus = moderator.aggregator.aggregate([a for _, a in r3])
-        p_hat = getattr(
-            consensus, "iraki_probability", getattr(consensus, "p_iraki", None)
-        )
-        log.info(
-            "[case %s] aggregation done — p=%.3f, ci=%s",
-            case_id,
-            p_hat,
-            consensus.ci_iraki,
-        )
-
-        report = {
-            "round1": [(eid, a.model_dump()) for eid, a in r1],
-            "debate": debate_ctx,
-            "round3": [(eid, a.model_dump()) for eid, a in r3],
-            "consensus": consensus.model_dump(),
-        }
-        report_with_id = {"case_id": case_id, **report}
-
-        if outdir:
-            out_path = outdir / f"report_{idx:03d}_{case_id}.json"
-            with out_path.open("w", encoding="utf-8") as f:
-                json.dump(report_with_id, f, indent=2)
-            log.info("[case %s] wrote %s", case_id, out_path)
-        else:
-            results.append(report_with_id)
-
-    # print to stdout if not writing to files
-    if not outdir:
-        is_batch = bool(args.cases)
-        print(json.dumps(results if is_batch else results[0], indent=2))
+    out_path = Path(args.out)
+    with out_path.open("w", encoding="utf-8") as f:
+        json.dump(report, f, ensure_ascii=False, indent=2)
+    LOG.info("run saved → %s", out_path.resolve())
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        LOG.exception("fatal error: %s", e)
+        sys.exit(1)
