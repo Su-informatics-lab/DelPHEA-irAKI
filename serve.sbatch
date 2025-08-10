@@ -10,13 +10,19 @@
 #SBATCH --output=logs/%j.out
 #SBATCH --error=logs/%j.err
 #SBATCH --signal=USR1@120
+#SBATCH --export=NONE                 # avoid inheriting your local venv/path
 
 set -euo pipefail
 
-# --- config ---
-MODEL="${MODEL:-openai/gpt-oss-120b}"   # use 120b on 2×h100
+# --- modules: restore your py312 collection -----------------------------------
+module purge                          # clear any defaults that slurm might add
+module restore py312                  # your saved module set
+module list                           # debug: show what's loaded
+
+# --- config -------------------------------------------------------------------
+MODEL="${MODEL:-openai/gpt-oss-120b}" # using 120b on 2×h100
 PORT="${PORT:-8000}"
-TP="${TP:-2}"                           # tensor parallel size = num gpus
+TP="${TP:-2}"                         # tensor parallel size = gpus
 HF_HOME="${HF_HOME:-$HOME/hf-cache}"
 IMG="$HOME/containers/vllm-gptoss.sif"
 
@@ -27,13 +33,13 @@ echo "model: $MODEL"
 echo "port:  $PORT"
 echo "tp:    $TP"
 
-# optional: make vllm multiproc explicit (helps inside apptainer sometimes)
+# optional: this can help vllm workers under apptainer
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 
-# graceful preemption handling (prints a note, then exits cleanly)
-trap 'echo "[signal] got USR1, shutting down soon..."; sleep 2; exit 0' USR1
+# graceful preemption / end signal
+trap 'echo "[signal] USR1 received, exiting"; sleep 2; exit 0' USR1
 
-# apptainer will bind host nvidia libs with --nv
+# --- run vllm openai server inside apptainer ----------------------------------
 apptainer run --nv \
   --bind "$HF_HOME:/root/.cache/huggingface" \
   "$IMG" \
