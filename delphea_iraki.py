@@ -46,13 +46,7 @@ def _configure_logging(verbosity: int) -> None:
 
 
 def _normalize_case_id(x: str) -> str:
-    """normalize arbitrary patient ids to canonical 'iraki_case_<digits>'.
-
-    accepts inputs such as:
-      - 'iraki_case_123456'
-      - 'P123456'
-      - '123456'
-    """
+    """normalize arbitrary patient ids to canonical 'iraki_case_<digits>'."""
     if not x or not isinstance(x, str):
         raise ValueError("case id must be a non-empty string")
     if x.startswith("iraki_case_"):
@@ -64,14 +58,24 @@ def _normalize_case_id(x: str) -> str:
 
 
 def _load_panel(panel_path: str) -> List[Dict[str, Any]]:
-    """load and validate expert panel config.
+    """load and normalize expert panel config.
 
-    supports either:
-      - list[ {id, specialty, persona?} ]
-      - {"experts": [ {id, specialty, persona?}, ... ]}
+    accepted shapes:
+      1) list of experts:
+         [
+           {"id": "onc1", "specialty": "Oncologist", "persona": {...}},
+           ...
+         ]
+      2) dict with one of these keys → list:
+         {"experts": [...]}
+         {"expert_panel": [...]}
+         {"panel": [...]}
+         {"members": [...]}
 
-    returns:
-        list of expert dicts.
+    each expert must have:
+      - id (or expert_id/eid) → string
+      - specialty (or role/discipline) → string
+      - persona (optional) → object
     """
     p = Path(panel_path)
     if not p.exists():
@@ -81,31 +85,45 @@ def _load_panel(panel_path: str) -> List[Dict[str, Any]]:
     except Exception as e:
         raise ValueError(f"failed to parse panel json: {e}") from e
 
-    experts = cfg.get("experts") if isinstance(cfg, dict) else cfg
-    if not isinstance(experts, list) or not experts:
-        raise ValueError("panel config must contain a non-empty list of experts")
+    experts = None
+    if isinstance(cfg, list):
+        experts = cfg
+    elif isinstance(cfg, dict):
+        for key in ("experts", "expert_panel", "panel", "members"):
+            if key in cfg:
+                experts = cfg[key]
+                break
 
+    if not isinstance(experts, list) or not experts:
+        raise ValueError(
+            "panel config must contain a non-empty list of experts under one of "
+            "['experts','expert_panel','panel','members'] or be a list itself"
+        )
+
+    normd: List[Dict[str, Any]] = []
     for i, e in enumerate(experts):
         if not isinstance(e, dict):
             raise ValueError(f"panel entry {i} must be an object")
-        if not e.get("id") or not e.get("specialty"):
+        eid = e.get("id") or e.get("expert_id") or e.get("eid")
+        if not eid or not isinstance(eid, str):
+            raise ValueError(f"panel entry {i} missing expert id (id/expert_id/eid)")
+        spec = e.get("specialty") or e.get("role") or e.get("discipline")
+        if not spec or not isinstance(spec, str):
             raise ValueError(
-                f"panel entry {i} missing required fields 'id' and/or 'specialty'"
+                f"panel entry {i} missing specialty (specialty/role/discipline)"
             )
-        # persona is optional; normalize to dict
-        if "persona" in e and e["persona"] is None:
-            e["persona"] = {}
-        if "persona" not in e:
-            e["persona"] = {}
-    return experts
+        persona = e.get("persona") or {}
+        if not isinstance(persona, dict):
+            raise ValueError(f"panel entry {i} persona must be an object if provided")
+        normd.append({"id": eid, "specialty": spec, "persona": persona})
+    return normd
 
 
 def _build_backend(
     endpoint_url: str, model_name: str, t_r1: float, t_r2: float, t_r3: float
 ) -> LLMBackend:
-    """construct llm backend and apply round temperatures if supported."""
+    """construct llm backend and apply per-round temperatures if supported."""
     backend = LLMBackend(endpoint_url=endpoint_url, model_name=model_name)
-    # best-effort temperature wiring; keep silent on success, warn if unsupported
     applied = []
     for attr, val in (
         ("temperature_r1", t_r1),
@@ -136,7 +154,6 @@ def _build_experts(
                 backend=backend,
             )
         )
-    # verify unique ids early
     ids = [x.expert_id for x in experts]
     if len(set(ids)) != len(ids):
         raise ValueError(f"duplicate expert_id in panel: {ids}")
@@ -154,10 +171,7 @@ def _select_router(name: str):
 
 
 def _fetch_case(loader: Any, case_id: str) -> Dict[str, Any]:
-    """fetch a single case dict from the dataloader using a tolerant method probe.
-
-    tries methods in order: get_case, load_case, fetch_case.
-    """
+    """fetch a single case dict from the dataloader using a tolerant method probe."""
     for fn_name in ("get_case", "load_case", "fetch_case"):
         if hasattr(loader, fn_name):
             fn = getattr(loader, fn_name)
@@ -206,7 +220,7 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
         "--model-name", default=os.getenv("MODEL_NAME", "openai/gpt-oss-120b")
     )
 
-    # per-round temperatures (user asked for r1 and r2 explicitly; we keep r3 for completeness)
+    # per-round temperatures
     ap.add_argument("--temperature-r1", type=float, default=0.2)
     ap.add_argument("--temperature-r2", type=float, default=0.6)
     ap.add_argument("--temperature-r3", type=float, default=0.2)
@@ -244,7 +258,7 @@ def main(argv: List[str] | None = None) -> None:
     if not qpath.exists():
         raise FileNotFoundError(f"questionnaire file not found: {args.questionnaire}")
 
-    # load qids only for logging visibility; moderator enforces correctness later
+    # load qids only for visibility; moderator enforces later
     try:
         qids = load_qids(args.questionnaire)
         LOG.info("questionnaire qids: %d", len(qids))
@@ -269,7 +283,7 @@ def main(argv: List[str] | None = None) -> None:
     router = _select_router(args.router)
     aggregator = WeightedMeanAggregator()
 
-    # moderator expects questionnaire_path (not qpath kwarg name)
+    # moderator expects questionnaire_path
     moderator = Moderator(
         experts=experts,
         questionnaire_path=args.questionnaire,
