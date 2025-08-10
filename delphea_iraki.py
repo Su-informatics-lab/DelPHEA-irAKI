@@ -218,12 +218,15 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="safety buffer tokens not used by output",
     )
 
-    # per-round temperatures
+    # per-round temperatures (r1, r2/debate, r3)
     parser.add_argument(
         "--temperature-r1", type=float, default=0.0, help="temperature for round 1"
     )
     parser.add_argument(
-        "--temperature-debate", type=float, default=0.3, help="temperature for debate"
+        "--temperature-r2",
+        type=float,
+        default=0.3,
+        help="temperature for round 2 (debate)",
     )
     parser.add_argument(
         "--temperature-r3", type=float, default=0.0, help="temperature for round 3"
@@ -269,19 +272,34 @@ def main(argv: Optional[List[str]] = None) -> None:
         else _to_case_id_from_patient_id(args.case)
     )
 
-    # fetch the case (support both get_case / load_case names)
+    # fetch the case (support common method names in DataLoader)
     case: Optional[Dict[str, Any]] = None
-    for fn in ("get_case", "load_case", "get_patient_case", "select_case"):
+    method_names = (
+        "get_case",
+        "load_case",
+        "get_patient_case",
+        "select_case",
+        "load_patient_case",
+    )
+    for fn in method_names:
         if hasattr(loader, fn):
             try:
                 case = getattr(loader, fn)(case_id)
                 break
             except TypeError:
-                case = getattr(loader, fn)(case_id=case_id)
-                break
+                try:
+                    case = getattr(loader, fn)(case_id=case_id)
+                    break
+                except Exception:
+                    continue
             except Exception:
                 continue
     if case is None:
+        try:
+            sample = loader.get_available_patients(limit=3)
+            LOG.error("could not load case %r; samples: %s", case_id, sample)
+        except Exception:
+            pass
         raise RuntimeError(f"could not load case {case_id!r} via DataLoader")
 
     LOG.info(
@@ -317,7 +335,7 @@ def main(argv: Optional[List[str]] = None) -> None:
             persona=(persona or {}),
             backend=backend,
             temperature_r1=args.temperature_r1,
-            temperature_debate=args.temperature_debate,
+            temperature_r2=args.temperature_r2,  # ← r2, not "debate"
             temperature_r3=args.temperature_r3,
         )
         for spec, persona in panel
@@ -332,7 +350,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         experts=experts, router=router, aggregator=aggregator, qpath=args.q
     )
 
-    # run rounds (r1 → debate → r3)
+    # run rounds (r1 → debate/r2 → r3)
     LOG.info("[case %s] round 1 start — fan-out %d experts", case_id, len(experts))
     r1 = moderator.assess_round(1, case)
 
@@ -355,7 +373,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         try:
             consensus = moderator.aggregate(case_id, r1=r1, debate=r_debate, r3=r3)
         except TypeError:
-            consensus = moderator.aggregate(case_id, r1, r_debate, r3)  # old signature
+            consensus = moderator.aggregate(case_id, r1, r_debate, r3)
 
     # build a serializable report
     report = {
@@ -371,7 +389,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         },
         "temperatures": {
             "r1": args.temperature_r1,
-            "debate": args.temperature_debate,
+            "r2": args.temperature_r2,
             "r3": args.temperature_r3,
         },
         "round1": r1,

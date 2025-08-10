@@ -27,7 +27,7 @@ class Expert:
         prompts_path: str = "prompts/expert_prompts.json",
         *,
         temperature_r1: float = 0.0,
-        temperature_debate: float = 0.3,
+        temperature_r2: float = 0.3,
         temperature_r3: float = 0.0,
     ) -> None:
         # validate
@@ -44,7 +44,7 @@ class Expert:
 
         # per-round temperatures (cli-controlled via delphea_iraki.py)
         self.temperature_r1 = float(temperature_r1)
-        self.temperature_debate = float(temperature_debate)
+        self.temperature_r2 = float(temperature_r2)  # debate
         self.temperature_r3 = float(temperature_r3)
 
         # logger
@@ -122,8 +122,8 @@ class Expert:
     ) -> DebateTurn:
         """produce a single debate turn for a specific question.
 
-        note: if your backend supports passing temperature for debate, extend the payload
-        or add a dedicated call that accepts temperature=self.temperature_debate.
+        note: if your backend supports passing temperature for debate, it can
+        honor 'temperature' in the payload below (r2 temperature).
         """
         if not qid:
             raise ValueError("debate requires a non-empty qid")
@@ -137,8 +137,7 @@ class Expert:
             "round_no": round_no,
             "clinical_context": clinical_context,
             "minority_view": minority_view,
-            # optionally include temperature for backends that honor it
-            "temperature": self.temperature_debate,
+            "temperature": self.temperature_r2,  # r2 temperature
         }
         raw = self.backend.debate(payload)
         self._log_preview(raw, f"[debate {qid} raw]")
@@ -221,8 +220,8 @@ class Expert:
     def _coerce_notes(self, case: Dict[str, Any]) -> str:
         """normalize aggregated clinical notes into a single string (no truncation here).
 
-        input-size control is intentionally handled upstream (delphea_iraki.py) via --max-input-chars
-        and centrally in validators via token budgeting. this function only normalizes.
+        input-size control is handled upstream via --max-input-chars and centrally
+        in validators via token budgeting. this function only normalizes.
         """
         if case.get("notes_agg") is not None:
             notes_val = case["notes_agg"]
