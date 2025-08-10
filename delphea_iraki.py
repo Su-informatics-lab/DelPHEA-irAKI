@@ -1,6 +1,6 @@
 # delphea_iraki.py
-# cli entrypoint wiring config → dataloader → agents → run (single or batch)
-# token policy is controlled via cli (ctx window, output budget, retries, etc).
+# cli entrypoint wiring config → dataloader → experts/moderator → run (single case)
+# keeps to yagni: minimal flags, fail fast, clear logs.
 
 from __future__ import annotations
 
@@ -11,402 +11,299 @@ import os
 import re
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List
 
-import validators as _validators  # to set token policy defaults
 from aggregator import WeightedMeanAggregator
 from dataloader import DataLoader
 from expert import Expert
 from llm_backend import LLMBackend
 from moderator import Moderator
 from router import FullRouter, SparseRouter
-from schema import load_qids  # for logging qid count
-
-# ------------------------------- logging setup -------------------------------
+from schema import load_qids
 
 LOG = logging.getLogger("delphea_iraki")
-logging.basicConfig(
-    level=os.environ.get("DELPHEA_LOGLEVEL", "INFO"),
-    format="%(asctime)s | %(levelname)s | %(message)s",
-)
-
-# -------------------- helpers: id parsing & dataloader glue --------------------
-
 _ID_RE = re.compile(r"(\d+)")
 
 
-def _to_case_id_from_patient_id(x: str | int) -> str:
-    """normalize arbitrary patient_id inputs (e.g., 'P123', '123') to 'iraki_case_123'."""
-    if isinstance(x, int):
-        return f"iraki_case_{x}"
-    s = str(x)
-    m = _ID_RE.search(s)
+def _configure_logging(verbosity: int) -> None:
+    """configure root logger with a simple, consistent format.
+
+    args:
+        verbosity: 0=warning, 1=info, 2+=debug
+    """
+    level = (
+        logging.WARNING
+        if verbosity <= 0
+        else logging.INFO
+        if verbosity == 1
+        else logging.DEBUG
+    )
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s | %(levelname)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+
+def _normalize_case_id(x: str) -> str:
+    """normalize arbitrary patient ids to canonical 'iraki_case_<digits>'.
+
+    accepts inputs such as:
+      - 'iraki_case_123456'
+      - 'P123456'
+      - '123456'
+    """
+    if not x or not isinstance(x, str):
+        raise ValueError("case id must be a non-empty string")
+    if x.startswith("iraki_case_"):
+        return x
+    m = _ID_RE.search(x)
     if not m:
-        raise ValueError(f"cannot parse patient/case id from {x!r}")
+        raise ValueError(f"cannot parse numeric id from: {x!r}")
     return f"iraki_case_{m.group(1)}"
 
 
-def _patch_backend_caps(backend: Any, ctx_window: int) -> None:
-    """ensure backend.capabilities() reports our chosen context window (no recursion)."""
-    orig_caps = getattr(backend, "capabilities", None)
+def _load_panel(panel_path: str) -> List[Dict[str, Any]]:
+    """load and validate expert panel config.
 
-    def _caps() -> Dict[str, Any]:
-        base: Dict[str, Any] = {}
-        try:
-            if callable(orig_caps):
-                got = orig_caps()
-                if isinstance(got, dict):
-                    base.update(got)
-        except Exception:
-            pass
-        base["context_window"] = int(ctx_window)
-        return base
-
-    setattr(backend, "capabilities", _caps)
-
-
-def _prune_case_text(case: Dict[str, Any], max_chars: int) -> Tuple[int, int]:
-    """trim total free-text in case['notes'] to <= max_chars (best-effort, in-place).
+    supports either:
+      - list[ {id, specialty, persona?} ]
+      - {"experts": [ {id, specialty, persona?}, ... ]}
 
     returns:
-        (chars_before, chars_after)
+        list of expert dicts.
     """
-    if max_chars <= 0:
-        return (0, 0)
+    p = Path(panel_path)
+    if not p.exists():
+        raise FileNotFoundError(f"panel file not found: {panel_path}")
+    try:
+        cfg = json.loads(p.read_text())
+    except Exception as e:
+        raise ValueError(f"failed to parse panel json: {e}") from e
 
-    # discover note list
-    notes = None
-    for key in ("notes", "clinical_notes", "CLINICAL_NOTES"):
-        if isinstance(case.get(key), list):
-            notes = case[key]
-            break
-    if notes is None:
-        return (0, 0)
+    experts = cfg.get("experts") if isinstance(cfg, dict) else cfg
+    if not isinstance(experts, list) or not experts:
+        raise ValueError("panel config must contain a non-empty list of experts")
 
-    text_keys = ("REPORT_TEXT", "report_text", "NOTE_TEXT", "text")
-    before = 0
-    for n in notes:
-        if isinstance(n, dict):
-            for tk in text_keys:
-                v = n.get(tk)
-                if isinstance(v, str):
-                    before += len(v)
-
-    # short-circuit if already within budget
-    if before <= max_chars:
-        return (before, before)
-
-    # greedy trim: walk notes in order and truncate spillover
-    budget = max_chars
-    for n in notes:
-        if not isinstance(n, dict):
-            continue
-        for tk in text_keys:
-            v = n.get(tk)
-            if not isinstance(v, str) or not v:
-                continue
-            if budget <= 0:
-                n[tk] = ""
-                continue
-            if len(v) <= budget:
-                budget -= len(v)
-            else:
-                n[tk] = v[:budget]
-                budget = 0
-
-    # recount
-    after = 0
-    for n in notes:
-        if isinstance(n, dict):
-            for tk in text_keys:
-                v = n.get(tk)
-                if isinstance(v, str):
-                    after += len(v)
-
-    return (before, after)
+    for i, e in enumerate(experts):
+        if not isinstance(e, dict):
+            raise ValueError(f"panel entry {i} must be an object")
+        if not e.get("id") or not e.get("specialty"):
+            raise ValueError(
+                f"panel entry {i} missing required fields 'id' and/or 'specialty'"
+            )
+        # persona is optional; normalize to dict
+        if "persona" in e and e["persona"] is None:
+            e["persona"] = {}
+        if "persona" not in e:
+            e["persona"] = {}
+    return experts
 
 
-def _load_panel(panel_path: Path) -> List[Tuple[str, Dict[str, Any]]]:
-    """load expert panel config; supports dict{specialty: persona} or list of entries."""
-    with panel_path.open("r", encoding="utf-8") as f:
-        raw = json.load(f)
-
-    panel: List[Tuple[str, Dict[str, Any]]] = []
-    if isinstance(raw, dict):
-        for spec, persona in raw.items():
-            panel.append((str(spec), persona or {}))
-    elif isinstance(raw, list):
-        for item in raw:
-            if isinstance(item, dict):
-                spec = item.get("specialty") or item.get("name") or item.get("id")
-                persona = item.get("persona", {})
-                if not spec:
-                    raise ValueError(f"panel entry missing specialty: {item}")
-                panel.append((str(spec), persona or {}))
-    else:
-        raise ValueError("panel.json must be an object or array")
-    return panel
-
-
-def _build_router(kind: str) -> Any:
-    if kind.lower() == "sparse":
+def _build_backend(
+    endpoint_url: str, model_name: str, t_r1: float, t_r2: float, t_r3: float
+) -> LLMBackend:
+    """construct llm backend and apply round temperatures if supported."""
+    backend = LLMBackend(endpoint_url=endpoint_url, model_name=model_name)
+    # best-effort temperature wiring; keep silent on success, warn if unsupported
+    applied = []
+    for attr, val in (
+        ("temperature_r1", t_r1),
+        ("temperature_r2", t_r2),
+        ("temperature_r3", t_r3),
+    ):
         try:
-            return SparseRouter()
-        except Exception:
-            LOG.warning("failed to init SparseRouter; falling back to FullRouter")
-    return FullRouter()
-
-
-# --------------------------------- argument io ---------------------------------
-
-
-def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="DelPHEA-irAKI — multi-expert Delphi consensus for irAKI"
-    )
-    parser.add_argument(
-        "--case",
-        required=True,
-        help="case id or patient id (e.g., iraki_case_123 or P123)",
-    )
-    parser.add_argument("--q", required=True, help="path to questionnaire json")
-    parser.add_argument(
-        "--panel", default="panel.json", help="path to expert panel json"
-    )
-    parser.add_argument(
-        "--router", choices=["full", "sparse"], default="full", help="routing strategy"
-    )
-    parser.add_argument(
-        "--endpoint-url", default=os.getenv("DELPHEA_ENDPOINT", "http://localhost:8000")
-    )
-    parser.add_argument(
-        "--model-name", default=os.getenv("DELPHEA_MODEL", "openai/gpt-oss-120b")
-    )
-    parser.add_argument(
-        "--out", default="delphea_run.json", help="where to write the run report (json)"
-    )
-
-    # token policy knobs (centralized in validators via defaults we set below)
-    parser.add_argument(
-        "--ctx-window",
-        type=int,
-        default=200_000,
-        help="model context window tokens (e.g., 200000)",
-    )
-    parser.add_argument(
-        "--out-tokens-init",
-        type=int,
-        default=6_000,
-        help="initial output token budget per attempt",
-    )
-    parser.add_argument(
-        "--retries",
-        type=int,
-        default=2,
-        help="number of repair retries on schema/JSON errors",
-    )
-    parser.add_argument(
-        "--retry-factor",
-        type=float,
-        default=1.75,
-        help="geometric escalation factor per retry",
-    )
-    parser.add_argument(
-        "--reserve-tokens",
-        type=int,
-        default=1_024,
-        help="safety buffer tokens not used by output",
-    )
-
-    # per-round temperatures (r1, r2/debate, r3)
-    parser.add_argument(
-        "--temperature-r1", type=float, default=0.0, help="temperature for round 1"
-    )
-    parser.add_argument(
-        "--temperature-r2",
-        type=float,
-        default=0.3,
-        help="temperature for round 2 (debate)",
-    )
-    parser.add_argument(
-        "--temperature-r3", type=float, default=0.0, help="temperature for round 3"
-    )
-
-    # optional input length control (best-effort)
-    parser.add_argument(
-        "--max-input-chars",
-        type=int,
-        default=0,
-        help="cap total free-text chars from notes (0=off)",
-    )
-    return parser.parse_args(argv)
-
-
-# ------------------------------------- main ------------------------------------
-
-
-def main(argv: Optional[List[str]] = None) -> None:
-    args = _parse_args(argv)
-
-    LOG.info("starting delphea-iraki")
-    LOG.info("questionnaire=%s panel=%s", args.q, args.panel)
-    LOG.info("endpoint_url=%s model_name=%s", args.endpoint_url, args.model_name)
-
-    # set validator token policy defaults based on cli (no env control)
-    _validators.DEFAULT_CTX_WINDOW = int(args.ctx_window)
-    _validators.DEFAULT_OUT_TOKENS_INIT = int(args.out_tokens_init)
-    _validators.DEFAULT_RETRIES = int(args.retries)
-    _validators.DEFAULT_RETRY_FACTOR = float(args.retry_factor)
-    _validators.DEFAULT_RESERVE_TOKENS = int(args.reserve_tokens)
-
-    # init backend and patch reported context window
-    backend = LLMBackend(endpoint_url=args.endpoint_url, model_name=args.model_name)
-    _patch_backend_caps(backend, ctx_window=args.ctx_window)
-
-    # load data
-    LOG.info("Loading patient data...")
-    loader = DataLoader()
-    case_id = (
-        args.case
-        if str(args.case).startswith("iraki_case_")
-        else _to_case_id_from_patient_id(args.case)
-    )
-
-    # fetch the case (support common method names in DataLoader)
-    case: Optional[Dict[str, Any]] = None
-    method_names = (
-        "get_case",
-        "load_case",
-        "get_patient_case",
-        "select_case",
-        "load_patient_case",
-    )
-    for fn in method_names:
-        if hasattr(loader, fn):
-            try:
-                case = getattr(loader, fn)(case_id)
-                break
-            except TypeError:
-                try:
-                    case = getattr(loader, fn)(case_id=case_id)
-                    break
-                except Exception:
-                    continue
-            except Exception:
-                continue
-    if case is None:
-        try:
-            sample = loader.get_available_patients(limit=3)
-            LOG.error("could not load case %r; samples: %s", case_id, sample)
+            setattr(backend, attr, val)
+            applied.append(attr)
         except Exception:
             pass
-        raise RuntimeError(f"could not load case {case_id!r} via DataLoader")
+    if len(applied) < 3:
+        LOG.debug("backend may not support per-round temperatures; applied=%s", applied)
+    return backend
 
-    LOG.info(
-        "Loaded %d patients",
-        getattr(loader, "n_patients", 0) or getattr(loader, "num_patients", 0) or 0,
+
+def _build_experts(
+    panel_cfg: List[Dict[str, Any]], backend: LLMBackend
+) -> List[Expert]:
+    """instantiate expert objects from panel config."""
+    experts: List[Expert] = []
+    for e in panel_cfg:
+        experts.append(
+            Expert(
+                expert_id=e["id"],
+                specialty=e["specialty"],
+                persona=e.get("persona") or {},
+                backend=backend,
+            )
+        )
+    # verify unique ids early
+    ids = [x.expert_id for x in experts]
+    if len(set(ids)) != len(ids):
+        raise ValueError(f"duplicate expert_id in panel: {ids}")
+    return experts
+
+
+def _select_router(name: str):
+    """select router strategy by name."""
+    n = (name or "sparse").lower()
+    if n == "sparse":
+        return SparseRouter()
+    if n == "full":
+        return FullRouter()
+    raise ValueError(f"unknown router: {name!r} (use 'sparse' or 'full')")
+
+
+def _fetch_case(loader: Any, case_id: str) -> Dict[str, Any]:
+    """fetch a single case dict from the dataloader using a tolerant method probe.
+
+    tries methods in order: get_case, load_case, fetch_case.
+    """
+    for fn_name in ("get_case", "load_case", "fetch_case"):
+        if hasattr(loader, fn_name):
+            fn = getattr(loader, fn_name)
+            return fn(case_id)
+    raise AttributeError(
+        "dataloader must expose one of: .get_case(case_id), .load_case(case_id), .fetch_case(case_id)"
     )
 
-    # optional input pruning to keep giant notes sane
-    if args.max_input_chars and args.max_input_chars > 0:
-        before, after = _prune_case_text(case, args.max_input_chars)
-        LOG.info(
-            "pruned case text: %d → %d chars (limit=%d)",
-            before,
-            after,
-            args.max_input_chars,
-        )
 
-    # build expert panel
-    panel = _load_panel(Path(args.panel))
-    LOG.info("constructed expert panel: %s", [spec for spec, _ in panel])
+def _write_json(path: str, obj: Any) -> None:
+    """write json to path with pretty formatting."""
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(obj, indent=2))
 
-    # show qid count (helpful for budgeting)
+
+def parse_args(argv: List[str]) -> argparse.Namespace:
+    """parse command line flags."""
+    ap = argparse.ArgumentParser(
+        prog="delphea-iraki",
+        description="run delphea irAKI multi-expert consensus for a single case",
+    )
+    ap.add_argument(
+        "--case", required=True, help="case id (e.g., iraki_case_123 or raw numeric)"
+    )
+    ap.add_argument(
+        "--q",
+        dest="questionnaire",
+        default="questionnaire_full.json",
+        help="questionnaire json path",
+    )
+    ap.add_argument("--panel", default="panel.json", help="expert panel json path")
+    ap.add_argument(
+        "--router",
+        choices=["sparse", "full"],
+        default="sparse",
+        help="debate routing strategy",
+    )
+    ap.add_argument("--out", default=None, help="optional output json path")
+
+    # backend config
+    ap.add_argument(
+        "--endpoint-url", default=os.getenv("ENDPOINT_URL", "http://localhost:8000")
+    )
+    ap.add_argument(
+        "--model-name", default=os.getenv("MODEL_NAME", "openai/gpt-oss-120b")
+    )
+
+    # per-round temperatures (user asked for r1 and r2 explicitly; we keep r3 for completeness)
+    ap.add_argument("--temperature-r1", type=float, default=0.2)
+    ap.add_argument("--temperature-r2", type=float, default=0.6)
+    ap.add_argument("--temperature-r3", type=float, default=0.2)
+
+    # moderator behavior
+    ap.add_argument(
+        "--max-retries",
+        type=int,
+        default=1,
+        help="per-expert retry attempts on validation failure",
+    )
+
+    # logging
+    ap.add_argument(
+        "-v",
+        "--verbose",
+        action="count",
+        default=1,
+        help="increase verbosity (-v info, -vv debug)",
+    )
+    return ap.parse_args(argv)
+
+
+def main(argv: List[str] | None = None) -> None:
+    """main cli entrypoint."""
+    args = parse_args(argv or sys.argv[1:])
+    _configure_logging(args.verbose)
+
+    LOG.info("starting delphea-iraki")
+    LOG.info("questionnaire=%s panel=%s", args.questionnaire, args.panel)
+    LOG.info("endpoint_url=%s model_name=%s", args.endpoint_url, args.model_name)
+
+    # fail early on questionnaire path; moderator will load qids/rules from it
+    qpath = Path(args.questionnaire)
+    if not qpath.exists():
+        raise FileNotFoundError(f"questionnaire file not found: {args.questionnaire}")
+
+    # load qids only for logging visibility; moderator enforces correctness later
     try:
-        qids = load_qids(args.q)
+        qids = load_qids(args.questionnaire)
         LOG.info("questionnaire qids: %d", len(qids))
-    except Exception:
-        LOG.info("questionnaire qids: (unavailable)")
+    except Exception as e:
+        raise RuntimeError(
+            f"failed to load questionnaire ids from {args.questionnaire}: {e}"
+        ) from e
 
-    experts: List[Expert] = [
-        Expert(
-            expert_id=str(spec),
-            specialty=str(spec),
-            persona=(persona or {}),
-            backend=backend,
-            temperature_r1=args.temperature_r1,
-            temperature_r2=args.temperature_r2,  # ← r2, not "debate"
-            temperature_r3=args.temperature_r3,
-        )
-        for spec, persona in panel
-    ]
+    # build backend and experts
+    backend = _build_backend(
+        endpoint_url=args.endpoint_url,
+        model_name=args.model_name,
+        t_r1=args.temperature_r1,
+        t_r2=args.temperature_r2,
+        t_r3=args.temperature_r3,
+    )
+    panel_cfg = _load_panel(args.panel)
+    experts = _build_experts(panel_cfg, backend)
+    LOG.info("constructed expert panel: %s", [e.expert_id for e in experts])
 
-    # router & aggregator
-    router = _build_router(args.router)
+    # router + aggregator
+    router = _select_router(args.router)
     aggregator = WeightedMeanAggregator()
 
-    # moderator orchestrates rounds w/ questionnaire path
+    # moderator expects questionnaire_path (not qpath kwarg name)
     moderator = Moderator(
-        experts=experts, router=router, aggregator=aggregator, qpath=args.q
+        experts=experts,
+        questionnaire_path=args.questionnaire,
+        router=router,
+        aggregator=aggregator,
+        logger=logging.getLogger("moderator"),
+        max_retries=args.max_retries,
     )
 
-    # run rounds (r1 → debate/r2 → r3)
-    LOG.info("[case %s] round 1 start — fan-out %d experts", case_id, len(experts))
-    r1 = moderator.assess_round(1, case)
+    # dataloader should self-log its own 'loading data' messages; instantiate once
+    loader = DataLoader()
 
-    r_debate = None
-    if hasattr(moderator, "run_debate"):
-        LOG.info("[case %s] debate start", case_id)
-        try:
-            r_debate = moderator.run_debate(case, r1)
-        except TypeError:
-            r_debate = moderator.run_debate(case_id=case_id, r1=r1)
+    # normalize case id and fetch case dict
+    case_id = _normalize_case_id(args.case)
+    case = _fetch_case(loader, case_id)
+    if not isinstance(case, dict) or not case:
+        raise ValueError(f"case not found or invalid structure for id: {case_id}")
 
-    r3 = None
-    if hasattr(moderator, "assess_round"):
-        LOG.info("[case %s] round 3 start", case_id)
-        r3 = moderator.assess_round(3, case)
+    LOG.info("[case %s] running r1 → debate → r3 → aggregate", case_id)
+    report = moderator.run_case(case)
 
-    # aggregate to consensus if Moderator doesn’t already do it
-    consensus = None
-    if hasattr(moderator, "aggregate"):
-        try:
-            consensus = moderator.aggregate(case_id, r1=r1, debate=r_debate, r3=r3)
-        except TypeError:
-            consensus = moderator.aggregate(case_id, r1, r_debate, r3)
-
-    # build a serializable report
-    report = {
-        "case_id": case_id,
-        "model_name": args.model_name,
-        "endpoint_url": args.endpoint_url,
-        "token_policy": {
-            "ctx_window": args.ctx_window,
-            "out_tokens_init": args.out_tokens_init,
-            "retries": args.retries,
-            "retry_factor": args.retry_factor,
-            "reserve_tokens": args.reserve_tokens,
-        },
-        "temperatures": {
-            "r1": args.temperature_r1,
-            "r2": args.temperature_r2,
-            "r3": args.temperature_r3,
-        },
-        "round1": r1,
-        "debate": r_debate,
-        "round3": r3,
-        "consensus": consensus,
-    }
-
-    out_path = Path(args.out)
-    with out_path.open("w", encoding="utf-8") as f:
-        json.dump(report, f, ensure_ascii=False, indent=2)
-    LOG.info("run saved → %s", out_path.resolve())
+    # dump output
+    if args.out:
+        _write_json(args.out, report)
+        LOG.info("wrote results to %s", args.out)
+    else:
+        # compact stdout summary for quick inspection
+        summary = {
+            "case_id": case_id,
+            "consensus": report.get("consensus", {}),
+            "debate_skipped": report.get("debate", {}).get("debate_skipped", None),
+        }
+        print(json.dumps(summary, indent=2))
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        LOG.exception("fatal error: %s", e)
-        sys.exit(1)
+    main()
