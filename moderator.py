@@ -113,16 +113,7 @@ class Moderator:
         case: Dict[str, Any],
         debate_ctx: Dict[str, Any] | None = None,
     ) -> List[Tuple[str, AssessmentR1 | AssessmentR3]]:
-        """fan-out round requests to all experts; return structured pydantic models.
-
-        args:
-            round_no: 1 or 3.
-            case: case dict with patient/context fields.
-            debate_ctx: context dict from debate step (for round 3).
-
-        returns:
-            list of (expert_id, AssessmentR1|AssessmentR3).
-        """
+        """fan-out round requests to all experts; return structured pydantic models."""
         if round_no not in (1, 3):
             raise ValueError(f"unsupported round: {round_no}")
         self.logger.info(
@@ -165,18 +156,31 @@ class Moderator:
         solicitations = sum(len(v) for v in plan.by_qid.values())
         disagreement_present = solicitations > 0
 
-        # supply required fields to validator logger
+        # structured status: summary "start"
         cid = self._extract_case_id(case)
         log_debate_status(
-            disagreement_present=disagreement_present,
             logger=self.logger,
             case_id=cid,
-            question_id="__summary__",  # summary-level status
+            question_id="__summary__",
             expert_id="moderator",
+            stage="debate",
+            status="start",
+            meta={"solicitations": solicitations, "qids": len(plan.by_qid)},
         )
 
         transcripts: Dict[str, List[Dict[str, Any]]] = {}
         if not disagreement_present:
+            # structured status: summary "skip"
+            log_debate_status(
+                logger=self.logger,
+                case_id=cid,
+                question_id="__summary__",
+                expert_id="moderator",
+                stage="debate",
+                status="skip",
+                reason="no_disagreement_detected",
+                meta={"solicitations": 0},
+            )
             return {
                 "debate_plan": plan.by_qid,
                 "transcripts": {},
@@ -194,13 +198,15 @@ class Moderator:
             if not expert_ids:
                 continue
 
-            # per-question status line
+            # structured status: per-question "turn" (before collecting turns)
             log_debate_status(
-                disagreement_present=True,
                 logger=self.logger,
                 case_id=cid,
                 question_id=qid,
                 expert_id="moderator",
+                stage="debate",
+                status="turn",
+                meta={"asked_experts": expert_ids},
             )
 
             minority_text = []
@@ -221,6 +227,17 @@ class Moderator:
                         minority_view=mv,
                     )
                     transcripts[qid].append(turn.model_dump())
+
+        # structured status: summary "end"
+        log_debate_status(
+            logger=self.logger,
+            case_id=cid,
+            question_id="__summary__",
+            expert_id="moderator",
+            stage="debate",
+            status="end",
+            meta={"qids_with_transcripts": len(transcripts)},
+        )
 
         return {
             "debate_plan": plan.by_qid,
@@ -258,34 +275,6 @@ class Moderator:
         return report
 
     # --------- private: robust r1/r3 callers with repair ---------
-
-    def _ensure_ids(
-        self, assessed: AssessmentR1 | AssessmentR3, expert, case: Dict[str, Any]
-    ):
-        """guarantee presence of case_id/expert_id in assessed payloads."""
-        d = assessed.model_dump()
-        cid = None
-        try:
-            if isinstance(case, dict):
-                cid = (
-                    case.get("case_id")
-                    or case.get("id")
-                    or case.get("patient_id")
-                    or case.get("person_id")
-                )
-        except Exception:
-            pass
-        if not d.get("case_id"):
-            d["case_id"] = (
-                cid or getattr(self, "current_case_id", None) or "unknown_case"
-            )
-        if not d.get("expert_id"):
-            d["expert_id"] = (
-                getattr(expert, "expert_id", None)
-                or getattr(self, "current_expert_id", None)
-                or "unknown_expert"
-            )
-        return assessed.__class__(**d)
 
     def _validation_payload_with_ids(
         self, assessed: AssessmentR1 | AssessmentR3, expert, case: Dict[str, Any]
@@ -350,7 +339,6 @@ class Moderator:
             expert.expert_id,
             last_err,
         )
-        # patch on top of the most recent vd so IDs are guaranteed
         vd = self._validation_payload_with_ids(
             a1 or expert.assess_round1(case, self.qpath), expert, case
         )
