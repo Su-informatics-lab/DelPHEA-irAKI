@@ -153,25 +153,18 @@ class Moderator:
                     return str(v)
         return "unknown_case"
 
-    def detect_and_run_debates(
-        self, r1: Sequence[Tuple[str, AssessmentR1]], case: Dict[str, Any]
-    ) -> Dict[str, Any]:
-        """compute debate plan via router and collect debate turns.
-
-        returns:
-            dict with keys:
-              - debate_plan: mapping qid -> list[expert_id] asked to argue
-              - transcripts: mapping qid -> list[debate_turn dict]
-              - debate_skipped: bool indicating whether moderator skipped debate
-        """
+    def detect_and_run_debates(self, r1, case):
         plan: DebatePlan = self.router.plan(r1, self.rules)
         solicitations = sum(len(v) for v in plan.by_qid.values())
         disagreement_present = solicitations > 0
 
-        # explicit log of debate status for operator visibility
+        # NEW: supply both required fields
         cid = self._extract_case_id(case)
         log_debate_status(
-            disagreement_present=disagreement_present, logger=self.logger, case_id=cid
+            disagreement_present=disagreement_present,
+            logger=self.logger,
+            case_id=cid,
+            question_id="__summary__",  # summary-level status
         )
 
         transcripts: Dict[str, List[Dict[str, Any]]] = {}
@@ -192,6 +185,15 @@ class Moderator:
         for qid, expert_ids in plan.by_qid.items():
             if not expert_ids:
                 continue
+
+            # OPTIONAL but nice: per-question status line
+            log_debate_status(
+                disagreement_present=True,
+                logger=self.logger,
+                case_id=cid,
+                question_id=qid,
+            )
+
             minority_text = []
             for eid, a in r1:
                 if eid in expert_ids:
