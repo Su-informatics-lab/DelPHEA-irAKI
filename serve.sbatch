@@ -14,8 +14,8 @@
 set -euo pipefail
 
 # ============================================
-# Optimized for 2x H100 with Latest vLLM
-# Container: vllm-gptoss.sif (0.10.2.dev2)
+# Fixed for Container Missing vllm CLI
+# Using Python Module Instead
 # ============================================
 
 # Paths
@@ -32,22 +32,19 @@ export PATH=$CUDA_HOME/bin:$PATH
 export CUDA_VISIBLE_DEVICES=0,1
 export TORCH_CUDA_ARCH_LIST="9.0"  # H100 SM_90
 
-# Network optimization for HPC
+# Network optimization
 export NCCL_IB_DISABLE=1
-export NCCL_P2P_LEVEL="NVL"  # H100 NVLink optimization
+export NCCL_P2P_LEVEL="NVL"
 
-# Tensor parallel from SLURM allocation
+# Tensor parallel
 export TENSOR_PARALLEL=${SLURM_JOB_GPUS_PER_NODE:-2}
 
-# ============================================
-# Fallback Settings (if needed)
-# ============================================
-# Uncomment if you get attention backend errors:
-# export VLLM_ATTENTION_BACKEND="TRITON_ATTN_VLLM_V1"
+# IMPORTANT: Fallback for attention backend
+# The new container should auto-detect, but add this if needed
+export VLLM_ATTENTION_BACKEND="TRITON_ATTN_VLLM_V1"
 
-# For maximum performance on H100 (experimental):
-# export VLLM_USE_TRTLLM_ATTENTION=1
-# export VLLM_USE_FLASHINFER_MXFP4_BF16_MOE=1
+# Force v0 engine for stability
+export VLLM_USE_V1=0
 
 # ============================================
 # Diagnostics
@@ -57,27 +54,15 @@ echo "vLLM GPT-OSS-120B Server Configuration"
 echo "========================================="
 echo "Node: $(hostname)"
 echo "Job ID: ${SLURM_JOB_ID}"
-echo "GPUs: ${TENSOR_PARALLEL} x H100 80GB HBM3"
-echo "Container: vllm-gptoss.sif (v0.10.2.dev2)"
-echo "Model: openai/gpt-oss-120b"
+echo "GPUs: ${TENSOR_PARALLEL} x H100"
+echo "Container: $(basename $IMG_FILE)"
 echo "========================================="
 
-# Show GPU information
-nvidia-smi --query-gpu=index,name,memory.total,compute_cap --format=csv
-echo "========================================="
-
-# Show container info
-echo "Container details:"
-apptainer exec "$IMG_FILE" python3 -c "
-import vllm, torch
-print(f'vLLM: {vllm.__version__}')
-print(f'PyTorch: {torch.__version__}')
-print(f'CUDA in container: {torch.cuda.is_available()}')
-" 2>/dev/null || echo "Container info unavailable"
-echo "========================================="
+# Show GPU info
+nvidia-smi --query-gpu=index,name,memory.total --format=csv
 
 # ============================================
-# Launch vLLM Server (Official Method)
+# Launch Using Python Module (WORKING METHOD)
 # ============================================
 echo "Starting vLLM server at $(date)..."
 
@@ -87,47 +72,23 @@ apptainer exec --nv \
   --bind "$JOB_SCRATCH":/tmp \
   --env CUDA_HOME="$CUDA_HOME" \
   --env PATH="$PATH" \
+  --env VLLM_USE_V1="$VLLM_USE_V1" \
+  --env VLLM_ATTENTION_BACKEND="$VLLM_ATTENTION_BACKEND" \
   --env TORCH_CUDA_ARCH_LIST="$TORCH_CUDA_ARCH_LIST" \
   --env CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES" \
   --env NCCL_IB_DISABLE="$NCCL_IB_DISABLE" \
   --env NCCL_P2P_LEVEL="$NCCL_P2P_LEVEL" \
   "$IMG_FILE" \
-  vllm serve openai/gpt-oss-120b \
+  python3 -m vllm.entrypoints.openai.api_server \
+    --model openai/gpt-oss-120b \
     --tensor-parallel-size "$TENSOR_PARALLEL" \
     --gpu-memory-utilization 0.90 \
-    --max-model-len 16384 \
-    --max-num-seqs 256 \
     --host 0.0.0.0 \
     --port 8000 \
+    --trust-remote-code \
     --async-scheduling \
-    --enable-prefix-caching \
     --disable-log-requests
-
-# ============================================
-# Alternative if 'vllm serve' doesn't work:
-# ============================================
-# Comment out the above and uncomment below:
-#
-# apptainer exec --nv \
-#   --bind "$HF_HOME":/root/.cache/huggingface \
-#   --bind /mnt/shared/moduleapps/eb/CUDA/12.3.0:/mnt/shared/moduleapps/eb/CUDA/12.3.0 \
-#   --bind "$JOB_SCRATCH":/tmp \
-#   --env CUDA_HOME="$CUDA_HOME" \
-#   --env PATH="$PATH" \
-#   --env TORCH_CUDA_ARCH_LIST="$TORCH_CUDA_ARCH_LIST" \
-#   --env CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES" \
-#   --env NCCL_IB_DISABLE="$NCCL_IB_DISABLE" \
-#   "$IMG_FILE" \
-#   python3 -m vllm.entrypoints.openai.api_server \
-#     --model openai/gpt-oss-120b \
-#     --tensor-parallel-size "$TENSOR_PARALLEL" \
-#     --gpu-memory-utilization 0.90 \
-#     --host 0.0.0.0 \
-#     --port 8000 \
-#     --async-scheduling \
-#     --trust-remote-code
 
 echo "========================================="
 echo "Server terminated at $(date)"
-echo "Exit code: $?"
 echo "========================================="
