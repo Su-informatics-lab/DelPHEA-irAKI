@@ -14,42 +14,50 @@ set -euo pipefail
 
 # paths
 export HF_HOME="$HOME/hf-cache"
-# use the freshest image; gptoss tag may lag on FA3 fixes
-export IMG_FILE="$HOME/containers/vllm-latest.sif"
+export IMG_FILE="$HOME/containers/vllm-gptoss.sif"   # use the GPT-OSS image
 export JOB_SCRATCH="$HOME/DelPHEA-irAKI/tmp/$SLURM_JOB_ID"
 mkdir -p "$HF_HOME" logs "$JOB_SCRATCH"
 
 # gpu env
 export CUDA_VISIBLE_DEVICES=0,1
 export NCCL_IB_DISABLE=1
-export TORCH_CUDA_ARCH_LIST="9.0"   # h100
+export TORCH_CUDA_ARCH_LIST="9.0"   # H100 (sm_90)
 
-# vllm v1 + fa3: don't force a backend; v1 on hopper selects flash-attn 3
+# vllm v1 on hopper selects FA3 automatically; do NOT force Triton
 export VLLM_USE_V1=1
 unset VLLM_ATTENTION_BACKEND
 export VLLM_DISABLE_FLASHINFER=1
 export VLLM_CONFIGURE_LOGGING=1
 export VLLM_LOGGING_LEVEL=INFO
 
-# tp across 2 gpus
+# tensor parallel
 export TENSOR_PARALLEL=2
 
-echo "=== vllm gpt-oss-120b on $(hostname) job=$SLURM_JOB_ID ==="
+echo "=== vLLM gpt-oss-120b on $(hostname) job=$SLURM_JOB_ID ==="
 nvidia-smi --query-gpu=index,name,memory.total,driver_version --format=csv
 
-# quick preflight inside container
+# --- sanity: print versions and confirm transformers sees 'gpt_oss'
 apptainer exec --nv \
   --bind "$HF_HOME":/root/.cache/huggingface \
   --bind "$JOB_SCRATCH":/tmp \
   "$IMG_FILE" \
   python3 - << 'PY'
+import importlib, sys
 import torch, vllm
 print("torch:", torch.__version__)
-print("cuda ok:", torch.cuda.is_available(), "ngpus:", torch.cuda.device_count())
 print("vllm:", vllm.__version__)
+try:
+    import transformers
+    from transformers.models.auto.configuration_auto import CONFIG_MAPPING_NAMES
+    print("transformers:", transformers.__version__)
+    print("has gpt_oss in CONFIG_MAPPING_NAMES:",
+          any("gpt_oss" in k for k in CONFIG_MAPPING_NAMES.keys()))
+except Exception as e:
+    print("transformers import failed:", e, file=sys.stderr)
+    sys.exit(1)
 PY
 
-# serve (v1 chooses fa3 on hopper)
+# serve (keep context modest for first boot; raise later)
 apptainer exec --nv \
   --bind "$HF_HOME":/root/.cache/huggingface \
   --bind "$JOB_SCRATCH":/tmp \
