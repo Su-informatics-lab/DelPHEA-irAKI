@@ -1,24 +1,16 @@
 # llm_backend.py
-# single minimal backend for text generation against a vLLM/OpenAI-compatible server.
-# provides a tiny, reliable .generate(prompt) api and hides transport details.
+# thin, robust client for vLLM/OpenAI-compatible servers with JSON repair.
 #
-# design goals
-# ------------
-# - prefer /v1/chat/completions for instruct/chat models; fallback to /v1/completions
-# - do not force openai "json mode" by default (vllm/model combos may not support it)
-# - aggressively extract a valid json object/array from the returned text when present
-# - fail loud with actionable error messages (http status, body head)
+# key changes in this version
+# ---------------------------
+# - try chat completions first; fallback to legacy completions
+# - optionally attempt openai "json mode" first; if the server returns empty content,
+#   we gracefully fall back
+# - aggressive json extraction + repair (fixes unescaped newlines in strings, smart quotes,
+#   trailing commas, and strips code fences)
+# - loud, actionable errors on http/schema failures
 #
-# usage
-# -----
-# backend = LLMBackend(endpoint_url="http://localhost:8000", model="openai/gpt-oss-120b")
-# text = backend.generate(prompt)
-#
-# notes
-# -----
-# some servers return empty content for unsupported params (e.g., response_format);
-# we therefore keep the default payload minimal and only add extras when explicitly
-# requested by the caller via the `extra` argument.
+# this is intentionally minimal (yagni) and fails fast with clear messages.
 
 from __future__ import annotations
 
@@ -30,12 +22,11 @@ import requests
 
 
 class LLMBackend:
-    """thin client for vLLM/OpenAI-compatible inference servers.
+    """minimal backend for text generation with optional json-first behavior.
 
-    this class exposes a single method, `generate(prompt)`, that returns a string.
-    it first attempts the Chat Completions endpoint, then falls back to the legacy
-    Completions endpoint. returned text is post-processed to extract valid json if
-    present, which works well with schema validators upstream that expect json.
+    the `generate()` method returns a string. when a json object/array is present,
+    it is extracted and repaired into valid json so that downstream `json.loads()`
+    succeeds. otherwise, the raw text is returned.
     """
 
     def __init__(
@@ -43,10 +34,11 @@ class LLMBackend:
         *,
         endpoint_url: str,
         model: Optional[str] = None,
-        model_name: Optional[str] = None,  # synonym for convenience
+        model_name: Optional[str] = None,
         timeout: float = 120.0,
         api_key: Optional[str] = None,
-        **_: Any,  # ignore legacy kwargs gracefully
+        prefer_json_mode: bool = True,  # try response_format json_object on chat route
+        **_: Any,
     ) -> None:
         model_id = model_name or model
         if not model_id:
@@ -57,8 +49,8 @@ class LLMBackend:
         self._model = model_id
         self._timeout = timeout
         self._api_key = api_key
+        self._prefer_json_mode = prefer_json_mode
 
-        # endpoints
         self._completions = f"{self._base}/v1/completions"
         self._chat = f"{self._base}/v1/chat/completions"
 
@@ -74,42 +66,37 @@ class LLMBackend:
         seed: Optional[int] = None,
         extra: Optional[Dict[str, Any]] = None,
     ) -> str:
-        """return raw text completion for a single prompt string.
+        """return text completion for a prompt; extract/repair json when found.
 
-        attempts /v1/chat/completions first; if unavailable or blank, falls back to
-        /v1/completions. avoids forcing json mode unless explicitly requested in `extra`.
-
-        Raises:
-            RuntimeError: on network, http, or schema errors, or if both routes
-            return no usable text.
+        tries chat api (optionally with json mode) → falls back to completions.
         """
-        # 1) try chat api first (most reliable for instruction-tuned models)
+        # first attempt: chat with optional json mode
         chat_payload: Dict[str, Any] = {
             "model": self._model,
             "messages": [{"role": "user", "content": prompt}],
             "max_tokens": max_tokens,
             "temperature": temperature,
         }
-        # only pass response_format/json mode if explicitly asked by caller
-        if isinstance(extra, dict) and "response_format" in extra:
-            chat_payload["response_format"] = extra["response_format"]
+        if self._prefer_json_mode:
+            chat_payload["response_format"] = {"type": "json_object"}
         if stop:
             chat_payload["stop"] = stop
         if seed is not None:
             chat_payload["seed"] = seed
         if isinstance(extra, dict):
-            # merge any other extras last
             for k, v in extra.items():
-                if k == "response_format":
-                    continue
-                chat_payload[k] = v
+                if k == "response_format" and not self._prefer_json_mode:
+                    # allow caller to force json mode off or custom formats
+                    chat_payload[k] = v
+                elif k != "response_format":
+                    chat_payload[k] = v
 
         text = self._post_and_parse_text(self._chat, chat_payload, mode="chat")
-        text = self._clean_and_maybe_extract_json(text)
+        text = self._normalize_text(text)
         if text is not None:
             return text
 
-        # 2) fallback to legacy text completions
+        # second attempt: legacy completions (no json mode here)
         payload = {
             "model": self._model,
             "prompt": prompt,
@@ -124,13 +111,13 @@ class LLMBackend:
             payload.update({k: v for k, v in extra.items() if k != "response_format"})
 
         text = self._post_and_parse_text(self._completions, payload, mode="completions")
-        text = self._clean_and_maybe_extract_json(text)
+        text = self._normalize_text(text)
         if text is not None:
             return text
 
         raise RuntimeError("LLMBackend.generate: no usable text from either route")
 
-    # -------------------- internals --------------------
+    # -------------------- http helpers --------------------
 
     def _headers(self) -> Dict[str, str]:
         h = {"Content-Type": "application/json"}
@@ -146,13 +133,10 @@ class LLMBackend:
                 url, headers=self._headers(), json=payload, timeout=self._timeout
             )
         except requests.RequestException:
-            # allow fallback by returning None unless this is the last route
             return None
 
-        # allow fallback on missing route
         if resp.status_code == 404:
             return None
-
         if resp.status_code != 200:
             body_head = resp.text[:500]
             raise RuntimeError(
@@ -164,29 +148,22 @@ class LLMBackend:
         except json.JSONDecodeError as e:
             raise RuntimeError(f"LLMBackend: non-JSON response from {url}: {e}") from e
 
-        # normalize to a text string if possible
         try:
             if mode == "chat":
                 choices = data.get("choices") or []
                 if not choices:
                     return None
                 msg = choices[0].get("message") or {}
-
-                # primary: regular assistant content
                 content = msg.get("content")
                 if isinstance(content, str) and content.strip():
                     return content
-
-                # some servers may put text under 'delta' even when not streaming
                 delta = choices[0].get("delta") or {}
                 dcontent = delta.get("content")
-                if isinstance(dcontent, str) and dcontent.strip():
-                    return dcontent
+                return (
+                    dcontent if isinstance(dcontent, str) and dcontent.strip() else None
+                )
 
-                # no text content
-                return None
-
-            # completions mode
+            # completions
             choices = data.get("choices") or []
             if not choices:
                 return None
@@ -194,65 +171,122 @@ class LLMBackend:
             return text if isinstance(text, str) and text.strip() else None
 
         except Exception as e:  # noqa: BLE001
-            # defensive: convert any schema surprises into a loud, actionable error
             raise RuntimeError(
                 f"LLMBackend: unexpected response schema from {url}: {data!r}"
             ) from e
 
-    # -------------------- text post-processing helpers --------------------
+    # -------------------- normalization & json repair --------------------
 
-    @staticmethod
-    def _is_valid_json(s: str) -> bool:
-        try:
-            json.loads(s)
-            return True
-        except Exception:  # noqa: BLE001
-            return False
-
-    def _clean_and_maybe_extract_json(self, text: Optional[str]) -> Optional[str]:
-        """normalize empty to None; if text contains json, extract and return it."""
+    def _normalize_text(self, text: Optional[str]) -> Optional[str]:
         if not isinstance(text, str):
             return None
         s = text.strip()
         if not s:
             return None
 
-        # fast path: already valid json
-        if self._is_valid_json(s):
+        # cut code fences if present
+        fence = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", s, flags=re.IGNORECASE)
+        if fence:
+            s = fence.group(1).strip()
+
+        # if it already parses as json, return as-is
+        if self._json_ok(s):
             return s
 
-        # fenced code block: ```json ...```
-        m = re.search(
-            r"```(?:json)?\s*(\{[\s\S]*?\}|\[[\s\S]*?\])\s*```", s, flags=re.IGNORECASE
-        )
-        if m and self._is_valid_json(m.group(1)):
-            return m.group(1)
+        # try to isolate first balanced json object/array (string-aware)
+        for candidate in self._extract_candidates(s):
+            fixed = self._repair_json(candidate)
+            if self._json_ok(fixed):
+                return fixed
 
-        # first balanced-looking json object/array substring (simple heuristic)
-        # try object
-        obj = self._extract_first_braced(s, opener="{", closer="}")
-        if obj and self._is_valid_json(obj):
-            return obj
-        # try array
-        arr = self._extract_first_braced(s, opener="[", closer="]")
-        if arr and self._is_valid_json(arr):
-            return arr
+        # last chance: attempt repair on full string
+        fixed = self._repair_json(s)
+        if self._json_ok(fixed):
+            return fixed
 
-        # no valid json found; return original (non-json) text to upstream caller
+        # give the caller raw text; upstream may retry/repair further
         return s
 
     @staticmethod
-    def _extract_first_braced(s: str, *, opener: str, closer: str) -> Optional[str]:
-        # simple bracket matching to find the first top-level balanced segment
-        start = s.find(opener)
-        if start == -1:
-            return None
-        depth = 0
-        for i in range(start, len(s)):
-            if s[i] == opener:
-                depth += 1
-            elif s[i] == closer:
-                depth -= 1
-                if depth == 0:
-                    return s[start : i + 1]
-        return None
+    def _json_ok(s: str) -> bool:
+        try:
+            json.loads(s)
+            return True
+        except Exception:
+            return False
+
+    def _extract_candidates(self, s: str) -> List[str]:
+        """yield plausible json substrings respecting quoted strings."""
+        out: List[str] = []
+        for opener, closer in (("{", "}"), ("[", "]")):
+            start = s.find(opener)
+            if start == -1:
+                continue
+            depth = 0
+            in_str = False
+            esc = False
+            for i in range(start, len(s)):
+                ch = s[i]
+                if in_str:
+                    if esc:
+                        esc = False
+                    elif ch == "\\":
+                        esc = True
+                    elif ch == '"':
+                        in_str = False
+                else:
+                    if ch == '"':
+                        in_str = True
+                    elif ch == opener:
+                        depth += 1
+                    elif ch == closer:
+                        depth -= 1
+                        if depth == 0:
+                            out.append(s[start : i + 1])
+                            break
+        return out
+
+    def _repair_json(self, s: str) -> str:
+        """fix common json issues: smart quotes, unescaped newlines in strings, trailing commas."""
+        # normalize quotes
+        s = s.replace("“", '"').replace("”", '"').replace("’", "'").replace("‘", "'")
+
+        # strip leading/trailing junk backticks/boms
+        s = s.strip().lstrip("`").rstrip("`").lstrip("\ufeff").rstrip("\ufeff")
+
+        # remove trailing commas before } or ]
+        s = re.sub(r",(\s*[}\]])", r"\1", s)
+
+        # escape bare newlines that occur inside json strings
+        s = self._escape_newlines_inside_strings(s)
+
+        return s
+
+    @staticmethod
+    def _escape_newlines_inside_strings(s: str) -> str:
+        out: List[str] = []
+        in_str = False
+        esc = False
+        for ch in s:
+            if in_str:
+                if esc:
+                    out.append(ch)
+                    esc = False
+                else:
+                    if ch == "\\":
+                        out.append(ch)
+                        esc = True
+                    elif ch == '"':
+                        out.append(ch)
+                        in_str = False
+                    elif ch == "\n" or ch == "\r":
+                        out.append("\\n")
+                    else:
+                        out.append(ch)
+            else:
+                if ch == '"':
+                    out.append(ch)
+                    in_str = True
+                else:
+                    out.append(ch)
+        return "".join(out)
