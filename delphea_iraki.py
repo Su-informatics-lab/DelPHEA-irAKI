@@ -61,10 +61,10 @@ def _load_panel(panel_path: str) -> List[Dict[str, Any]]:
     """load and normalize expert panel config.
 
     accepted shapes:
-      A) list of experts
-      B) {"experts": [...]}
-      C) {"expert_panel": {"experts": [...], <metadata>}}
-      D) dict-of-dicts keyed by id (top-level or under any of the above)
+      a) list of experts
+      b) {"experts": [...]}
+      c) {"expert_panel": {"experts": [...], <metadata>}}
+      d) dict-of-dicts keyed by id (top-level or nested)
     """
     p = Path(panel_path)
     if not p.exists():
@@ -74,7 +74,6 @@ def _load_panel(panel_path: str) -> List[Dict[str, Any]]:
     except Exception as e:
         raise ValueError(f"failed to parse panel json: {e}") from e
 
-    # unwrap common container
     if (
         isinstance(cfg, dict)
         and "expert_panel" in cfg
@@ -83,26 +82,16 @@ def _load_panel(panel_path: str) -> List[Dict[str, Any]]:
         cfg = cfg["expert_panel"]
 
     raw_list = None
-
-    # direct list
     if isinstance(cfg, list):
         raw_list = cfg
-
-    # dict with explicit experts list
     if raw_list is None and isinstance(cfg, dict) and "experts" in cfg:
         node = cfg["experts"]
         if isinstance(node, list):
             raw_list = node
-        elif isinstance(node, dict):  # experts provided as dict-of-dicts
+        elif isinstance(node, dict):
             raw_list = [{"id": k, **(v or {})} for k, v in node.items()]
-
-    # alias keys at top-level (back-compat)
     if raw_list is None and isinstance(cfg, dict):
-        for key in (
-            "expert_panel",
-            "panel",
-            "members",
-        ):  # if someone nested differently
+        for key in ("expert_panel", "panel", "members"):
             if key in cfg:
                 node = cfg[key]
                 if isinstance(node, list):
@@ -119,8 +108,6 @@ def _load_panel(panel_path: str) -> List[Dict[str, Any]]:
                     raw_list = [{"id": k, **(v or {})} for k, v in node.items()]
                 if raw_list is not None:
                     break
-
-    # plain dict-of-dicts at top
     if (
         raw_list is None
         and isinstance(cfg, dict)
@@ -136,7 +123,6 @@ def _load_panel(panel_path: str) -> List[Dict[str, Any]]:
             f"top-level keys seen: {keys!r}"
         )
 
-    # normalize each expert
     normd: List[Dict[str, Any]] = []
     for i, e in enumerate(raw_list):
         if not isinstance(e, dict):
@@ -156,7 +142,6 @@ def _load_panel(panel_path: str) -> List[Dict[str, Any]]:
             raise ValueError(f"panel entry {i} persona must be an object if provided")
         normd.append({"id": eid, "specialty": spec, "persona": persona})
 
-    # ensure id uniqueness
     ids = [x["id"] for x in normd]
     if len(set(ids)) != len(ids):
         raise ValueError(f"duplicate expert_id in panel: {ids}")
@@ -216,13 +201,43 @@ def _select_router(name: str):
 
 
 def _fetch_case(loader: Any, case_id: str) -> Dict[str, Any]:
-    """fetch a single case dict from the dataloader using a tolerant method probe."""
+    """fetch a single case dict using the dataloader's public api.
+
+    prefers .load_patient_case(case_id); falls back to a few legacy names.
+    emits a helpful error with sample ids if the case isn't available.
+    """
+    # check availability first if the loader exposes it
+    if hasattr(loader, "is_available"):
+        try:
+            if not loader.is_available():
+                raise RuntimeError(
+                    "dataloader reports data not available; ensure data_dir exists or run with use_dummy=True"
+                )
+        except Exception as e:
+            # don't mask attribute errors from below; only surface availability issues
+            LOG.debug("availability check raised: %s", e)
+
+    # preferred modern api
+    if hasattr(loader, "load_patient_case"):
+        return loader.load_patient_case(case_id)
+
+    # legacy fallbacks
     for fn_name in ("get_case", "load_case", "fetch_case"):
         if hasattr(loader, fn_name):
-            fn = getattr(loader, fn_name)
-            return fn(case_id)
+            return getattr(loader, fn_name)(case_id)
+
+    # offer hints with a few available ids if possible
+    sample_ids: List[str] = []
+    if hasattr(loader, "get_available_patients"):
+        try:
+            sample_ids = loader.get_available_patients(limit=5)
+        except Exception:
+            pass
+
     raise AttributeError(
-        "dataloader must expose one of: .get_case(case_id), .load_case(case_id), .fetch_case(case_id)"
+        "dataloader must expose one of: .load_patient_case(case_id), .get_case(case_id), "
+        ".load_case(case_id), .fetch_case(case_id)"
+        + (f". sample ids: {sample_ids}" if sample_ids else "")
     )
 
 
