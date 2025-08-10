@@ -61,21 +61,10 @@ def _load_panel(panel_path: str) -> List[Dict[str, Any]]:
     """load and normalize expert panel config.
 
     accepted shapes:
-      1) list of experts:
-         [
-           {"id": "onc1", "specialty": "Oncologist", "persona": {...}},
-           ...
-         ]
-      2) dict with one of these keys → list:
-         {"experts": [...]}
-         {"expert_panel": [...]}
-         {"panel": [...]}
-         {"members": [...]}
-
-    each expert must have:
-      - id (or expert_id/eid) → string
-      - specialty (or role/discipline) → string
-      - persona (optional) → object
+      A) list of experts
+      B) {"experts": [...]}
+      C) {"expert_panel": {"experts": [...], <metadata>}}
+      D) dict-of-dicts keyed by id (top-level or under any of the above)
     """
     p = Path(panel_path)
     if not p.exists():
@@ -85,25 +74,75 @@ def _load_panel(panel_path: str) -> List[Dict[str, Any]]:
     except Exception as e:
         raise ValueError(f"failed to parse panel json: {e}") from e
 
-    experts = None
-    if isinstance(cfg, list):
-        experts = cfg
-    elif isinstance(cfg, dict):
-        for key in ("experts", "expert_panel", "panel", "members"):
-            if key in cfg:
-                experts = cfg[key]
-                break
+    # unwrap common container
+    if (
+        isinstance(cfg, dict)
+        and "expert_panel" in cfg
+        and isinstance(cfg["expert_panel"], dict)
+    ):
+        cfg = cfg["expert_panel"]
 
-    if not isinstance(experts, list) or not experts:
+    raw_list = None
+
+    # direct list
+    if isinstance(cfg, list):
+        raw_list = cfg
+
+    # dict with explicit experts list
+    if raw_list is None and isinstance(cfg, dict) and "experts" in cfg:
+        node = cfg["experts"]
+        if isinstance(node, list):
+            raw_list = node
+        elif isinstance(node, dict):  # experts provided as dict-of-dicts
+            raw_list = [{"id": k, **(v or {})} for k, v in node.items()]
+
+    # alias keys at top-level (back-compat)
+    if raw_list is None and isinstance(cfg, dict):
+        for key in (
+            "expert_panel",
+            "panel",
+            "members",
+        ):  # if someone nested differently
+            if key in cfg:
+                node = cfg[key]
+                if isinstance(node, list):
+                    raw_list = node
+                elif (
+                    isinstance(node, dict)
+                    and "experts" in node
+                    and isinstance(node["experts"], list)
+                ):
+                    raw_list = node["experts"]
+                elif isinstance(node, dict) and all(
+                    isinstance(v, dict) for v in node.values()
+                ):
+                    raw_list = [{"id": k, **(v or {})} for k, v in node.items()]
+                if raw_list is not None:
+                    break
+
+    # plain dict-of-dicts at top
+    if (
+        raw_list is None
+        and isinstance(cfg, dict)
+        and cfg
+        and all(isinstance(v, dict) for v in cfg.values())
+    ):
+        raw_list = [{"id": k, **(v or {})} for k, v in cfg.items()]
+
+    if not isinstance(raw_list, list) or not raw_list:
+        keys = list(cfg.keys()) if isinstance(cfg, dict) else type(cfg).__name__
         raise ValueError(
-            "panel config must contain a non-empty list of experts under one of "
-            "['experts','expert_panel','panel','members'] or be a list itself"
+            "panel config must contain a non-empty experts collection. "
+            f"top-level keys seen: {keys!r}"
         )
 
+    # normalize each expert
     normd: List[Dict[str, Any]] = []
-    for i, e in enumerate(experts):
+    for i, e in enumerate(raw_list):
         if not isinstance(e, dict):
-            raise ValueError(f"panel entry {i} must be an object")
+            raise ValueError(
+                f"panel entry {i} must be an object, got {type(e).__name__}"
+            )
         eid = e.get("id") or e.get("expert_id") or e.get("eid")
         if not eid or not isinstance(eid, str):
             raise ValueError(f"panel entry {i} missing expert id (id/expert_id/eid)")
@@ -116,6 +155,12 @@ def _load_panel(panel_path: str) -> List[Dict[str, Any]]:
         if not isinstance(persona, dict):
             raise ValueError(f"panel entry {i} persona must be an object if provided")
         normd.append({"id": eid, "specialty": spec, "persona": persona})
+
+    # ensure id uniqueness
+    ids = [x["id"] for x in normd]
+    if len(set(ids)) != len(ids):
+        raise ValueError(f"duplicate expert_id in panel: {ids}")
+
     return normd
 
 
