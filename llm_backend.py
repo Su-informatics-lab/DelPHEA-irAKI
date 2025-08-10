@@ -159,127 +159,83 @@ class LLMBackend:
           - clinical_context: dict
           - minority_view: str
           - temperature: float
+
         Returns:
-          dict suitable for models.DebateTurn(**dict)
+          dict suitable for models.DebateTurn(**dict), i.e.
+          {
+            "expert_id": "...",
+            "qid": "...",
+            "round_no": 2,
+            "text": "<plain argument>",
+            "satisfied": true
+          }
         """
-        expert_id = payload.get("expert_id", "unknown_expert")
-        specialty = payload.get("specialty", "expert")
-        qid = payload.get("qid", "unknown_qid")
-        round_no = int(payload.get("round_no", 2))
-        minority_view = payload.get("minority_view", "")
-        clinical_context = payload.get("clinical_context", {})
-        temperature = float(payload.get("temperature", 0.3))
+        expert_id = str(payload.get("expert_id") or "unknown_expert")
+        specialty = str(payload.get("specialty") or "expert")
+        qid = str(payload.get("qid") or "unknown_qid")
+        round_no = int(payload.get("round_no") or 2)
+        minority_view = str(payload.get("minority_view") or "")
+        clinical_context = payload.get("clinical_context") or {}
+        temperature = float(payload.get("temperature") or self.temperature_r2 or 0.3)
 
-        system = (
-            "You are a clinical expert participating in a structured, single-turn debate. "
-            "Return ONLY one JSON object with your argument."
-        )
-        user = (
-            f"Role: {specialty} ({expert_id})\n"
-            f"Question ID: {qid}\n"
-            f"Round: {round_no}\n\n"
-            "Clinical context (JSON):\n"
-            f"{json.dumps(clinical_context, ensure_ascii=False)}\n\n"
-            "Minority view summary:\n"
-            f"{minority_view}\n\n"
-            "TASK: Write a concise, evidence-grounded argument (<=150 words) addressing the question.\n"
-            "OUTPUT: Return ONLY a JSON object with fields:\n"
-            "{\n"
-            f'  "expert_id": "{expert_id}",\n'
-            f'  "qid": "{qid}",\n'
-            f'  "round_no": {round_no},\n'
-            '  "content": "short argument text",\n'
-            '  "stance": "support" | "oppose" | "nuanced",\n'
-            '  "citations": ["optional strings"]\n'
-            "}\n"
+        # Best-effort case id (optional, for prompt context only)
+        case_id = None
+        try:
+            case = (
+                clinical_context.get("case")
+                if isinstance(clinical_context, dict)
+                else None
+            )
+            if isinstance(case, dict):
+                for k in ("case_id", "id", "patient_id", "person_id"):
+                    v = case.get(k)
+                    if v:
+                        case_id = str(v)
+                        break
+        except Exception:
+            case_id = None
+
+        header = f"Debate turn for question {qid} (round {round_no})."
+        role = f"Role: {expert_id} ({specialty})."
+        cid = f"Case: {case_id or '(unspecified)'}."
+        mv = (
+            f"Minority view:\n{minority_view}"
+            if minority_view
+            else "Minority view: (not provided)."
         )
 
-        # try JSON-mode completion first
+        prompt = (
+            f"{header}\n{role}\n{cid}\n\n"
+            f"{mv}\n\n"
+            "Write a concise, evidence-grounded argument (<= 180 words) that addresses the point. "
+            "Return PLAIN TEXT only — no lists, no markdown, no JSON."
+        )
+
         try:
             text = self.generate(
-                user, max_tokens=600, temperature=temperature, system=system
-            )
-            obj = self._safe_first_json(text)
-            if isinstance(obj, dict):
-                # ensure required identifiers present
-                obj.setdefault("expert_id", expert_id)
-                obj.setdefault("qid", qid)
-                obj.setdefault("round_no", round_no)
-                # compatibility: some schemas name the field "argument" instead of "content"
-                if "argument" not in obj and "content" in obj:
-                    obj["argument"] = obj["content"]
-                if "content" not in obj and "argument" in obj:
-                    obj["content"] = obj["argument"]
-                if "citations" not in obj:
-                    obj["citations"] = []
-                return obj
-        except Exception:
-            # fall through to plain completion path below
-            pass
-
-        # fallback: ask plain completion and wrap it
-        try:
-            plain = self.generate(
-                f"{user}\nReturn just the argument text (no JSON) if you cannot return JSON.",
-                max_tokens=400,
+                prompt,
+                max_tokens=512,
                 temperature=temperature,
-                system="You are concise and factual.",
+                system="You are a clinical expert generating short, plain-text debate arguments. No markdown, no JSON.",
             )
         except Exception:
-            plain = "Unable to generate debate content."
+            text = "Unable to generate debate content."
 
+        # normalize & guard against None
+        try:
+            text = (text or "").strip()
+        except Exception:
+            text = "Unable to generate debate content."
+
+        if not text:
+            text = "No argument produced."
+
+        # Minimal, schema-friendly shape
         return {
             "expert_id": expert_id,
             "qid": qid,
             "round_no": round_no,
-            "content": plain.strip(),
-            "argument": plain.strip(),  # compatibility with alternate schemas
-            "citations": [],
-            "stance": "nuanced",
+            "text": text,
+            # conservative default; flip to False here if you want a stricter stance
+            "satisfied": True,
         }
-
-    # ----------------------------- utils ----------------------------------
-
-    @staticmethod
-    def _safe_first_json(text: str) -> Any:
-        """Extract and parse the first JSON object in text; return dict on success or None."""
-        if not isinstance(text, str):
-            return None
-        # fenced block first
-        fence = text.find("```json")
-        if fence == -1:
-            fence = text.find("```JSON")
-        if fence != -1:
-            end = text.find("```", fence + 7)
-            if end != -1:
-                text = text[fence + 7 : end]
-
-        # find first '{' and balance braces
-        start = text.find("{")
-        if start == -1:
-            return None
-        brace = 0
-        in_str = False
-        esc = False
-        for i in range(start, len(text)):
-            ch = text[i]
-            if in_str:
-                if esc:
-                    esc = False
-                elif ch == "\\":
-                    esc = True
-                elif ch == '"':
-                    in_str = False
-            else:
-                if ch == '"':
-                    in_str = True
-                elif ch == "{":
-                    brace += 1
-                elif ch == "}":
-                    brace -= 1
-                    if brace == 0:
-                        try:
-                            return json.loads(text[start : i + 1])
-                        except Exception:
-                            return None
-        return None
