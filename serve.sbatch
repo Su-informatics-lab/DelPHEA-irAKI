@@ -15,6 +15,7 @@ set -euo pipefail
 
 # paths
 export HF_HOME="$HOME/hf-cache"
+# try gptoss image first; switch to vllm-latest.sif if issues persist
 export IMG_FILE="$HOME/containers/vllm-gptoss.sif"
 export JOB_SCRATCH="$HOME/DelPHEA-irAKI/tmp/$SLURM_JOB_ID"
 mkdir -p "$HF_HOME" logs "$JOB_SCRATCH"
@@ -22,20 +23,15 @@ mkdir -p "$HF_HOME" logs "$JOB_SCRATCH"
 # gpu env
 export CUDA_VISIBLE_DEVICES=0,1
 export NCCL_IB_DISABLE=1
-export TORCH_CUDA_ARCH_LIST="9.0"   # H100
+export TORCH_CUDA_ARCH_LIST="9.0"   # h100
 
-# --- vllm engine / attention (V1 + valid backend) ---
+# ---- vllm v1 engine + stable attention backend ----
 export VLLM_USE_V1=1
-# preferred on H100; let FA3 load
-export VLLM_ATTENTION_BACKEND=FLASH_ATTN
-# optional: force FA v3 if present
-export VLLM_FLASH_ATTN_VERSION=3
-# avoid flashinfer JIT unless you explicitly want it
-export VLLM_DISABLE_FLASHINFER=1
-
-# logging so worker errors surface
+export VLLM_ATTENTION_BACKEND=TRITON_ATTN   # valid in v1
+export VLLM_DISABLE_FLASHINFER=1            # avoid extra JIT path
+# logging to surface worker issues
 export VLLM_CONFIGURE_LOGGING=1
-export VLLM_LOGGING_LEVEL=INFO
+export VLLM_LOGGING_LEVEL=DEBUG
 
 # tensor parallel across the two gpus
 export TENSOR_PARALLEL=2
@@ -57,14 +53,15 @@ print("cuda available:", torch.cuda.is_available(), "ngpus:", torch.cuda.device_
 print("vllm:", vllm.__version__)
 PY
 
-# serve via the official CLI
+# serve via official CLI; keep context modest to rule out KV pressure
 apptainer exec --nv \
   --bind "$HF_HOME":/root/.cache/huggingface \
   --bind "$JOB_SCRATCH":/tmp \
   "$IMG_FILE" \
   vllm serve openai/gpt-oss-120b \
     --tensor-parallel-size "$TENSOR_PARALLEL" \
-    --gpu-memory-utilization 0.90 \
+    --gpu-memory-utilization 0.85 \
+    --max-model-len 8192 \
     --host 0.0.0.0 \
     --port 8000 \
     --async-scheduling
