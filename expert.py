@@ -4,11 +4,11 @@ expert agent: specialty-conditioned assessor that emits strictly validated json.
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any, Dict, List, Optional
 
 from llm_backend import LLMBackend
-from messages import ExpertRound1Reply, ExpertRound3Reply
 from models import AssessmentR1, AssessmentR3, DebateTurn
 from prompts.rounds import format_round1_prompt, format_round3_prompt
 from schema import load_qids
@@ -48,7 +48,7 @@ class Expert:
         questionnaire_path: str,
         repair_hint: Optional[str] = None,  # reserved for future use
     ) -> AssessmentR1:
-        """produce a round-1 assessment using instructor + pydantic conversion."""
+        """produce a round-1 assessment using strict pydantic validation at the boundary."""
         # validate questionnaire early (fail loud if malformed/missing)
         load_qids(questionnaire_path)
 
@@ -63,16 +63,14 @@ class Expert:
         )
 
         reply = call_llm_with_schema(
-            response_model=ExpertRound1Reply,  # messages.* schema for instructor
+            response_model=AssessmentR1,  # strict final model
             prompt_text=prompt_text,
-            backend=self.backend,  # validators infer base_url/model
+            backend=self.backend,
             temperature=0.0,
             max_retries=1,
         )
-        payload = reply.model_dump()
-        self._log_preview(payload, "[r1 parsed]")
-        # return models.* pydantic to satisfy moderator/aggregator contracts
-        return AssessmentR1(**payload)
+        self._log_preview(reply, "r1-validated")
+        return reply  # already a validated AssessmentR1
 
     def assess_round3(
         self,
@@ -81,7 +79,7 @@ class Expert:
         debate_context: Dict[str, Any],
         repair_hint: Optional[str] = None,  # reserved for future use
     ) -> AssessmentR3:
-        """produce a round-3 reassessment using instructor + pydantic conversion."""
+        """produce a round-3 reassessment using strict pydantic validation at the boundary."""
         load_qids(questionnaire_path)
 
         info = self._extract_case_strings(case)
@@ -96,15 +94,14 @@ class Expert:
         )
 
         reply = call_llm_with_schema(
-            response_model=ExpertRound3Reply,  # messages.* schema for instructor
+            response_model=AssessmentR3,  # strict final model
             prompt_text=prompt_text,
             backend=self.backend,
             temperature=0.0,
             max_retries=1,
         )
-        payload = reply.model_dump()
-        self._log_preview(payload, "[r3 parsed]")
-        return AssessmentR3(**payload)
+        self._log_preview(reply, "r3-validated")
+        return reply  # already a validated AssessmentR3
 
     # --------- debate (round 2 single turn) ---------
 
@@ -121,7 +118,6 @@ class Expert:
         if round_no not in (1, 2, 3):
             raise ValueError(f"unsupported round_no for debate: {round_no}")
 
-        # keep using backend's debate hook (yagni: no instructor schema unless needed)
         payload = {
             "expert_id": self.expert_id,
             "specialty": self.specialty,
@@ -132,6 +128,18 @@ class Expert:
         }
         raw = self.backend.debate(payload)
         self._log_preview(raw, f"[debate {qid} raw]")
+
+        # minimal hardening: accept dict, pydantic model, or json string
+        if hasattr(raw, "model_dump"):
+            raw = raw.model_dump()
+        elif isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except Exception as e:
+                raise ValueError(f"backend.debate returned non-json string: {e}") from e
+        if not isinstance(raw, dict):
+            raise TypeError("backend.debate must return a dict-like (or json string)")
+
         return DebateTurn(**raw)
 
     # --------- helpers ---------
@@ -152,9 +160,12 @@ class Expert:
         items = d.items()
         if allow_keys:
             allow = set(allow_keys)
-            items = [(k, v) for k, v in d.items() if k in allow]
+            items = ((k, v) for k, v in d.items() if k in allow)
+        # ensure stable ordering
         return "\n".join(
-            f"{k}: {v}" for k, v in items if v is not None and str(v).strip()
+            f"{k}: {v}"
+            for k, v in sorted(items, key=lambda kv: str(kv[0]))
+            if v is not None and str(v).strip()
         )
 
     def _coerce_demographics(self, case: Dict[str, Any]) -> str:
