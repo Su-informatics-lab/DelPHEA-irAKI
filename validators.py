@@ -108,7 +108,9 @@ def call_llm_with_schema(
 
     base_url, model_name = _infer_endpoint_and_model(backend, endpoint_url, model)
     api_key = os.getenv("OPENAI_API_KEY", "EMPTY")
-    client = patch(OpenAI(base_url=base_url, api_key=api_key))
+
+    # set default mode=JSON at patch time; do NOT pass `mode` again in create()
+    client = patch(OpenAI(base_url=base_url, api_key=api_key), mode=Mode.JSON)
 
     try:
         result = client.chat.completions.create(
@@ -119,8 +121,9 @@ def call_llm_with_schema(
             stop=stop,
             seed=seed,
             response_model=dict[str, Any],
-            mode=Mode.JSON,  # prompt-enforced json; server-agnostic
-            max_retries=max_retries,  # 5 retries
+            # no 'mode' here to avoid double-passing in some instructor versions
+            # retries handled by instructor using the patched client
+            max_retries=max_retries,
         )
     except Exception as e:  # noqa: BLE001
         raise PayloadValidationError(f"instructor call failed: {e}") from e
