@@ -65,6 +65,7 @@ class Expert:
         info = self._extract_case_strings(case)
         prompt_text = format_round1_prompt(
             expert_name=self._expert_name(),
+            expert_id=self.expert_id,
             specialty=self.specialty,
             case_id=info["case_id"],
             demographics=info["demographics"],
@@ -109,6 +110,7 @@ class Expert:
         info = self._extract_case_strings(case)
         prompt_text = format_round3_prompt(
             expert_name=self._expert_name(),
+            expert_id=self.expert_id,
             specialty=self.specialty,
             case_id=info["case_id"],
             demographics=info["demographics"],

@@ -265,19 +265,46 @@ class Moderator:
             )
         return assessed.__class__(**d)
 
+    def _validation_payload_with_ids(
+        self, assessed: AssessmentR1 | AssessmentR3, expert, case: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Return a dict suitable for validators, guaranteeing case_id/expert_id fields."""
+        d = assessed.model_dump() if hasattr(assessed, "model_dump") else dict(assessed)
+        # derive case_id deterministically from the case payload or transient context
+        cid = None
+        if isinstance(case, dict):
+            cid = (
+                case.get("case_id")
+                or case.get("id")
+                or case.get("patient_id")
+                or case.get("person_id")
+            )
+        d["case_id"] = (
+            d.get("case_id")
+            or cid
+            or getattr(self, "current_case_id", None)
+            or "unknown_case"
+        )
+        d["expert_id"] = (
+            d.get("expert_id")
+            or getattr(expert, "expert_id", None)
+            or getattr(self, "current_expert_id", None)
+            or "unknown_expert"
+        )
+        return d
+
     def _call_round1_with_repair(self, expert, case: Dict[str, Any]) -> AssessmentR1:
-        """call expert.assess_round1 with one-shot retry and auto-repair fallback."""
         attempt = 0
         last_err: ValidationError | None = None
         self.current_expert_id = getattr(expert, "expert_id", None)
         self.current_case_id = case.get("case_id") if isinstance(case, dict) else None
 
+        a1 = None
         while attempt <= self.max_retries:
             a1 = expert.assess_round1(case, self.qpath)
-            # ensure identifiers before validation
-            a1 = self._ensure_ids(a1, expert, case)
+            vd = self._validation_payload_with_ids(a1, expert, case)
             try:
-                validate_round1_payload(a1.model_dump(), required_evidence=12)
+                validate_round1_payload(vd, required_evidence=12)
                 if attempt > 0:
                     self.logger.info(
                         "round1 validation succeeded after retry for %s",
@@ -292,40 +319,35 @@ class Moderator:
                 attempt += 1
                 if attempt > self.max_retries:
                     break
-                # build a short repair hint and try to re-ask the expert
                 hint = self._build_repair_hint(ve, round_no=1)
                 a1 = self._retry_assess_round1(expert, case, hint)
-                a1 = self._ensure_ids(a1, expert, case)
-                # loop will validate again
 
-        # auto-repair as last resort
         self.logger.warning(
             "auto-repairing round1 payload for %s (last error: %s)",
             expert.expert_id,
             last_err,
         )
-        # we assume the assessed object is structurally close; patch deterministically
-        patched = self._autopatch_round1(
-            a1.model_dump()
-            if last_err
-            else expert.assess_round1(case, self.qpath).model_dump()
+        # patch on top of the most recent vd so IDs are guaranteed
+        vd = self._validation_payload_with_ids(
+            a1 or expert.assess_round1(case, self.qpath), expert, case
         )
+        patched = self._autopatch_round1(vd)
         return AssessmentR1(**patched)
 
     def _call_round3_with_repair(
         self, expert, case: Dict[str, Any], ctx: Dict[str, Any]
     ) -> AssessmentR3:
-        """call expert.assess_round3 with one-shot retry and auto-repair fallback."""
         attempt = 0
         last_err: ValidationError | None = None
         self.current_expert_id = getattr(expert, "expert_id", None)
         self.current_case_id = case.get("case_id") if isinstance(case, dict) else None
 
+        a3 = None
         while attempt <= self.max_retries:
             a3 = expert.assess_round3(case, self.qpath, ctx)
-            a3 = self._ensure_ids(a3, expert, case)
+            vd = self._validation_payload_with_ids(a3, expert, case)
             try:
-                validate_round3_payload(a3.model_dump())
+                validate_round3_payload(vd)
                 if attempt > 0:
                     self.logger.info(
                         "round3 validation succeeded after retry for %s",
@@ -342,18 +364,16 @@ class Moderator:
                     break
                 hint = self._build_repair_hint(ve, round_no=3)
                 a3 = self._retry_assess_round3(expert, case, ctx, hint)
-                a3 = self._ensure_ids(a3, expert, case)
 
         self.logger.warning(
             "auto-repairing round3 payload for %s (last error: %s)",
             expert.expert_id,
             last_err,
         )
-        patched = self._autopatch_round3(
-            a3.model_dump()
-            if last_err
-            else expert.assess_round3(case, self.qpath, ctx).model_dump()
+        vd = self._validation_payload_with_ids(
+            a3 or expert.assess_round3(case, self.qpath, ctx), expert, case
         )
+        patched = self._autopatch_round3(vd)
         return AssessmentR3(**patched)
 
     # --------- helpers: retry & autopatch ---------
