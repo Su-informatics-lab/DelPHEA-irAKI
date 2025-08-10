@@ -1,6 +1,6 @@
 # validators.py
 # instructor-based structured output with robust retries.
-# accepts both `prompt` and `prompt_text` for backward compatibility.
+# stable api: backend is OPTIONAL; accept prompt or prompt_text; provide helper utilities.
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ class PayloadValidationError(RuntimeError):
     """raised when model output cannot be coerced into the expected structured payload."""
 
 
-# backward-compat alias
+# backward-compat alias for older imports
 class ValidationError(PayloadValidationError):
     pass
 
@@ -31,40 +31,55 @@ __all__ = [
 
 
 def _infer_endpoint_and_model(
-    backend: Any, endpoint_url: Optional[str], model: Optional[str]
+    backend: Any | None, endpoint_url: Optional[str], model: Optional[str]
 ) -> tuple[str, str]:
-    # prefer explicit args/env; fallback to backend attributes
-    ep = (endpoint_url or os.getenv("OPENAI_BASE_URL", "")).rstrip("/")
-    mdl = (model or os.getenv("OPENAI_MODEL", "")).strip()
+    """infer endpoint and model from args/env/backend.
 
+    priority:
+      1) explicit args
+      2) env OPENAI_BASE_URL/OPENAI_MODEL
+      3) backend attributes (_base/endpoint_url, _model/model/model_name)
+    """
+    # explicit
+    ep = (endpoint_url or "").strip()
+    mdl = (model or "").strip()
+
+    # env
     if not ep:
-        ep = getattr(backend, "_base", "") or getattr(backend, "endpoint_url", "")
+        ep = os.getenv("OPENAI_BASE_URL", "").strip()
     if not mdl:
-        mdl = (
-            getattr(backend, "_model", "")
-            or getattr(backend, "model", "")
-            or getattr(backend, "model_name", "")
-        )
+        mdl = os.getenv("OPENAI_MODEL", "").strip()
+
+    # backend
+    if backend is not None:
+        if not ep:
+            ep = getattr(backend, "_base", "") or getattr(backend, "endpoint_url", "")
+        if not mdl:
+            mdl = (
+                getattr(backend, "_model", "")
+                or getattr(backend, "model", "")
+                or getattr(backend, "model_name", "")
+            )
 
     if not ep:
         raise ValueError(
-            "validators: cannot infer endpoint_url; pass explicitly or set OPENAI_BASE_URL"
+            "validators: cannot infer endpoint_url; pass endpoint_url or set OPENAI_BASE_URL"
         )
     if not mdl:
         raise ValueError(
-            "validators: cannot infer model name; pass explicitly or set OPENAI_MODEL"
+            "validators: cannot infer model name; pass model or set OPENAI_MODEL"
         )
 
+    ep = ep.rstrip("/")
     if not ep.endswith("/v1"):
         ep = ep + "/v1"
     return ep, mdl
 
 
 def call_llm_with_schema(
-    backend: Any,
-    prompt: Optional[str] = None,
-    /,
+    backend: Any | None = None,
     *,
+    prompt: Optional[str] = None,
     prompt_text: Optional[str] = None,
     endpoint_url: Optional[str] = None,
     model: Optional[str] = None,
@@ -78,10 +93,11 @@ def call_llm_with_schema(
     """generate and validate a structured payload using Instructor.
 
     Args:
-        backend: existing backend object (used only to discover endpoint/model).
-        prompt: prompt text (legacy name).
-        prompt_text: prompt text (new name). if both given, prompt_text wins.
-        endpoint_url, model, temperature, max_tokens, stop, seed, max_retries: usual knobs.
+        backend: optional backend object; used to discover endpoint/model if not given.
+        prompt/prompt_text: prompt string (either key works).
+        endpoint_url, model: override discovery.
+        temperature, max_tokens, stop, seed: usual generation settings.
+        max_retries: structured retries (default 5).
 
     Returns:
         dict[str, Any]: parsed payload guaranteed to be valid json.
@@ -103,8 +119,8 @@ def call_llm_with_schema(
             stop=stop,
             seed=seed,
             response_model=dict[str, Any],
-            mode=Mode.JSON,
-            max_retries=max_retries,
+            mode=Mode.JSON,  # prompt-enforced json; server-agnostic
+            max_retries=max_retries,  # 5 retries
         )
     except Exception as e:  # noqa: BLE001
         raise PayloadValidationError(f"instructor call failed: {e}") from e
@@ -121,25 +137,30 @@ def call_llm_with_schema(
 
 
 def validate_round1_payload(payload: Dict[str, Any]) -> None:
-    """permissive sanity checks for round 1 outputs; fail loud on obvious issues."""
     if not isinstance(payload, dict) or not payload:
         raise ValidationError("round1: payload must be a non-empty object")
-    # common fields (optional): probability, evidence list
     if "probability" in payload:
         p = payload["probability"]
-        if not isinstance(p, (int, float)) or not (0 <= float(p) <= 1):
+        try:
+            pf = float(p)
+        except Exception as e:  # noqa: BLE001
+            raise ValidationError(f"round1: probability not a number: {p}") from e
+        if not (0.0 <= pf <= 1.0):
             raise ValidationError(f"round1: probability out of range: {p}")
     if "evidence" in payload and not isinstance(payload["evidence"], (list, str)):
         raise ValidationError("round1: evidence must be a list or string")
 
 
 def validate_round3_payload(payload: Dict[str, Any]) -> None:
-    """permissive sanity checks for round 3 consensus-related outputs."""
     if not isinstance(payload, dict) or not payload:
         raise ValidationError("round3: payload must be a non-empty object")
     if "final_probability" in payload:
         p = payload["final_probability"]
-        if not isinstance(p, (int, float)) or not (0 <= float(p) <= 1):
+        try:
+            pf = float(p)
+        except Exception as e:  # noqa: BLE001
+            raise ValidationError(f"round3: final_probability not a number: {p}") from e
+        if not (0.0 <= pf <= 1.0):
             raise ValidationError(f"round3: final_probability out of range: {p}")
 
 
