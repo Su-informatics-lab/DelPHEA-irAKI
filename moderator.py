@@ -145,6 +145,14 @@ class Moderator:
             outputs.append((e.expert_id, a3))
         return outputs
 
+    def _extract_case_id(self, case: Dict[str, Any]) -> str:
+        if isinstance(case, dict):
+            for k in ("case_id", "id", "patient_id", "person_id"):
+                v = case.get(k)
+                if v:
+                    return str(v)
+        return "unknown_case"
+
     def detect_and_run_debates(
         self, r1: Sequence[Tuple[str, AssessmentR1]], case: Dict[str, Any]
     ) -> Dict[str, Any]:
@@ -161,7 +169,10 @@ class Moderator:
         disagreement_present = solicitations > 0
 
         # explicit log of debate status for operator visibility
-        log_debate_status(disagreement_present=disagreement_present, logger=self.logger)
+        cid = self._extract_case_id(case)
+        log_debate_status(
+            disagreement_present=disagreement_present, logger=self.logger, case_id=cid
+        )
 
         transcripts: Dict[str, List[Dict[str, Any]]] = {}
         if not disagreement_present:
