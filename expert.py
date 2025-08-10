@@ -174,20 +174,63 @@ class Expert:
         raw = self.backend.debate(payload)
         self._log_preview(raw, f"[debate {qid} raw]")
 
-        # minimal hardening: accept dict, pydantic model, or json string
+        # normalize backend reply into DebateTurn schema
+        turn = self._coerce_debate_turn(raw, qid=qid, round_no=round_no)
+        return turn
+
+    # --------- helpers ---------
+
+    def _coerce_debate_turn(self, raw: Any, *, qid: str, round_no: int) -> DebateTurn:
+        """best-effort coercion of backend reply into DebateTurn fields.
+
+        Guarantees:
+          - expert_id, qid, round_no
+          - text: uses raw['text'] or raw['content'] or raw['argument'] or raw_string
+          - satisfied: bool (default heuristic based on presence of substantive text)
+          - citations: list[str] if present else []
+        """
+        # accept dict, pydantic-like, or json string
         if hasattr(raw, "model_dump"):
             raw = raw.model_dump()
         elif isinstance(raw, str):
             try:
                 raw = json.loads(raw)
-            except Exception as e:
-                raise ValueError(f"backend.debate returned non-json string: {e}") from e
+            except Exception:
+                # treat raw string as the debate text
+                raw = {"text": raw}
+
         if not isinstance(raw, dict):
-            raise TypeError("backend.debate must return a dict-like (or json string)")
+            raw = {}
 
-        return DebateTurn(**raw)
+        # choose the best available text field
+        text = (
+            (raw.get("text") if isinstance(raw.get("text"), str) else None)
+            or (raw.get("content") if isinstance(raw.get("content"), str) else None)
+            or (raw.get("argument") if isinstance(raw.get("argument"), str) else None)
+            or ""
+        ).strip()
 
-    # --------- helpers ---------
+        # satisfied: prefer explicit; else infer from text length
+        sat = raw.get("satisfied")
+        if not isinstance(sat, bool):
+            sat = bool(len(text) >= 20)
+
+        citations = raw.get("citations")
+        if not isinstance(citations, list):
+            citations = []
+        else:
+            citations = [str(x) for x in citations]
+
+        base = {
+            "expert_id": self.expert_id,
+            "qid": qid,
+            "round_no": int(round_no),
+            "text": text if text else "[auto-repair] debate content missing.",
+            "satisfied": sat,
+            "citations": citations,
+        }
+
+        return DebateTurn(**base)
 
     def _expert_name(self) -> str:
         """derive display name for prompts."""
