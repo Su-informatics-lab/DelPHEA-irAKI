@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from llm_backend import LLMBackend
@@ -29,6 +31,7 @@ class Expert:
         temperature_r1: float = 0.0,
         temperature_r2: float = 0.3,
         temperature_r3: float = 0.0,
+        dump_root: Optional[str | Path] = None,  # optional: where to dump io traces
     ) -> None:
         # validate
         if not expert_id:
@@ -46,6 +49,12 @@ class Expert:
         self.temperature_r1 = float(temperature_r1)
         self.temperature_r2 = float(temperature_r2)  # debate
         self.temperature_r3 = float(temperature_r3)
+
+        # optional io dump root (env fallback)
+        env_root = os.getenv("DELPHEA_OUT_DIR")
+        self._dump_root: Optional[Path] = (
+            Path(dump_root) if dump_root else (Path(env_root) if env_root else None)
+        )
 
         # logger
         self.logger = logging.getLogger(f"expert.{self.expert_id}")
@@ -72,12 +81,19 @@ class Expert:
             clinical_notes=info["clinical_notes"],
             qpath=questionnaire_path,
         )
-        # belt-and-suspenders: require identifiers in the JSON output
+        # belt-and-suspenders: require identifiers in the JSON output (fixed quoting)
         prompt_text += (
-            f"\n\nIMPORTANT: In your JSON output, you MUST include precisely these keys:\n"
-            f'- "case_id": "{info["case_id"]}"\n'
-            f'- "expert_id": "{self.expert_id}"\n'
-            f"Return ONLY valid JSON."
+            "\n\nIMPORTANT: In your JSON output, you MUST include precisely these keys:\n"
+            '- "case_id": "{case_id}"\n'
+            '- "expert_id": "{expert_id}"\n'
+            "Return ONLY valid JSON."
+        ).format(case_id=info["case_id"], expert_id=self.expert_id)
+
+        # dump prompt (optional)
+        self._dump_text(
+            case_id=info["case_id"],
+            relpath=f"experts/{self.expert_id}/r1.prompt.txt",
+            text=prompt_text,
         )
 
         reply = call_llm_with_schema(
@@ -93,6 +109,13 @@ class Expert:
             d.setdefault("case_id", info["case_id"])
             d.setdefault("expert_id", self.expert_id)
             reply = AssessmentR1(**d)
+
+        # dump validated output (optional)
+        self._dump_json(
+            case_id=info["case_id"],
+            relpath=f"experts/{self.expert_id}/r1.output.json",
+            obj=reply.model_dump(),
+        )
 
         self._log_preview(reply, "r1-validated")
         return reply  # already a validated AssessmentR1
@@ -116,14 +139,26 @@ class Expert:
             demographics=info["demographics"],
             clinical_notes=info["clinical_notes"],
             qpath=questionnaire_path,
-            debate_ctx=debate_context,
+            debate_ctx=debate_context,  # tolerated by format_round3_prompt (**_ sink)
         )
-        # require identifiers again for consistency
+        # require identifiers again for consistency (fixed quoting)
         prompt_text += (
-            f"\n\nIMPORTANT: In your JSON output, you MUST include precisely these keys:\n"
-            f'- "case_id": "{info["case_id"]}"\n'
-            f'- "expert_id": "{self.expert_id}"\n'
-            f"Return ONLY valid JSON."
+            "\n\nIMPORTANT: In your JSON output, you MUST include precisely these keys:\n"
+            '- "case_id": "{case_id}"\n'
+            '- "expert_id": "{expert_id}"\n'
+            "Return ONLY valid JSON."
+        ).format(case_id=info["case_id"], expert_id=self.expert_id)
+
+        # dump prompt & r3 context (optional)
+        self._dump_text(
+            case_id=info["case_id"],
+            relpath=f"experts/{self.expert_id}/r3.prompt.txt",
+            text=prompt_text,
+        )
+        self._dump_json(
+            case_id=info["case_id"],
+            relpath=f"experts/{self.expert_id}/r3.debate_ctx.json",
+            obj=debate_context,
         )
 
         reply = call_llm_with_schema(
@@ -139,6 +174,13 @@ class Expert:
             d.setdefault("case_id", info["case_id"])
             d.setdefault("expert_id", self.expert_id)
             reply = AssessmentR3(**d)
+
+        # dump validated output (optional)
+        self._dump_json(
+            case_id=info["case_id"],
+            relpath=f"experts/{self.expert_id}/r3.output.json",
+            obj=reply.model_dump(),
+        )
 
         self._log_preview(reply, "r3-validated")
         return reply  # already a validated AssessmentR3
@@ -162,6 +204,9 @@ class Expert:
         if round_no not in (1, 2, 3):
             raise ValueError(f"unsupported round_no for debate: {round_no}")
 
+        # best effort case_id extraction from clinical_context
+        case_id = self._extract_case_id_from_context(clinical_context) or "unknown_case"
+
         payload = {
             "expert_id": self.expert_id,
             "specialty": self.specialty,
@@ -171,11 +216,27 @@ class Expert:
             "minority_view": minority_view,
             "temperature": self.temperature_r2,  # r2 temperature
         }
+
+        # dump the request we’re sending to the backend (optional)
+        self._dump_json(
+            case_id=case_id,
+            relpath=f"experts/{self.expert_id}/debate/{qid}.request.json",
+            obj=payload,
+        )
+
         raw = self.backend.debate(payload)
         self._log_preview(raw, f"[debate {qid} raw]")
 
         # normalize backend reply into DebateTurn schema
         turn = self._coerce_debate_turn(raw, qid=qid, round_no=round_no)
+
+        # dump the normalized/validated turn (optional)
+        self._dump_json(
+            case_id=case_id,
+            relpath=f"experts/{self.expert_id}/debate/{qid}.turn.json",
+            obj=turn.model_dump(),
+        )
+
         return turn
 
     # --------- helpers ---------
@@ -350,6 +411,50 @@ class Expert:
         notes = self._coerce_notes(case)
 
         return {"case_id": str(cid), "demographics": demo, "clinical_notes": notes}
+
+    # --------- dump helpers (optional) ---------
+
+    def _mk_dump_dir(self, case_id: str, relpath: str) -> Optional[Path]:
+        if not self._dump_root:
+            return None
+        base = Path(self._dump_root) / str(case_id)
+        # allow absolute relpath? no — always under case dir
+        full = base / relpath
+        try:
+            full.parent.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            return None
+        return full
+
+    def _dump_text(self, *, case_id: str, relpath: str, text: str) -> None:
+        p = self._mk_dump_dir(case_id, relpath)
+        if not p:
+            return
+        try:
+            p.write_text(text if isinstance(text, str) else str(text))
+        except Exception:
+            pass
+
+    def _dump_json(self, *, case_id: str, relpath: str, obj: Any) -> None:
+        p = self._mk_dump_dir(case_id, relpath)
+        if not p:
+            return
+        try:
+            p.write_text(json.dumps(obj, ensure_ascii=False, indent=2))
+        except Exception:
+            pass
+
+    def _extract_case_id_from_context(self, ctx: Dict[str, Any]) -> Optional[str]:
+        try:
+            case = ctx.get("case") if isinstance(ctx, dict) else None
+            if isinstance(case, dict):
+                for k in ("case_id", "id", "patient_id", "person_id"):
+                    v = case.get(k)
+                    if v:
+                        return str(v)
+        except Exception:
+            return None
+        return None
 
     def _log_preview(self, obj: Any, tag: str) -> None:
         """log a short preview of backend output for debugging (best-effort)."""

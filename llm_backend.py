@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import json
 import os
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 import requests
@@ -146,6 +148,37 @@ class LLMBackend:
         data = r.json()
         return data["choices"][0]["message"]["content"]
 
+    # ----------------------------- safe dumping (optional) ------------------------------
+
+    @staticmethod
+    def _safe_name(x: Any, default: str) -> str:
+        s = str(x) if x is not None else default
+        # allow letters, digits, _, -, .
+        cleaned = "".join(ch for ch in s if ch.isalnum() or ch in "._-")
+        return cleaned or default
+
+    @staticmethod
+    def _dump_write(base: Optional[Path], rel: str, content: str) -> None:
+        if not base:
+            return
+        try:
+            p = base / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(content)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _dump_json(base: Optional[Path], rel: str, obj: Any) -> None:
+        if not base:
+            return
+        try:
+            p = base / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(json.dumps(obj, ensure_ascii=False, indent=2))
+        except Exception:
+            pass
+
     # ----------------------------- debate api ------------------------------
 
     def debate(self, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -211,6 +244,31 @@ class LLMBackend:
             "Return PLAIN TEXT only — no lists, no markdown, no JSON."
         )
 
+        # optional dump root
+        dump_root_env = os.getenv("DELPHEA_OUT_DIR")
+        dump_base: Optional[Path] = Path(dump_root_env) if dump_root_env else None
+        safe_case = self._safe_name(case_id or "unknown_case", "unknown_case")
+        safe_eid = self._safe_name(expert_id, "unknown_expert")
+        safe_qid = self._safe_name(qid, "Q")
+        subdir = f"{safe_case}/experts/{safe_eid}/debate/{safe_qid}"
+
+        # dump prompt + meta (best-effort, never raise)
+        self._dump_write(dump_base, f"{subdir}/prompt.txt", prompt)
+        self._dump_json(
+            dump_base,
+            f"{subdir}/meta.json",
+            {
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "model_name": self.model_name,
+                "temperature": temperature,
+                "round_no": round_no,
+                "expert_id": expert_id,
+                "qid": qid,
+                "case_id": case_id,
+                "minority_view_len": len(minority_view),
+            },
+        )
+
         try:
             text = self.generate(
                 prompt,
@@ -230,8 +288,7 @@ class LLMBackend:
         if not text:
             text = "No argument produced."
 
-        # Minimal, schema-friendly shape
-        return {
+        result = {
             "expert_id": expert_id,
             "qid": qid,
             "round_no": round_no,
@@ -239,3 +296,8 @@ class LLMBackend:
             # conservative default; flip to False here if you want a stricter stance
             "satisfied": True,
         }
+
+        # dump turn (best-effort)
+        self._dump_json(dump_base, f"{subdir}/turn.json", result)
+
+        return result

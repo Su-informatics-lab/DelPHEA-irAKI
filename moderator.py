@@ -169,6 +169,8 @@ class Moderator:
         )
 
         transcripts: Dict[str, List[Dict[str, Any]]] = {}
+        minority_views: Dict[str, str] = {}
+
         if not disagreement_present:
             # structured status: summary "skip"
             log_debate_status(
@@ -184,6 +186,7 @@ class Moderator:
             return {
                 "debate_plan": plan.by_qid,
                 "transcripts": {},
+                "minority_views": {},
                 "debate_skipped": True,
             }
 
@@ -216,6 +219,7 @@ class Moderator:
                     score = a.scores.get(qid, None)
                     minority_text.append(f"{eid}: score={score} evidence={ev}")
             mv = "\n".join(minority_text) or "minority perspective not available"
+            minority_views[qid] = mv  # expose the exact input to debate turns
 
             transcripts[qid] = []
             for e in self.experts:
@@ -241,7 +245,8 @@ class Moderator:
 
         return {
             "debate_plan": plan.by_qid,
-            "transcripts": transcripts,
+            "transcripts": transcripts,  # unchanged shape (qid -> [turn, ...])
+            "minority_views": minority_views,  # new: qid -> string used as input
             "debate_skipped": False,
         }
 
@@ -265,7 +270,11 @@ class Moderator:
         # aggregate
         buffers.consensus = self.aggregator.aggregate([a for _, a in buffers.r3])
 
+        # include case_id for easier downstream bundling
+        cid = self._extract_case_id(case)
+
         report = {
+            "case_id": cid,
             "round1": [(eid, a.model_dump()) for eid, a in buffers.r1],
             "debate": buffers.debate_ctx,
             "round3": [(eid, a.model_dump()) for eid, a in buffers.r3],
@@ -420,7 +429,7 @@ class Moderator:
         """compact, model-friendly hint listing what failed and how to fix."""
         msgs = []
         for err in ve.errors():
-            loc = " → ".join(str(x) for x in err.get("loc", ()))
+            loc = " ".join(str(x) for x in err.get("loc", ()))
             msg = err.get("msg", "invalid value")
             msgs.append(f"{loc}: {msg}")
         if round_no == 1:

@@ -377,6 +377,89 @@ def _write_json(path: str, obj: Any) -> None:
     p.write_text(json.dumps(obj, indent=2))
 
 
+def _write_jsonl(path: str, rows: List[Dict[str, Any]]) -> None:
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with p.open("w", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def _dump_run_bundle(
+    out_dir: str, case_id: str, report: Dict[str, Any], args: argparse.Namespace
+) -> None:
+    """Persist a browsable bundle under out/<case_id>/ without altering stdout behavior."""
+    base = Path(out_dir) / case_id
+    base.mkdir(parents=True, exist_ok=True)
+
+    # full report for archival
+    _write_json(base / "report.json", report)
+
+    # run args (for reproducibility)
+    try:
+        _write_json(base / "run_args.json", vars(args))
+    except Exception:
+        pass
+
+    # summary (same content you print when --out is not set)
+    summary = {
+        "case_id": case_id,
+        "consensus": report.get("consensus", {}),
+        "debate_skipped": report.get("debate", {}).get("debate_skipped", None),
+    }
+    _write_json(base / "summary.json", summary)
+
+    # round1 per-expert
+    r1_dir = base / "round1"
+    r1_dir.mkdir(exist_ok=True)
+    for item in report.get("round1", []):
+        # item may be [eid, payload] (list/tuple) or {"expert_id":..., ...}
+        if isinstance(item, (list, tuple)) and len(item) == 2:
+            eid, payload = item[0], item[1]
+        elif isinstance(item, dict) and "expert_id" in item:
+            eid, payload = item["expert_id"], item
+        else:
+            # fallback unique filename
+            eid, payload = "unknown_expert", item
+        _write_json(r1_dir / f"{eid}.json", payload)
+
+    # debate plan + transcripts
+    debate = report.get("debate", {})
+    deb_dir = base / "debate"
+    deb_dir.mkdir(exist_ok=True)
+    if debate:
+        _write_json(
+            deb_dir / "debate_plan.json",
+            {
+                "debate_plan": debate.get("debate_plan", {}),
+                "debate_skipped": debate.get("debate_skipped", False),
+            },
+        )
+        transcripts = debate.get("transcripts", {})
+        if isinstance(transcripts, dict):
+            for qid, turns in transcripts.items():
+                rows: List[Dict[str, Any]] = []
+                if isinstance(turns, list):
+                    for t in turns:
+                        if isinstance(t, dict):
+                            rows.append(t)
+                        else:
+                            rows.append({"raw": t})
+                _write_jsonl(deb_dir / f"{qid}.jsonl", rows)
+
+    # round3 per-expert
+    r3_dir = base / "round3"
+    r3_dir.mkdir(exist_ok=True)
+    for item in report.get("round3", []):
+        if isinstance(item, (list, tuple)) and len(item) == 2:
+            eid, payload = item[0], item[1]
+        elif isinstance(item, dict) and "expert_id" in item:
+            eid, payload = item["expert_id"], item
+        else:
+            eid, payload = "unknown_expert", item
+        _write_json(r3_dir / f"{eid}.json", payload)
+
+
 # ------------------------ cli ------------------------
 
 
@@ -402,6 +485,11 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
         help="debate routing strategy",
     )
     ap.add_argument("--out", default=None, help="optional output json path")
+    ap.add_argument(
+        "--out-dir",
+        default="out",
+        help="directory to write a browsable run bundle (default: out/CASE_ID)",
+    )
 
     # backend config
     ap.add_argument(
@@ -555,6 +643,14 @@ def main(argv: List[str] | None = None) -> None:
     LOG.info("[case %s] running r1 → debate → r3 → aggregate", case_id)
     report = moderator.run_case(case)
 
+    # Always dump a browsable bundle under out_dir/case_id
+    try:
+        _dump_run_bundle(args.out_dir, case_id, report, args)
+        LOG.info("wrote run bundle to %s", (Path(args.out_dir) / case_id))
+    except Exception as e:
+        LOG.warning("failed to write run bundle: %s", e)
+
+    # Preserve existing behavior
     if args.out:
         _write_json(args.out, report)
         LOG.info("wrote results to %s", args.out)

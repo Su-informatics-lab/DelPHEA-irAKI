@@ -6,7 +6,10 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import re
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Type, TypeVar
 
 from pydantic import BaseModel, ValidationError
@@ -244,6 +247,57 @@ def _coerce_for_model_like_r1_r3(data: Dict[str, Any]) -> Dict[str, Any]:
     return d
 
 
+# --------------------------- dump helpers (optional) ---------------------------
+
+_CASE_RE = re.compile(r'-\s*"case_id":\s*"([^"]+)"')
+_EXP_RE = re.compile(r'-\s*"expert_id":\s*"([^"]+)"')
+
+
+def _ids_from_prompt(prompt: str) -> tuple[str, str]:
+    """Best-effort extraction of (case_id, expert_id) from the 'IMPORTANT' block."""
+    case_id = "unknown_case"
+    expert_id = "unknown_expert"
+    m1 = _CASE_RE.search(prompt)
+    if m1:
+        case_id = m1.group(1)
+    m2 = _EXP_RE.search(prompt)
+    if m2:
+        expert_id = m2.group(1)
+    return case_id, expert_id
+
+
+def _round_key_from_model(response_model: Type[BaseModel]) -> str:
+    name = getattr(response_model, "__name__", "").lower()
+    if "assessmentr1" in name or name == "assessmentr1":
+        return "r1"
+    if "assessmentr3" in name or name == "assessmentr3":
+        return "r3"
+    return "gen"
+
+
+def _dump_write(base: Optional[Path], rel: str, content: str) -> None:
+    if not base:
+        return
+    try:
+        p = base / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(content)
+    except Exception:
+        # never let dumping break validation
+        pass
+
+
+def _dump_json(base: Optional[Path], rel: str, obj: Any) -> None:
+    if not base:
+        return
+    try:
+        p = base / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(obj, ensure_ascii=False, indent=2))
+    except Exception:
+        pass
+
+
 # --------------------------- llm → schema validator ---------------------------
 
 
@@ -295,6 +349,29 @@ def call_llm_with_schema(
             },
         )
 
+    # optional dumping setup (env only; no API change)
+    dump_root_env = os.getenv("DELPHEA_OUT_DIR")
+    base: Optional[Path] = Path(dump_root_env) if dump_root_env else None
+    case_id, expert_id = _ids_from_prompt(prompt_text)
+    round_key = _round_key_from_model(response_model)
+
+    # write a one-time meta file per call (best-effort)
+    _dump_json(
+        base,
+        f"{case_id}/experts/{expert_id}/{round_key}/meta.json",
+        {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "model_name": getattr(backend, "model_name", None),
+            "context_window": ctx,
+            "input_tokens_est": input_tokens,
+            "available_output_tokens_est": available_out,
+            "temperature": temperature,
+            "retries": retries,
+            "retry_factor": rfactor,
+            "reserve_tokens": reserve,
+        },
+    )
+
     def _gen_once(prompt: str, tokens: int) -> str:
         if hasattr(backend, "generate"):
             return backend.generate(prompt, max_tokens=tokens, temperature=temperature)  # type: ignore[attr-defined]
@@ -330,7 +407,9 @@ def call_llm_with_schema(
         else:
             err_types = {e["type"] for e in (last_err.errors() if last_err else [])}
             if {"json_unbalanced", "json_missing_object"} & err_types and last_raw:
-                partial = last_raw.strip()
+                partial = (
+                    last_raw.strip() if isinstance(last_raw, str) else str(last_raw)
+                )
                 if len(partial) > 6000:
                     partial = partial[-6000:]
                 prompt = (
@@ -346,6 +425,13 @@ def call_llm_with_schema(
         raw = _gen_once(prompt, tokens_for_attempt)
         last_raw = raw
 
+        # dump raw attempt (optional)
+        _dump_write(
+            base,
+            f"{case_id}/experts/{expert_id}/{round_key}/attempt-{attempt}.raw.txt",
+            raw if isinstance(raw, str) else str(raw),
+        )
+
         try:
             json_text = _extract_first_json_object(raw)
             data = json.loads(json_text)
@@ -354,7 +440,22 @@ def call_llm_with_schema(
             if isinstance(data, dict):
                 data = _coerce_for_model_like_r1_r3(data)
 
-            return response_model(**data)
+            model = response_model(**data)
+
+            # dump final validated json (optional)
+            _dump_json(
+                base,
+                f"{case_id}/experts/{expert_id}/{round_key}/validated.json",
+                getattr(
+                    model,
+                    "model_dump",
+                    model.__dict__ if hasattr(model, "__dict__") else lambda: data,
+                )()
+                if hasattr(model, "model_dump")
+                else data,
+            )
+
+            return model
 
         except ValidationError as ve:
             last_err = ve
