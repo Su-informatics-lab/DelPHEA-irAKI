@@ -1,27 +1,9 @@
 # validators.py
 # structured output via Instructor (pydantic-powered) with robust retries.
-# replaces ad-hoc json parsing/repair loops with a single call that returns a dict.
+# provides a backwards‑compat alias `ValidationError` for existing imports.
 #
-# usage
-# -----
-# from validators import call_llm_with_schema, PayloadValidationError
-# payload = call_llm_with_schema(backend, prompt_text)
-#
-# design notes
-# ------------
-# - instructor + OpenAI client pointed at your vLLM server (openai-compatible)
-# - Mode.JSON avoids requiring server-side json_schema support
-# - returns a python dict on success; raises PayloadValidationError on failure
-# - fails fast with clear, actionable errors
-#
-# dependencies
-# ------------
-# pip install "openai>=1.40.0" "instructor>=1.4.0" "pydantic>=2.7"
-#
-# env
-# ---
-# export OPENAI_API_KEY=EMPTY            # vllm usually doesn't check it, but sdk requires it
-# export OPENAI_BASE_URL=http://localhost:8000 # optional, validator reads from backend by default
+# dependencies:
+#   pip install "openai>=1.40.0" "instructor>=1.4.0" "pydantic>=2.7"
 
 from __future__ import annotations
 
@@ -36,6 +18,18 @@ class PayloadValidationError(RuntimeError):
     """raised when model output cannot be coerced into the expected structured payload."""
 
 
+# backward‑compat shim for older modules importing `ValidationError` from validators
+class ValidationError(PayloadValidationError):
+    """alias kept for compatibility with older import sites."""
+
+
+__all__ = [
+    "PayloadValidationError",
+    "ValidationError",
+    "call_llm_with_schema",
+]
+
+
 def _infer_endpoint_and_model(
     backend: Any, endpoint_url: Optional[str], model: Optional[str]
 ) -> tuple[str, str]:
@@ -43,17 +37,14 @@ def _infer_endpoint_and_model(
 
     prefers explicit args; falls back to known attributes on LLMBackend.
     """
-    # explicit wins
     ep = (endpoint_url or "").strip()
     mdl = (model or "").strip()
 
-    # try environment override if not provided
     if not ep:
         ep = os.getenv("OPENAI_BASE_URL", "").rstrip("/")
     if not mdl:
         mdl = os.getenv("OPENAI_MODEL", "").strip()
 
-    # try backend introspection (supports our llm_backend)
     if not ep:
         ep = getattr(backend, "_base", "") or getattr(backend, "endpoint_url", "")
     if not mdl:
@@ -72,7 +63,6 @@ def _infer_endpoint_and_model(
             "validators: cannot infer model name; pass explicitly or set OPENAI_MODEL"
         )
 
-    # openai sdk expects a /v1 base url
     ep = ep.rstrip("/")
     if not ep.endswith("/v1"):
         ep = ep + "/v1"
@@ -113,13 +103,11 @@ def call_llm_with_schema(
     """
     base_url, model_name = _infer_endpoint_and_model(backend, endpoint_url, model)
 
-    # openai python sdk requires an api key string; vllm typically ignores it
     api_key = os.getenv("OPENAI_API_KEY", "EMPTY")
 
     client = patch(OpenAI(base_url=base_url, api_key=api_key))
 
     try:
-        # response_model=dict[str, Any] directs instructor to return a plain dict
         result = client.chat.completions.create(
             model=model_name,
             messages=[{"role": "user", "content": prompt_text}],
@@ -128,22 +116,19 @@ def call_llm_with_schema(
             stop=stop,
             seed=seed,
             response_model=dict[str, Any],
-            mode=Mode.JSON,  # do not rely on server-side json schema
-            max_retries=max_retries,  # bump retries from 2 → 5
+            mode=Mode.JSON,
+            max_retries=max_retries,
         )
     except Exception as e:  # noqa: BLE001
         raise PayloadValidationError(f"instructor call failed: {e}") from e
 
     if not isinstance(result, dict):
-        # instructor may return a pydantic model; coerce to dict if so
         try:
-            # pydantic v2 compatible
             dump = getattr(result, "model_dump", None)
             if callable(dump):
                 return dump()
         except Exception:
             pass
-        # last resort: this should not happen with response_model=dict[str, Any]
         raise PayloadValidationError(
             f"unexpected instructor return type: {type(result)}"
         )
