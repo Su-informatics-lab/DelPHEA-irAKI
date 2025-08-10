@@ -8,7 +8,7 @@ import logging
 from typing import Any, Dict, List, Optional
 
 from llm_backend import LLMBackend
-from models import AssessmentR1, AssessmentR3, DebateTurn
+from messages import DebateComment, ExpertRound1Reply, ExpertRound3Reply
 from prompts.rounds import format_round1_prompt, format_round3_prompt
 from schema import load_qids
 from validators import call_llm_with_schema
@@ -46,11 +46,16 @@ class Expert:
         case: Dict[str, Any],
         questionnaire_path: str,
         repair_hint: Optional[str] = None,  # reserved for future use
-    ) -> AssessmentR1:
-        """produce a round-1 assessment using json prompts + guarded validation."""
-        qids = load_qids(questionnaire_path)
+    ) -> Dict[str, Any]:
+        """produce a round-1 assessment using schema-guarded parsing.
+
+        returns a plain dict (json-serializable) shaped like ExpertRound1Reply.
+        """
+        # validate questionnaire early (fail loud if malformed/missing)
+        load_qids(questionnaire_path)
+
         info = self._extract_case_strings(case)
-        prompt = format_round1_prompt(
+        prompt_text = format_round1_prompt(
             expert_name=self._expert_name(),
             specialty=self.specialty,
             case_id=info["case_id"],
@@ -58,15 +63,17 @@ class Expert:
             clinical_notes=info["clinical_notes"],
             qpath=questionnaire_path,
         )
-        payload = call_llm_with_schema(
-            backend=self.backend,
-            prompt=prompt,
-            round_no=1,
-            max_retries=2,
-            qids=qids,
+
+        reply = call_llm_with_schema(
+            response_model=ExpertRound1Reply,
+            prompt_text=prompt_text,
+            backend=self.backend,  # validators will infer base_url/model from backend
+            temperature=0.0,
+            max_retries=1,
         )
+        payload = reply.model_dump()
         self._log_preview(payload, "[r1 parsed]")
-        return AssessmentR1(**payload)
+        return payload
 
     def assess_round3(
         self,
@@ -74,11 +81,15 @@ class Expert:
         questionnaire_path: str,
         debate_context: Dict[str, Any],
         repair_hint: Optional[str] = None,  # reserved for future use
-    ) -> AssessmentR3:
-        """produce a round-3 reassessment using json prompts + guarded validation."""
-        qids = load_qids(questionnaire_path)
+    ) -> Dict[str, Any]:
+        """produce a round-3 reassessment using schema-guarded parsing.
+
+        returns a plain dict (json-serializable) shaped like ExpertRound3Reply.
+        """
+        load_qids(questionnaire_path)
+
         info = self._extract_case_strings(case)
-        prompt = format_round3_prompt(
+        prompt_text = format_round3_prompt(
             expert_name=self._expert_name(),
             specialty=self.specialty,
             case_id=info["case_id"],
@@ -87,17 +98,19 @@ class Expert:
             qpath=questionnaire_path,
             debate_ctx=debate_context,
         )
-        payload = call_llm_with_schema(
-            backend=self.backend,
-            prompt=prompt,
-            round_no=3,
-            max_retries=2,
-            qids=qids,
-        )
-        self._log_preview(payload, "[r3 parsed]")
-        return AssessmentR3(**payload)
 
-    # --------- debate ---------
+        reply = call_llm_with_schema(
+            response_model=ExpertRound3Reply,
+            prompt_text=prompt_text,
+            backend=self.backend,
+            temperature=0.0,
+            max_retries=1,
+        )
+        payload = reply.model_dump()
+        self._log_preview(payload, "[r3 parsed]")
+        return payload
+
+    # --------- debate (round 2 single turn) ---------
 
     def debate(
         self,
@@ -105,19 +118,43 @@ class Expert:
         round_no: int,
         clinical_context: Dict[str, Any],
         minority_view: str,
-    ) -> DebateTurn:
-        """produce a single debate turn for a specific question."""
-        payload = {
-            "expert_id": self.expert_id,
-            "specialty": self.specialty,
-            "qid": qid,
-            "round_no": round_no,
-            "clinical_context": clinical_context,
-            "minority_view": minority_view,
-        }
-        raw = self.backend.debate(payload)
-        self._log_preview(raw, f"[debate {qid} raw]")
-        return DebateTurn(**raw)
+    ) -> Dict[str, Any]:
+        """produce a single debate turn for a specific question.
+
+        returns a plain dict (json-serializable) shaped like DebateComment.
+        """
+        if not qid:
+            raise ValueError("debate requires a non-empty qid")
+        if round_no not in (1, 2, 3):
+            raise ValueError(f"unsupported round_no for debate: {round_no}")
+
+        # minimal structured instruction to elicit DebateComment reliably
+        # keep instruction inline (yagni) rather than adding a new prompt file
+        prompt_text = (
+            "you are participating in a focused expert debate.\n"
+            "please respond with a concise, evidence-backed argument.\n\n"
+            f"question_id: {qid}\n"
+            f"expert_id (author): {self.expert_id}\n"
+            f"specialty: {self.specialty}\n"
+            "minority_view_to_address:\n"
+            f"{minority_view}\n\n"
+            "clinical_context:\n"
+            f"{self._flatten_dict_lines(clinical_context)}\n\n"
+            "return a valid DebateComment object. ensure 'text' > 10 chars. "
+            "set 'satisfied' true only if no further debate is needed; "
+            "optionally include 'revised_score' if your stance changed."
+        )
+
+        reply = call_llm_with_schema(
+            response_model=DebateComment,
+            prompt_text=prompt_text,
+            backend=self.backend,
+            temperature=0.0,
+            max_retries=1,
+        )
+        payload = reply.model_dump()
+        self._log_preview(payload, f"[debate {qid} parsed]")
+        return payload
 
     # --------- helpers ---------
 
@@ -144,17 +181,14 @@ class Expert:
 
     def _coerce_demographics(self, case: Dict[str, Any]) -> str:
         """derive a demographics text block from multiple possible case layouts."""
-        # explicit text provided
         if case.get("demographics_text"):
             return str(case["demographics_text"]).strip()
 
-        # simple dict field
         if isinstance(case.get("demographics"), dict):
             return self._flatten_dict_lines(case["demographics"])
         if "demographics" in case and isinstance(case["demographics"], str):
             return case["demographics"].strip()
 
-        # common fallbacks seen in loaders
         candidates = [
             ("person", None),
             ("patient", None),
@@ -173,23 +207,21 @@ class Expert:
                         return self._flatten_dict_lines(val)
                     return str(val).strip()
                 if isinstance(node, dict):
-                    # prefer common keys if present
                     txt = self._flatten_dict_lines(
                         node, allow_keys=["age", "sex", "gender", "race", "ethnicity"]
                     )
                     if txt:
                         return txt
 
-        # last-resort, non-failing placeholder (we don't crash on missing demographics)
         return "demographics: not available in source case"
 
     def _coerce_notes(self, case: Dict[str, Any]) -> str:
         """normalize aggregated clinical notes into a single bounded string."""
-        if case.get("notes_agg"):
+        if case.get("notes_agg") is not None:
             notes_val = case["notes_agg"]
-        elif case.get("clinical_notes"):
+        elif case.get("clinical_notes") is not None:
             notes_val = case["clinical_notes"]
-        elif case.get("notes_text"):
+        elif case.get("notes_text") is not None:
             notes_val = case["notes_text"]
         else:
             raise ValueError(
@@ -197,7 +229,6 @@ class Expert:
             )
 
         if isinstance(notes_val, list):
-            # accept list[str] or list[dict-like] with 'text'
             parts: List[str] = []
             for item in notes_val:
                 if isinstance(item, str):

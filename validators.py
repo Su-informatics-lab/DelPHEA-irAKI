@@ -5,172 +5,226 @@
 from __future__ import annotations
 
 import os
-from typing import Any, Dict, List, Optional
+import textwrap
+from typing import Any, Dict, List, Optional, Tuple, Type
 
 from instructor import Mode, patch
 from openai import OpenAI
+from pydantic import BaseModel
+from pydantic import ValidationError as PydanticValidationError
 
 
 class PayloadValidationError(RuntimeError):
     """raised when model output cannot be coerced into the expected structured payload."""
 
 
-# backward-compat alias for older imports
-class ValidationError(PayloadValidationError):
-    pass
+class ValidationError(ValueError):
+    """raised when a round payload is syntactically invalid."""
 
 
-__all__ = [
-    "PayloadValidationError",
-    "ValidationError",
-    "call_llm_with_schema",
-    "validate_round1_payload",
-    "validate_round3_payload",
-    "log_debate_status",
-]
+def _require_base_model(response_model: Any) -> Type[BaseModel]:
+    """ensure response_model is a pydantic BaseModel subclass; fail loud."""
+    if not isinstance(response_model, type) or not issubclass(
+        response_model, BaseModel
+    ):
+        typename = getattr(response_model, "__name__", str(type(response_model)))
+        raise PayloadValidationError(
+            f"response_model must be a subclass of pydantic.BaseModel; got {typename}. "
+            "use the reply models from messages.py, e.g.:\n"
+            "  from messages import ExpertRound1Reply, ExpertRound3Reply\n"
+            "  ... response_model=ExpertRound1Reply\n"
+        )
+    return response_model
 
 
 def _infer_endpoint_and_model(
-    backend: Any | None, endpoint_url: Optional[str], model: Optional[str]
-) -> tuple[str, str]:
-    """infer endpoint and model from args/env/backend.
+    *, endpoint_url: Optional[str], model: Optional[str], backend: Optional[Any]
+) -> Tuple[str, str]:
+    """derive endpoint base url and model name, fail if missing."""
+    ep = (endpoint_url or "").strip() or os.getenv("OPENAI_BASE_URL", "").strip()
+    mdl = (model or "").strip() or os.getenv("OPENAI_MODEL", "").strip()
 
-    priority:
-      1) explicit args
-      2) env OPENAI_BASE_URL/OPENAI_MODEL
-      3) backend attributes (_base/endpoint_url, _model/model/model_name)
-    """
-    # explicit
-    ep = (endpoint_url or "").strip()
-    mdl = (model or "").strip()
-
-    # env
-    if not ep:
-        ep = os.getenv("OPENAI_BASE_URL", "").strip()
-    if not mdl:
-        mdl = os.getenv("OPENAI_MODEL", "").strip()
-
-    # backend
+    # allow backend to provide hints, but do not silently guess
     if backend is not None:
         if not ep:
-            ep = getattr(backend, "_base", "") or getattr(backend, "endpoint_url", "")
+            ep = (
+                getattr(backend, "_base", "")
+                or getattr(backend, "endpoint_url", "")
+                or getattr(backend, "base_url", "")
+            )
         if not mdl:
             mdl = (
-                getattr(backend, "_model", "")
-                or getattr(backend, "model", "")
+                getattr(backend, "model", "")
                 or getattr(backend, "model_name", "")
+                or getattr(backend, "engine", "")
             )
 
     if not ep:
         raise ValueError(
-            "validators: cannot infer endpoint_url; pass endpoint_url or set OPENAI_BASE_URL"
+            "validators: cannot infer endpoint_url; pass endpoint_url explicitly or set OPENAI_BASE_URL"
         )
     if not mdl:
         raise ValueError(
-            "validators: cannot infer model name; pass model or set OPENAI_MODEL"
+            "validators: cannot infer model name; pass model explicitly or set OPENAI_MODEL"
         )
 
-    ep = ep.rstrip("/")
-    if not ep.endswith("/v1"):
-        ep = ep + "/v1"
-    return ep, mdl
+    return ep.rstrip("/"), mdl
+
+
+def _build_messages(
+    system_prompt: Optional[str],
+    prompt_text: Optional[str],
+    prompt: Optional[Dict[str, Any]],
+) -> List[Dict[str, str]]:
+    """normalize to OpenAI chat messages; prompt_text wins if both given."""
+    if prompt_text:
+        user = prompt_text
+    elif prompt and isinstance(prompt, dict) and "text" in prompt:
+        user = str(prompt["text"])
+    else:
+        raise ValueError(
+            "validators: need prompt_text (str) or prompt (dict with 'text')"
+        )
+
+    system = system_prompt or (
+        "you are a meticulous subspecialist clinician. "
+        "follow instructions exactly, return only the requested structured object."
+    )
+
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ]
 
 
 def call_llm_with_schema(
-    backend: Any | None = None,
     *,
-    prompt: Optional[str] = None,
+    response_model: Any,
+    system_prompt: Optional[str] = None,
     prompt_text: Optional[str] = None,
+    prompt: Optional[Dict[str, Any]] = None,
+    backend: Optional[Any] = None,
     endpoint_url: Optional[str] = None,
     model: Optional[str] = None,
-    temperature: float = 0.2,
-    max_tokens: int = 1024,
-    stop: Optional[List[str]] = None,
-    seed: Optional[int] = None,
-    max_retries: int = 5,
-    **_: Any,  # ignore unknown kwargs from older call sites
-) -> Dict[str, Any]:
-    """generate and validate a structured payload using Instructor.
+    temperature: float = 0.0,
+    max_retries: int = 1,
+    extra_create_kwargs: Optional[Dict[str, Any]] = None,
+) -> BaseModel:
+    """call an OpenAI-compatible server via instructor with strict schema parsing.
 
-    Args:
-        backend: optional backend object; used to discover endpoint/model if not given.
-        prompt/prompt_text: prompt string (either key works).
-        endpoint_url, model: override discovery.
-        temperature, max_tokens, stop, seed: usual generation settings.
-        max_retries: structured retries (default 5).
+    args:
+        response_model: pydantic.BaseModel subclass to parse into (REQUIRED).
+        system_prompt: optional system priming.
+        prompt_text / prompt: pass exactly one user prompt source.
+        backend: optional object with .endpoint_url/.model_name hints.
+        endpoint_url/model: explicit overrides; must resolve or we fail fast.
+        temperature: decoding temperature (default 0.0).
+        max_retries: number of parse-retry attempts (default 1).
+        extra_create_kwargs: forwarded to the OpenAI create call.
 
-    Returns:
-        dict[str, Any]: parsed payload guaranteed to be valid json.
+    returns:
+        An instance of the given response_model.
+
+    raises:
+        PayloadValidationError for schema/parse issues.
+        ValueError for missing configuration or invalid inputs.
     """
-    text = (prompt_text or prompt or "").strip()
-    if not text:
-        raise PayloadValidationError("call_llm_with_schema: empty prompt")
+    # validate response model type up front
+    model_cls = _require_base_model(response_model)
 
-    base_url, model_name = _infer_endpoint_and_model(backend, endpoint_url, model)
-    api_key = os.getenv("OPENAI_API_KEY", "EMPTY")
+    # resolve endpoint + model (fail if not set)
+    base_url, model_name = _infer_endpoint_and_model(
+        endpoint_url=endpoint_url, model=model, backend=backend
+    )
 
-    # set default mode=JSON at patch time; do NOT pass `mode` again in create()
-    client = patch(OpenAI(base_url=base_url, api_key=api_key), mode=Mode.JSON)
+    # compose messages
+    messages = _build_messages(system_prompt, prompt_text, prompt)
 
-    try:
-        result = client.chat.completions.create(
-            model=model_name,
-            messages=[{"role": "user", "content": text}],
-            temperature=temperature,
-            max_tokens=max_tokens,
-            stop=stop,
-            seed=seed,
-            response_model=dict[str, Any],
-            # no 'mode' here to avoid double-passing in some instructor versions
-            # retries handled by instructor using the patched client
-            max_retries=max_retries,
-        )
-    except Exception as e:  # noqa: BLE001
-        raise PayloadValidationError(f"instructor call failed: {e}") from e
+    # build patched client
+    api_key = os.getenv("OPENAI_API_KEY", "no-key-required")
+    client = patch(OpenAI(base_url=base_url, api_key=api_key), mode=Mode.JSON_SCHEMA)
 
-    if isinstance(result, dict):
-        return result
-    dump = getattr(result, "model_dump", None)
-    if callable(dump):
-        return dump()
-    raise PayloadValidationError(f"unexpected instructor return type: {type(result)}")
+    # perform call with strict parsing
+    last_err: Optional[Exception] = None
+    attempts = max(1, int(max_retries) + 1)
+    for attempt in range(attempts):
+        try:
+            kwargs = dict(
+                model=model_name,
+                messages=messages,
+                temperature=temperature,
+                response_model=model_cls,
+            )
+            if extra_create_kwargs:
+                kwargs.update(extra_create_kwargs)
+
+            result = client.chat.completions.create(**kwargs)
+            # instructor returns an instance of model_cls
+            return result
+        except (PydanticValidationError, Exception) as e:  # noqa: BLE001
+            last_err = e
+
+    # if we reach here, all attempts failed
+    details = textwrap.dedent(
+        f"""
+        instructor call failed after {attempts} attempt(s)
+        endpoint: {base_url}
+        model:    {model_name}
+        schema:   {model_cls.__name__}
+        error:    {last_err!r}
+        """
+    ).strip()
+    raise PayloadValidationError(details) from last_err
 
 
-# --- lightweight validators used by moderator.py ---
+# -------------------- optional round-level validators (strict, fail loud) --------------------
 
 
 def validate_round1_payload(payload: Dict[str, Any]) -> None:
     if not isinstance(payload, dict) or not payload:
         raise ValidationError("round1: payload must be a non-empty object")
-    if "probability" in payload:
-        p = payload["probability"]
+    if "p_iraki" in payload:
         try:
-            pf = float(p)
+            pf = float(payload["p_iraki"])
         except Exception as e:  # noqa: BLE001
-            raise ValidationError(f"round1: probability not a number: {p}") from e
+            raise ValidationError(
+                f"round1: p_iraki not a number: {payload['p_iraki']}"
+            ) from e
         if not (0.0 <= pf <= 1.0):
-            raise ValidationError(f"round1: probability out of range: {p}")
-    if "evidence" in payload and not isinstance(payload["evidence"], (list, str)):
-        raise ValidationError("round1: evidence must be a list or string")
+            raise ValidationError(f"round1: p_iraki out of range: {payload['p_iraki']}")
+    if "confidence" in payload:
+        try:
+            cf = float(payload["confidence"])
+        except Exception as e:  # noqa: BLE001
+            raise ValidationError(
+                f"round1: confidence not a number: {payload['confidence']}"
+            ) from e
+        if not (0.0 <= cf <= 1.0):
+            raise ValidationError(
+                f"round1: confidence out of range: {payload['confidence']}"
+            )
 
 
 def validate_round3_payload(payload: Dict[str, Any]) -> None:
     if not isinstance(payload, dict) or not payload:
         raise ValidationError("round3: payload must be a non-empty object")
-    if "final_probability" in payload:
-        p = payload["final_probability"]
+    if "p_iraki" in payload:
         try:
-            pf = float(p)
+            pf = float(payload["p_iraki"])
         except Exception as e:  # noqa: BLE001
-            raise ValidationError(f"round3: final_probability not a number: {p}") from e
+            raise ValidationError(
+                f"round3: p_iraki not a number: {payload['p_iraki']}"
+            ) from e
         if not (0.0 <= pf <= 1.0):
-            raise ValidationError(f"round3: final_probability out of range: {p}")
-
-
-def log_debate_status(*, disagreement_present: bool, logger) -> None:
-    try:
-        logger.info(
-            "debate status: %s", "disagreement" if disagreement_present else "converged"
-        )
-    except Exception:
-        pass
+            raise ValidationError(f"round3: p_iraki out of range: {payload['p_iraki']}")
+    if "confidence_in_verdict" in payload:
+        try:
+            cf = float(payload["confidence_in_verdict"])
+        except Exception as e:  # noqa: BLE001
+            raise ValidationError(
+                f"round3: confidence_in_verdict not a number: {payload['confidence_in_verdict']}"
+            ) from e
+        if not (0.0 <= cf <= 1.0):
+            raise ValidationError(
+                f"round3: confidence_in_verdict out of range: {payload['confidence_in_verdict']}"
+            )
