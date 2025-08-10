@@ -13,29 +13,24 @@
 
 set -euo pipefail
 
-# --------- paths & caches (host) ----------
+# ---------- paths & caches (host) ----------
 export HF_HOME="$HOME/hf-cache"
 export IMG_DIR="$HOME/containers"
 export IMG_FILE="$IMG_DIR/vllm-gptoss.sif"
-
 mkdir -p "$HF_HOME" "$IMG_DIR" logs
 
-# per-job scratch and persistent JIT cache dirs
 export JOB_SCRATCH="$HOME/DelPHEA-irAKI/tmp/${SLURM_JOB_ID}"
 export FLASHINFER_CACHE="$HOME/flashinfer-cache"
 mkdir -p "$JOB_SCRATCH" "$FLASHINFER_CACHE"
 
-# --------- CUDA toolchain to bind ----------
-# You can switch this to 12.2.0 if a node doesn’t have 12.3.0.
+# ---------- bind a CUDA toolchain ----------
 HOST_CUDA="/mnt/shared/moduleapps/eb/CUDA/12.3.0"
 if [[ ! -d "$HOST_CUDA" ]]; then
-  echo "WARN: $HOST_CUDA not found on $(hostname). Trying 12.2.0..."
+  echo "WARN: $HOST_CUDA not found on $(hostname). Falling back to 12.2.0"
   HOST_CUDA="/mnt/shared/moduleapps/eb/CUDA/12.2.0"
 fi
 
-# --------- vLLM / runtime env (inside container) ----------
-# Clean, minimal env to avoid tclsh/module pollution
-# Disable FlashInfer (no nvcc JIT), and disable Numba n-gram proposer path.
+# ---------- container env (clean, minimal) ----------
 APPT_ENV=(
   --env HF_HOME="/root/.cache/huggingface"
   --env CUDA_HOME="${HOST_CUDA}"
@@ -45,28 +40,29 @@ APPT_ENV=(
   --env NCCL_DEBUG=WARN
   --env CUDA_DEVICE_MAX_CONNECTIONS=1
   --env PYTHONUNBUFFERED=1
+  # stop shell from sourcing host module hooks
+  --env ENV=
+  --env BASH_ENV=
+  # stabilize vLLM startup
   --env VLLM_DISABLE_FLASHINFER=1
   --env VLLM_V1_SPEC_DECODE_NGRAM=0
-  # Optional: better error messages while stabilizing (slower)
-  # --env CUDA_LAUNCH_BLOCKING=1
 )
 
 echo "== Summary =="
 echo "Node: $(hostname)"
-echo "CUDA bind path: ${HOST_CUDA}"
-echo "GPUs requested: ${SLURM_JOB_GPUS_PER_NODE:-2}"
+echo "CUDA bind: ${HOST_CUDA}"
+echo "GPUs: ${SLURM_JOB_GPUS_PER_NODE:-2}"
 echo "HF cache: ${HF_HOME}"
-echo "FlashInfer cache (not used when disabled): ${FLASHINFER_CACHE}"
 echo "Scratch: ${JOB_SCRATCH}"
-echo "=============================="
+echo "================"
 
-# (Optional) quick sanity check of CUDA in container
+# Optional quick CUDA check inside image
 apptainer exec --nv --cleanenv \
   --bind "${HOST_CUDA}:${HOST_CUDA}" \
   "${APPT_ENV[@]}" \
   "$IMG_FILE" bash -lc 'nvidia-smi || true'
 
-# --------- run vLLM OpenAI server ----------
+# ---------- run vLLM OpenAI server ----------
 TENSOR_PARALLEL="${SLURM_JOB_GPUS_PER_NODE:-2}"
 
 apptainer exec --nv --cleanenv \
@@ -82,4 +78,5 @@ apptainer exec --nv --cleanenv \
     --max-model-len 131072 \
     --gpu-memory-utilization 0.90 \
     --host 0.0.0.0 --port 8000 \
-    --log-level DEBUG
+    --uvicorn-log-level info \
+    --disable-uvicorn-access-log
