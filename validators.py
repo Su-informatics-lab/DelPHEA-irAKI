@@ -128,12 +128,6 @@ def _extract_first_json_object(text: str) -> str:
 
 # ----------------------------- public: llm glue -------------------------------
 
-from __future__ import annotations
-
-import json
-from typing import Any, Optional, Type, TypeVar
-
-from pydantic import BaseModel, ValidationError
 
 T = TypeVar("T", bound=BaseModel)
 
