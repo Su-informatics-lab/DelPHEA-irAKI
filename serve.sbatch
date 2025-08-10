@@ -17,49 +17,52 @@ set -euo pipefail
 export HF_HOME="$HOME/hf-cache"
 export IMG_FILE="$HOME/containers/vllm-gptoss.sif"
 export JOB_SCRATCH="$HOME/DelPHEA-irAKI/tmp/$SLURM_JOB_ID"
-
 mkdir -p "$HF_HOME" logs "$JOB_SCRATCH"
 
-# cuda & gpu
+# gpu env
 export CUDA_VISIBLE_DEVICES=0,1
 export NCCL_IB_DISABLE=1
-export TORCH_CUDA_ARCH_LIST="9.0"   # hopper (h100)
+export TORCH_CUDA_ARCH_LIST="9.0"    # h100 (sm_90)
 
-# ---- vllm engine/attention fixes ----
-# force v1 engine; v0 is what threw the "Invalid attention backend" error.
+# vllm: force v1 and a conservative attention backend (avoids FA3 issues)
 export VLLM_USE_V1=1
-# on h100, v1 + flash_attn (fa3) is the intended path.
-export VLLM_ATTENTION_BACKEND=FLASH_ATTN
+export VLLM_ATTENTION_BACKEND=TRITON_ATTN_V2
 
-# tp=2 on 2×H100
+# helpful logging so we actually see the worker error if any
+export VLLM_CONFIGURE_LOGGING=1
+export VLLM_LOGGING_LEVEL=DEBUG
+
+# tensor parallel across the two gpus
 export TENSOR_PARALLEL=2
 
 echo "========================================="
-echo "vLLM gpt-oss-120b server"
-echo "node: $(hostname)"
-echo "job : ${SLURM_JOB_ID}"
-echo "gpus: ${CUDA_VISIBLE_DEVICES} (TP=${TENSOR_PARALLEL})"
-echo "img : $(basename "$IMG_FILE")"
+echo "vLLM gpt-oss-120b on $(hostname)  job=$SLURM_JOB_ID"
+nvidia-smi --query-gpu=index,name,memory.total,driver_version --format=csv
 echo "========================================="
 
-# quick gpu info
-nvidia-smi --query-gpu=index,name,memory.total,driver_version --format=csv
-
-# launch
-# note: we do NOT bind host CUDA into the container; --nv handles driver libs
+# quick preflight inside container: show versions & cuda
 apptainer exec --nv \
   --bind "$HF_HOME":/root/.cache/huggingface \
   --bind "$JOB_SCRATCH":/tmp \
   "$IMG_FILE" \
-  python3 -u -m vllm.entrypoints.openai.api_server \
-    --model openai/gpt-oss-120b \
+  python3 - << 'PY'
+import torch, vllm, sys
+print("torch:", torch.__version__)
+print("cuda available:", torch.cuda.is_available())
+print("cuda device count:", torch.cuda.device_count())
+print("vllm:", vllm.__version__)
+PY
+
+# serve (use the official vLLM CLI path)
+apptainer exec --nv \
+  --bind "$HF_HOME":/root/.cache/huggingface \
+  --bind "$JOB_SCRATCH":/tmp \
+  "$IMG_FILE" \
+  vllm serve openai/gpt-oss-120b \
     --tensor-parallel-size "$TENSOR_PARALLEL" \
-    --async-scheduling \
     --gpu-memory-utilization 0.90 \
     --host 0.0.0.0 \
     --port 8000 \
-    --trust-remote-code
+    --async-scheduling
 
-echo "========================================="
 echo "server terminated at $(date)"
-echo "========================================="
