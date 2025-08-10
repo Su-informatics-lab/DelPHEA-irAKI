@@ -117,8 +117,15 @@ class LLMBackend:
         max_tokens: int = 1200,
         temperature: float = 0.0,
         system: str = "you are a service that returns only json objects.",
+        prefer_json: Optional[bool] = None,
     ) -> str:
-        """return raw text content; prefers json mode if supported; falls back to plain."""
+        """return raw text content; prefers json mode if supported; falls back to plain.
+
+        prefer_json:
+          - None (default): try JSON mode if the server supports it (back-compat).
+          - True: force a JSON-mode attempt first.
+          - False: skip JSON mode and use plain text.
+        """
         payload_base = {
             "model": self.model_name,
             "messages": [
@@ -129,8 +136,17 @@ class LLMBackend:
             "max_tokens": int(max_tokens),
         }
 
-        # try json mode first unless we know it's unsupported
-        try_json_mode = True if self.supports_json_mode in (None, True) else False
+        try_json_mode = (
+            True
+            if prefer_json is True
+            else (
+                False
+                if prefer_json is False
+                else (self.supports_json_mode in (None, True))
+            )
+        )
+
+        # try json mode first unless explicitly disabled
         if try_json_mode:
             payload = dict(payload_base)
             payload["response_format"] = {"type": "json_object"}
@@ -275,25 +291,37 @@ class LLMBackend:
                 max_tokens=512,
                 temperature=temperature,
                 system="You are a clinical expert generating short, plain-text debate arguments. No markdown, no JSON.",
+                prefer_json=False,  # <-- critical: force plain completion
             )
         except Exception:
             text = "Unable to generate debate content."
 
-        # normalize & guard against None
+        # normalize & guard against None, and salvage if JSON slipped through
         try:
-            text = (text or "").strip()
+            s = (text or "").strip()
         except Exception:
-            text = "Unable to generate debate content."
+            s = "Unable to generate debate content."
+        if s.startswith("{") and s.endswith("}"):
+            try:
+                obj = json.loads(s)
+                for key in ("text", "content", "argument", "message"):
+                    if isinstance(obj.get(key), str) and obj.get(key).strip():
+                        s = obj[key].strip()
+                        break
+                else:
+                    # fall back to a compact string of the object if no field looked good
+                    s = json.dumps(obj, ensure_ascii=False)
+            except Exception:
+                pass
 
-        if not text:
-            text = "No argument produced."
+        if not s:
+            s = "No argument produced."
 
         result = {
             "expert_id": expert_id,
             "qid": qid,
             "round_no": round_no,
-            "text": text,
-            # conservative default; flip to False here if you want a stricter stance
+            "text": s,
             "satisfied": True,
         }
 
