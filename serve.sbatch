@@ -32,22 +32,19 @@ nvidia-smi --query-gpu=index,name,driver_version,memory.total --format=csv || tr
 apptainer exec --nv \
   --bind "$HF_HOME":/root/.cache/huggingface \
   --bind "$JOB_SCRATCH":/tmp \
-  \
-  --env CUDA_VISIBLE_DEVICES=0 \              # single GPU, avoids NCCL paths
-  --env VLLM_USE_V1=1 \                       # v1 engine (required for GPT-OSS path)
-  --env VLLM_ATTENTION_BACKEND=FLASH_ATTN \   # Hopper path
-  --env VLLM_FLASH_ATTN_VERSION=3 \           # FA3 on H100
-  --env VLLM_DISABLE_FLASHINFER=1 \           # avoid FlashInfer (Blackwell kernels)
-  --env NCCL_IB_DISABLE=1 \                   # keep IB off for now
-  --env TORCH_CUDA_ARCH_LIST=9.0 \            # H100
-  --env CUDA_LAUNCH_BLOCKING=1 \              # better stacktraces
-  --env VLLM_LOGGING_LEVEL=DEBUG \            # get the inner worker error
-  "$IMG_FILE" \
-  python3 -u -m vllm.entrypoints.openai.api_server \
+  --env VLLM_USE_V1=1 \
+  --env VLLM_ATTENTION_BACKEND=FLASH_ATTN \
+  --env VLLM_FLASH_ATTN_VERSION=3 \
+  --env VLLM_DISABLE_FLASHINFER=1 \
+  --env NCCL_IB_DISABLE=1 \
+  --env TORCH_CUDA_ARCH_LIST=9.0 \
+  --env VLLM_CONFIGURE_LOGGING=1 \
+  --env VLLM_LOGGING_LEVEL=DEBUG \
+  "$IMG_FILE" python3 -u -m vllm.entrypoints.openai.api_server \
     --model "$MODEL" \
     --tensor-parallel-size "$TP" \
     --gpu-memory-utilization "$GMU" \
     --max-model-len "$MAX_LEN" \
-    --enforce-eager \
     --async-scheduling \
-    --host 0.0.0.0 --port "$PORT"
+    --host 0.0.0.0 --port 8000
+
