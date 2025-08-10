@@ -1,138 +1,84 @@
-# llm_backend.py (exposes endpoint_url/model_name properties for validators.py)
+# llm_backend.py
+# minimal openai-compatible client with optional json mode
+
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+import json
+import os
+from typing import Any, Dict, Optional
 
 import requests
 
 
 class LLMBackend:
+    """thin client for an openai-compatible /v1/chat/completions endpoint.
+
+    attributes:
+        endpoint_url: base url, e.g., http://localhost:8000/v1
+        model_name: model id
+        api_key: optional bearer token
+        session: requests session
+        supports_json_mode: feature flag toggled at first request
+    """
+
     def __init__(
-        self,
-        *,
-        endpoint_url: str,
-        model: Optional[str] = None,
-        model_name: Optional[str] = None,
-        timeout: float = 120.0,
-        api_key: Optional[str] = None,
-        prefer_json_mode: Optional[bool] = None,
-        **_: Any,
+        self, endpoint_url: str, model_name: str, api_key: Optional[str] = None
     ) -> None:
-        model_id = model_name or model
-        if not model_id:
-            raise ValueError("LLMBackend requires 'model' (or 'model_name')")
-        if not endpoint_url:
-            raise ValueError("LLMBackend requires 'endpoint_url'")
-        self._base = endpoint_url.rstrip("/")
-        self._model = model_id
-        self._timeout = timeout
-        self._api_key = api_key
-        self._prefer_json_mode = (
-            bool(prefer_json_mode) if prefer_json_mode is not None else False
-        )
+        self.endpoint_url = endpoint_url.rstrip("/")
+        self.model_name = model_name
+        self.api_key = api_key or os.getenv("OPENAI_API_KEY", None)
+        self.session = requests.Session()
+        self.supports_json_mode: Optional[bool] = None  # unknown until first try
 
-        self._completions = f"{self._base}/v1/completions"
-        self._chat = f"{self._base}/v1/chat/completions"
-
-    # convenient properties used by validators.py
-    @property
-    def endpoint_url(self) -> str:
-        return self._base
-
-    @property
-    def model_name(self) -> str:
-        return self._model
+    def _headers(self) -> Dict[str, str]:
+        h = {"Content-Type": "application/json"}
+        if self.api_key:
+            h["Authorization"] = f"Bearer {self.api_key}"
+        return h
 
     def generate(
         self,
         prompt: str,
         *,
-        max_tokens: int = 1024,
-        temperature: float = 0.2,
-        stop: Optional[List[str]] = None,
-        seed: Optional[int] = None,
-        extra: Optional[Dict[str, Any]] = None,
+        max_tokens: int = 1200,
+        temperature: float = 0.0,
+        system: str = "you are a service that returns only json objects.",
     ) -> str:
-        # keep a simple text path as a fallback (unchanged from earlier simplified version)
-        chat_payload: Dict[str, Any] = {
-            "model": self._model,
-            "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": max_tokens,
-            "temperature": temperature,
-        }
-        if stop:
-            chat_payload["stop"] = stop
-        if seed is not None:
-            chat_payload["seed"] = seed
-        if isinstance(extra, dict):
-            for k, v in extra.items():
-                chat_payload[k] = v
+        """return raw text content; prefers json mode if supported."""
+        url = f"{self.endpoint_url}/v1/chat/completions"
 
-        text = self._post_and_parse_text(self._chat, chat_payload, mode="chat")
-        if isinstance(text, str) and text.strip():
-            return text.strip()
-
-        payload = {
-            "model": self._model,
-            "prompt": prompt,
-            "max_tokens": max_tokens,
-            "temperature": temperature,
-        }
-        if stop:
-            payload["stop"] = stop
-        if seed is not None:
-            payload["seed"] = seed
-        if isinstance(extra, dict):
-            payload.update(extra)
-
-        text = self._post_and_parse_text(self._completions, payload, mode="completions")
-        if isinstance(text, str) and text.strip():
-            return text.strip()
-
-        raise RuntimeError("LLMBackend.generate: no usable text from either route")
-
-    def _headers(self) -> Dict[str, str]:
-        h = {"Content-Type": "application/json"}
-        if self._api_key:
-            h["Authorization"] = f"Bearer {self._api_key}"
-        return h
-
-    def _post_and_parse_text(
-        self, url: str, payload: Dict[str, Any], *, mode: str
-    ) -> Optional[str]:
-        try:
-            resp = requests.post(
-                url, headers=self._headers(), json=payload, timeout=self._timeout
+        def _post(payload: Dict[str, Any]) -> requests.Response:
+            return self.session.post(
+                url, headers=self._headers(), data=json.dumps(payload), timeout=120
             )
-        except requests.RequestException:
-            return None
 
-        if resp.status_code == 404:
-            return None
-        if resp.status_code != 200:
-            # surface body head for diagnostics
-            raise RuntimeError(f"HTTP {resp.status_code} for {url}: {resp.text[:200]}")
+        # try json mode on first attempt if unknown/true
+        try_json_mode = True if self.supports_json_mode in (None, True) else False
 
-        try:
-            data = resp.json()
-        except Exception:
-            return None
+        payload_base = {
+            "model": self.model_name,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": float(temperature),
+            "max_tokens": int(max_tokens),
+        }
 
-        if mode == "chat":
-            choices = data.get("choices") or []
-            if not choices:
-                return None
-            msg = choices[0].get("message") or {}
-            content = msg.get("content")
-            if isinstance(content, str) and content.strip():
-                return content
-            delta = choices[0].get("delta") or {}
-            dcontent = delta.get("content")
-            return dcontent if isinstance(dcontent, str) and dcontent.strip() else None
+        # attempt json mode
+        if try_json_mode:
+            payload = dict(payload_base)
+            payload["response_format"] = {"type": "json_object"}
+            r = _post(payload)
+            if r.status_code == 200:
+                self.supports_json_mode = True
+                data = r.json()
+                return data["choices"][0]["message"]["content"]
+            # feature not supported; mark and fall through
+            self.supports_json_mode = False
 
-        # completions
-        choices = data.get("choices") or []
-        if not choices:
-            return None
-        text = choices[0].get("text")
-        return text if isinstance(text, str) and text.strip() else None
+        # plain text fallback
+        r = _post(payload_base)
+        r.raise_for_status()
+        data = r.json()
+        return data["choices"][0]["message"]["content"]

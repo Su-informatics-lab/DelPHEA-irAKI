@@ -128,6 +128,13 @@ def _extract_first_json_object(text: str) -> str:
 
 # ----------------------------- public: llm glue -------------------------------
 
+from __future__ import annotations
+
+import json
+from typing import Any, Optional, Type, TypeVar
+
+from pydantic import BaseModel, ValidationError
+
 T = TypeVar("T", bound=BaseModel)
 
 
@@ -137,74 +144,97 @@ def call_llm_with_schema(
     prompt_text: str,
     backend: Any,
     temperature: float = 0.0,
-    max_tokens: int = 1200,
-    max_retries: int = 1,
+    max_tokens: int = 1400,
+    max_retries: int = 1,  # one extra try beyond initial; we’ll hijack it for a structured repair
 ) -> T:
-    """call the llm backend and coerce output to the given pydantic model.
-
-    args:
-        response_model: pydantic model class (e.g., messages.ExpertRound1Reply).
-        prompt_text: fully-rendered prompt to send to the backend.
-        backend: object exposing `.generate(prompt, ...)` or `.get_completions(...)`.
-        temperature: decoding temperature.
-        max_tokens: upper bound for generation length.
-        max_retries: number of additional attempts after a parse/validate failure.
-
-    returns:
-        instance of `response_model`.
-
-    raises:
-        pydantic.ValidationError on extraction/parse/validation errors.
-        RuntimeError if backend call fails.
-    """
+    """call backend, extract json, validate with response_model; one-shot repair on partial json."""
 
     def _gen_once(prompt: str) -> str:
+        # prefer json mode if backend supports it (our llm_backend does this internally)
         if hasattr(backend, "generate"):
             return backend.generate(prompt, max_tokens=max_tokens, temperature=temperature)  # type: ignore[attr-defined]
         if hasattr(backend, "get_completions"):
             return backend.get_completions(prompt, temperature=temperature, max_tokens=max_tokens)  # type: ignore[attr-defined]
         raise RuntimeError("llm backend does not expose a known generation method")
 
+    from pydantic_core import InitErrorDetails, PydanticCustomError
+
+    from .validators import (
+        _extract_first_json_object,  # same module; adjust if namespaced
+    )
+
+    # if you placed _extract_first_json_object in this file, just call it directly.
+
     last_err: Optional[ValidationError] = None
+    last_raw: Optional[str] = None
     for attempt in range(max_retries + 1):
-        prompt = (
-            f"{prompt_text}\n\n"
-            "IMPORTANT: return ONLY a valid JSON object that strictly matches the expected schema. "
-            "Do not include any prose, markdown, or explanations."
-            if attempt > 0
-            else prompt_text
-        )
+        if attempt == 0:
+            prompt = prompt_text
+        else:
+            # structured repair if we previously saw unbalanced/missing json object
+            err_types = {e["type"] for e in (last_err.errors() if last_err else [])}
+            if {"json_unbalanced", "json_missing_object"} & err_types and last_raw:
+                partial = last_raw.strip()
+                partial = (
+                    partial[-3000:] if len(partial) > 3000 else partial
+                )  # clip long spills
+                prompt = (
+                    f"{prompt_text}\n\n"
+                    "the previous output was a PARTIAL json object. "
+                    "complete it to a SINGLE valid json object that strictly matches the expected schema. "
+                    "return ONLY the final json object, with no markdown or prose.\n\n"
+                    "partial_json:\n```json\n"
+                    f"{partial}\n```"
+                )
+            else:
+                # generic hard nudge
+                prompt = (
+                    f"{prompt_text}\n\n"
+                    "IMPORTANT: return ONLY a valid JSON object that exactly matches the schema. "
+                    "do not include markdown fences, prose, or any extra keys."
+                )
 
         raw = _gen_once(prompt)
+        last_raw = raw
+
         try:
             json_text = _extract_first_json_object(raw)
             data = json.loads(json_text)
+            return response_model.model_validate(data)
         except ValidationError as ve:
             last_err = ve
             continue
         except json.JSONDecodeError as je:
-            last_err = _ve(
-                "llm_response",
-                etype="json_decode_error",
-                msg="json decode error: {error}",
+            # turn into pydantic v2 ValidationError
+            from pydantic_core import InitErrorDetails, PydanticCustomError
+
+            line_err = InitErrorDetails(
+                type=PydanticCustomError(
+                    "json_decode_error",
+                    "json decode error: {error}",
+                    {"error": str(je)},
+                ),
                 loc=("content",),
-                inp=raw[:200],
+                input=raw[:200],
                 ctx={"error": str(je)},
+            )
+            last_err = ValidationError.from_exception_data(
+                title="llm_response", line_errors=[line_err]
             )
             continue
         except Exception as e:
-            last_err = _ve(
-                "llm_response",
-                etype="unexpected_error",
-                msg="{error}",
+            line_err = InitErrorDetails(
+                type=PydanticCustomError(
+                    "unexpected_error", "{error}", {"error": f"{type(e).__name__}: {e}"}
+                ),
                 loc=("content",),
-                inp=str(raw)[:200],
+                input=str(raw)[:200],
                 ctx={"error": f"{type(e).__name__}: {e}"},
             )
+            last_err = ValidationError.from_exception_data(
+                title="llm_response", line_errors=[line_err]
+            )
             continue
-
-        # pydantic does the real validation; this will raise ValidationError on failure
-        return response_model.model_validate(data)
 
     assert last_err is not None
     raise last_err
