@@ -45,7 +45,7 @@ fi
 source "$VENV_DIR/bin/activate"
 
 # Ensure pinned Torch is installed first (avoid solver conflicts)
-if ! python - <<PY | grep -q "$TORCH_VER"; then
+if ! python - <<'PY' | grep -q "$TORCH_VER"; then
 import sys
 try:
     import torch
@@ -53,10 +53,10 @@ try:
 except Exception:
     print("none")
 PY
-then
   uv pip uninstall -y torch || true
   uv pip install --pre "torch==$TORCH_VER" --index-url "$TORCH_INDEX"
 fi
+
 
 # Install vLLM GPT-OSS wheel and deps
 uv pip install --pre "vllm==0.10.1+gptoss" \
