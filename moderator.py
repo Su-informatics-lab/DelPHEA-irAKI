@@ -7,32 +7,13 @@ single orchestrator for n experts × m questions with pluggable routing (sparse/
 and pluggable aggregation. validates io contracts, fails fast but attempts a
 one-shot repair per expert, and returns a serializable run report.
 
-ascii: control & data flow (single case)
-----------------------------------------
-+------------------+         +-----------------+         +-------------------+
-|   delphea_cli    |         |    moderator    |         |    expert[i]      |
-| (entrypoint)     |         | (this module)   |         |  (llm-backed)     |
-+---------+--------+         +---------+-------+         +---------+---------+
-          |                            |                           ^
-          | load panel & questionnaire |                           |
-          |--------------------------->|                           |
-          |                            |  R1: assess_all(Q set)    |
-          |                            +------------------------->>+  (for all i)
-          |                            |   returns AssessmentR1    |
-          |                            |<<-------------------------+
-          |                            |  detect disagreement      |
-          |                            |  (router strategy)        |
-          |                            |-- if any --> Debate (R2) -+
-          |                            |       minority prompts    |
-          |                            |  R3: reassess_all(Q set)  |
-          |                            +------------------------->>+
-          |                            |  returns AssessmentR3     |
-          |                            |<<-------------------------+
-          |                            |  aggregate consensus      |
-          |<---------------------------+  build report/artifacts
-          | write outputs (json, logs) |
-          v                            v
-        files                     results dict
+multi-turn debate (this version)
+--------------------------------
+For each QID with disagreement:
+  1) Minority opening (all experts selected by router for that QID)
+  2) Majority rebuttals (all other experts)
+  3) Minority closing (first minority expert)
+Each turn receives the prior turns for that QID via clinical_context["peer_turns"].
 
 contracts
 ---------
@@ -82,6 +63,9 @@ class Moderator:
         aggregator: Aggregator,
         logger: logging.Logger | None = None,
         max_retries: int = 1,
+        *,
+        debate_rounds: int = 3,  # 1: minority only; 2: +majority; 3: +minority closing
+        max_history_turns: int = 6,  # how many prior turns to pass into peer_turns
     ):
         if not experts:
             raise ValueError("experts cannot be empty")
@@ -93,6 +77,8 @@ class Moderator:
         self.aggregator = aggregator
         self.logger = logger or logging.getLogger("moderator")
         self.max_retries = max_retries
+        self.debate_rounds = max(1, int(debate_rounds))
+        self.max_history_turns = max(0, int(max_history_turns))
 
         # basic expert id sanity
         ids = [getattr(e, "expert_id", None) for e in self.experts]
@@ -146,12 +132,18 @@ class Moderator:
                     return str(v)
         return "unknown_case"
 
+    def _expert_by_id(self, expert_id: str):
+        for e in self.experts:
+            if e.expert_id == expert_id:
+                return e
+        raise KeyError(f"expert not found: {expert_id}")
+
     # --------- debate orchestration ---------
 
     def detect_and_run_debates(
         self, r1: Sequence[Tuple[str, AssessmentR1]], case: Dict[str, Any]
     ) -> Dict[str, Any]:
-        """compute debate plan via router and collect debate turns."""
+        """compute debate plan via router and collect multi-turn debate transcripts."""
         plan: DebatePlan = self.router.plan(r1, self.rules)
         solicitations = sum(len(v) for v in plan.by_qid.values())
         disagreement_present = solicitations > 0
@@ -165,7 +157,11 @@ class Moderator:
             expert_id="moderator",
             stage="debate",
             status="start",
-            meta={"solicitations": solicitations, "qids": len(plan.by_qid)},
+            meta={
+                "solicitations": solicitations,
+                "qids": len(plan.by_qid),
+                "rounds": self.debate_rounds,
+            },
         )
 
         transcripts: Dict[str, List[Dict[str, Any]]] = {}
@@ -188,6 +184,7 @@ class Moderator:
                 "transcripts": {},
                 "minority_views": {},
                 "debate_skipped": True,
+                "rounds": self.debate_rounds,
             }
 
         self.logger.info(
@@ -196,10 +193,25 @@ class Moderator:
             len(plan.by_qid),
         )
 
+        # Helpers
+        all_ids = [eid for eid, _ in r1]
+        r1_by_id = {eid: a for eid, a in r1}
+
+        def _append_turn(qid: str, turn_dict: Dict[str, Any]) -> None:
+            transcripts.setdefault(qid, []).append(turn_dict)
+
+        def _peer_history(qid: str) -> List[Dict[str, Any]]:
+            hist = transcripts.get(qid, [])
+            if self.max_history_turns <= 0:
+                return []
+            return hist[-self.max_history_turns :]
+
         # derive a simple minority_view summary per qid from r1 spread
-        for qid, expert_ids in plan.by_qid.items():
-            if not expert_ids:
+        for qid, minority_ids in plan.by_qid.items():
+            if not minority_ids:
                 continue
+
+            majority_ids = [eid for eid in all_ids if eid not in minority_ids]
 
             # structured status: per-question "turn" (before collecting turns)
             log_debate_status(
@@ -209,28 +221,101 @@ class Moderator:
                 expert_id="moderator",
                 stage="debate",
                 status="turn",
-                meta={"asked_experts": expert_ids},
+                meta={
+                    "asked_experts": minority_ids,
+                    "majority_candidates": majority_ids,
+                    "pattern": "minority→majority→minority",
+                },
             )
 
+            # Build minority-view text from R1 payloads
             minority_text = []
-            for eid, a in r1:
-                if eid in expert_ids:
-                    ev = a.evidence.get(qid, "")
-                    score = a.scores.get(qid, None)
-                    minority_text.append(f"{eid}: score={score} evidence={ev}")
+            for eid in minority_ids:
+                a = r1_by_id.get(eid)
+                if not a:
+                    continue
+                ev = a.evidence.get(qid, "")
+                score = a.scores.get(qid, None)
+                minority_text.append(f"{eid}: score={score} evidence={ev}")
             mv = "\n".join(minority_text) or "minority perspective not available"
             minority_views[qid] = mv  # expose the exact input to debate turns
 
-            transcripts[qid] = []
-            for e in self.experts:
-                if e.expert_id in expert_ids:
+            # ---- Round A: Minority opening (all minority experts) ----
+            for eid in minority_ids:
+                e = self._expert_by_id(eid)
+                ctx = {
+                    "case": case,
+                    "peer_turns": _peer_history(qid),
+                    "role": "minority_open",
+                }
+                turn = e.debate(
+                    qid=qid,
+                    round_no=2,  # debate stage
+                    clinical_context=ctx,
+                    minority_view=mv,
+                )
+                td = turn.model_dump()
+                td.update(
+                    {
+                        "expert_id": eid,
+                        "qid": qid,
+                        "turn_index": len(transcripts.get(qid, [])),
+                        "speaker_role": "minority",
+                    }
+                )
+                _append_turn(qid, td)
+
+            # ---- Round B: Majority rebuttals (all others) ----
+            if self.debate_rounds >= 2:
+                for eid in majority_ids:
+                    e = self._expert_by_id(eid)
+                    ctx = {
+                        "case": case,
+                        "peer_turns": _peer_history(qid),
+                        "role": "majority_rebuttal",
+                    }
                     turn = e.debate(
                         qid=qid,
                         round_no=2,
-                        clinical_context={"case": case},
+                        clinical_context=ctx,
                         minority_view=mv,
                     )
-                    transcripts[qid].append(turn.model_dump())
+                    td = turn.model_dump()
+                    td.update(
+                        {
+                            "expert_id": eid,
+                            "qid": qid,
+                            "turn_index": len(transcripts.get(qid, [])),
+                            "speaker_role": "majority",
+                        }
+                    )
+                    _append_turn(qid, td)
+
+            # ---- Round C: Minority closing (first minority only) ----
+            if self.debate_rounds >= 3 and minority_ids:
+                closing_eid = minority_ids[0]
+                e = self._expert_by_id(closing_eid)
+                ctx = {
+                    "case": case,
+                    "peer_turns": _peer_history(qid),
+                    "role": "minority_closing",
+                }
+                turn = e.debate(
+                    qid=qid,
+                    round_no=2,
+                    clinical_context=ctx,
+                    minority_view=mv,
+                )
+                td = turn.model_dump()
+                td.update(
+                    {
+                        "expert_id": closing_eid,
+                        "qid": qid,
+                        "turn_index": len(transcripts.get(qid, [])),
+                        "speaker_role": "minority",
+                    }
+                )
+                _append_turn(qid, td)
 
         # structured status: summary "end"
         log_debate_status(
@@ -245,9 +330,10 @@ class Moderator:
 
         return {
             "debate_plan": plan.by_qid,
-            "transcripts": transcripts,  # unchanged shape (qid -> [turn, ...])
-            "minority_views": minority_views,  # new: qid -> string used as input
+            "transcripts": transcripts,  # qid -> [turn_dict...], each with metadata
+            "minority_views": minority_views,  # qid -> string used as input
             "debate_skipped": False,
+            "rounds": self.debate_rounds,
         }
 
     def run_case(self, case: Dict[str, Any]) -> Dict[str, Any]:
@@ -429,7 +515,7 @@ class Moderator:
         """compact, model-friendly hint listing what failed and how to fix."""
         msgs = []
         for err in ve.errors():
-            loc = " ".join(str(x) for x in err.get("loc", ()))
+            loc = " → ".join(str(x) for x in err.get("loc", ()))
             msg = err.get("msg", "invalid value")
             msgs.append(f"{loc}: {msg}")
         if round_no == 1:
@@ -604,7 +690,6 @@ class Moderator:
 
 
 if __name__ == "__main__":
-    # trivial smoke test: not executed in production
     import sys
 
     print("moderator module loaded ok", file=sys.stderr)
