@@ -26,14 +26,6 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple, Type, TypeVar
 from pydantic import BaseModel, ValidationError
 from pydantic_core import InitErrorDetails, PydanticCustomError
 
-try:
-    # package mode (e.g., python -m delphea_iraki.delphea_iraki)
-    from . import validators as _self  # type: ignore
-except Exception:
-    # script mode (e.g., python delphea_iraki.py from repo root)
-    import sys as _sys
-
-    _self = _sys.modules[__name__]
 # -------------------------- helpers: error builders ---------------------------
 
 
@@ -149,17 +141,11 @@ def call_llm_with_schema(
     max_retries: int = 1,
 ) -> T:
     """call backend, extract json, validate with response_model; one-shot repair on partial json."""
-    REQUIRED_KEYS = [
-        "case_id",
-        "expert_id",
-        "scores",
-        "evidence",
-        "clinical_reasoning",
-        "differential_diagnosis",
-        "p_iraki",
-        "ci_iraki",
-        "confidence",
-    ]
+    # derive expected keys from the pydantic model so the contract matches r1 or r3 automatically
+    try:
+        expected_keys = list(response_model.model_fields.keys())  # pydantic v2
+    except Exception:
+        expected_keys = []
 
     def _gen_once(prompt: str) -> str:
         if hasattr(backend, "generate"):
@@ -169,17 +155,18 @@ def call_llm_with_schema(
         raise RuntimeError("llm backend does not expose a known generation method")
 
     def _contract_suffix() -> str:
+        keys_clause = (
+            f"- top-level keys must be exactly: {expected_keys}.\n"
+            if expected_keys
+            else "- return a single valid json object matching the provided schema.\n"
+        )
         return (
             "\n\nOUTPUT CONTRACT — READ CAREFULLY:\n"
-            "- Return ONLY a single valid JSON object (no prose, no markdown fences).\n"
-            f"- Top-level keys MUST be exactly: {REQUIRED_KEYS}.\n"
-            "- Echo the provided case_id and your expert_id exactly.\n"
+            "- return ONLY a single valid JSON object (no prose, no markdown fences).\n"
+            f"{keys_clause}"
+            "- echo the provided case_id and your expert_id exactly.\n"
             "- 'ci_iraki' must be an array of two floats: [lower, upper].\n"
         )
-
-    from . import validators as _self  # this file; ok in a module context
-
-    _extract_first_json_object = _self._extract_first_json_object  # type: ignore[attr-defined]
 
     last_err: Optional[ValidationError] = None
     last_raw: Optional[str] = None
@@ -194,8 +181,8 @@ def call_llm_with_schema(
                 partial = partial[-3000:] if len(partial) > 3000 else partial
                 prompt = (
                     f"{prompt_text}{_contract_suffix()}\n"
-                    "The previous output was a PARTIAL JSON object. "
-                    "Complete it to a SINGLE valid JSON object that matches the contract exactly.\n\n"
+                    "the previous output was a PARTIAL json object. "
+                    "complete it to a SINGLE valid json object that matches the contract exactly.\n\n"
                     "partial_json:\n```json\n"
                     f"{partial}\n```"
                 )
@@ -209,14 +196,10 @@ def call_llm_with_schema(
             json_text = _extract_first_json_object(raw)
             data = json.loads(json_text)
 
-            # --- type normalization (not a semantic fallback) ---
+            # strict tuple for ci_iraki to satisfy strict model fields if configured
             ci = data.get("ci_iraki")
             if isinstance(ci, list) and len(ci) == 2:
-                data["ci_iraki"] = (
-                    float(ci[0]),
-                    float(ci[1]),
-                )  # Pydantic v2 strict configs want a tuple
-            # -----------------------------------------------------
+                data["ci_iraki"] = (float(ci[0]), float(ci[1]))
 
             return response_model.model_validate(data)
         except ValidationError as ve:
@@ -230,7 +213,7 @@ def call_llm_with_schema(
                     {"error": str(je)},
                 ),
                 loc=("content",),
-                input=raw[:200],
+                input=raw[:200] if isinstance(raw, str) else str(raw)[:200],
                 ctx={"error": str(je)},
             )
             last_err = ValidationError.from_exception_data(
@@ -243,7 +226,7 @@ def call_llm_with_schema(
                     "unexpected_error", "{error}", {"error": f"{type(e).__name__}: {e}"}
                 ),
                 loc=("content",),
-                input=str(raw)[:200],
+                input=raw[:200] if isinstance(raw, str) else str(raw)[:200],
                 ctx={"error": f"{type(e).__name__}: {e}"},
             )
             last_err = ValidationError.from_exception_data(
