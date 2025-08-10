@@ -3,9 +3,9 @@
 #SBATCH --partition=nextgen-gpu
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:h100:2
-#SBATCH --cpus-per-gpu=4
+#SBATCH --cpus-per-gpu=8
 #SBATCH --mem=128G
-#SBATCH --time=1-00:00:00
+#SBATCH --time=2-00:00:00
 #SBATCH --ntasks=1
 #SBATCH --output=logs/%j.out
 #SBATCH --error=logs/%j.err
@@ -20,35 +20,26 @@ export IMG_FILE="$IMG_DIR/vllm-gptoss.sif"
 
 mkdir -p "$HF_HOME" "$IMG_DIR" logs
 
-# per-job temporary area (inside project folder)
+# per-job temporary area
 export JOB_SCRATCH="$HOME/DelPHEA-irAKI/tmp/$SLURM_JOB_ID"
 mkdir -p "$JOB_SCRATCH"
 
-# CUDA tool-chain inside container
+# CUDA setup
 export CUDA_HOME=/usr/local/cuda
 export PATH=$CUDA_HOME/bin:$PATH
 
-# ============================================
-# WORKING CONFIGURATION FOR GPT-OSS
-# ============================================
-export VLLM_USE_V1=0                        # Force stable v0 engine
-export VLLM_ATTENTION_BACKEND="FLASHINFER"  # Use FLASHINFER (available & works)
-export TORCH_CUDA_ARCH_LIST="9.0"           # H100 SM_90 architecture
-
-# Additional settings
+# Force v0 engine and basic settings
+export VLLM_USE_V1=0
+export TORCH_CUDA_ARCH_LIST="9.0"
 export CUDA_VISIBLE_DEVICES=0,1
 export NCCL_IB_DISABLE=1
 
-# launch vLLM inside Apptainer container
-export TENSOR_PARALLEL=${SLURM_JOB_GPUS_PER_NODE:-2}
+echo "========================================="
+echo "vLLM GPT-OSS-120B Server (Eager Mode)"
+echo "Using --enforce-eager to bypass attention issues"
+echo "========================================="
 
-echo "========================================="
-echo "vLLM GPT-OSS-120B Server Starting"
-echo "Container: vllm-gptoss.sif (0.10.1+gptoss)"
-echo "Attention Backend: FLASHINFER ✓"
-echo "Engine: v0 (stable) ✓"
-echo "Tensor Parallel: $TENSOR_PARALLEL"
-echo "========================================="
+export TENSOR_PARALLEL=${SLURM_JOB_GPUS_PER_NODE:-2}
 
 apptainer exec --nv \
   --bind "$HF_HOME":/root/.cache/huggingface \
@@ -57,7 +48,6 @@ apptainer exec --nv \
   --env CUDA_HOME="$CUDA_HOME" \
   --env PATH="$PATH" \
   --env VLLM_USE_V1="$VLLM_USE_V1" \
-  --env VLLM_ATTENTION_BACKEND="$VLLM_ATTENTION_BACKEND" \
   --env TORCH_CUDA_ARCH_LIST="$TORCH_CUDA_ARCH_LIST" \
   --env CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES" \
   --env NCCL_IB_DISABLE="$NCCL_IB_DISABLE" \
@@ -65,12 +55,12 @@ apptainer exec --nv \
   python3 -m vllm.entrypoints.openai.api_server \
     --model openai/gpt-oss-120b \
     --tensor-parallel-size "$TENSOR_PARALLEL" \
-    --gpu-memory-utilization 0.90 \
+    --gpu-memory-utilization 0.85 \
     --host 0.0.0.0 \
     --port 8000 \
     --trust-remote-code \
+    --enforce-eager \
+    --max-num-seqs 8 \
     --disable-log-requests
 
-echo "========================================="
 echo "Server terminated at $(date)"
-echo "========================================="
