@@ -15,29 +15,38 @@ set -euo pipefail
 
 # caches & image
 export HF_HOME="$HOME/hf-cache"
-export IMG_FILE="$HOME/containers/vllm-gptoss.sif"   # keep this SIF pinned; do NOT overwrite it
+export IMG_FILE="$HOME/containers/vllm-gptoss.sif"
 export JOB_SCRATCH="$HOME/DelPHEA-irAKI/tmp/$SLURM_JOB_ID"
 mkdir -p "$HF_HOME" "$JOB_SCRATCH" logs
 
-# keep v1, let vLLM pick FA3 on H100; don't force any backend
+# vLLM v1 + FA3 on Hopper. Do not force Triton. Disable FlashInfer.
 export VLLM_USE_V1=1
-unset VLLM_ATTENTION_BACKEND
-unset FLASHINFER_DISABLE_JIT
+export VLLM_ATTENTION_BACKEND=FLASH_ATTN
+export VLLM_FLASH_ATTN_VERSION=3
+export VLLM_DISABLE_FLASHINFER=1
+export TORCH_CUDA_ARCH_LIST="9.0"      # H100
+export CUDA_VISIBLE_DEVICES=0,1
 
-# TP across the two GPUs
-export TENSOR_PARALLEL=${SLURM_JOB_GPUS_PER_NODE:-2}
+# smaller context for first boot; raise later after it’s stable
+MAX_LEN="${MAX_LEN:-16384}"
+TP="${SLURM_JOB_GPUS_PER_NODE:-2}"
 
-# optional: quick GPU info in logs
+# optional: make startup more chatty while we verify
+export VLLM_CONFIGURE_LOGGING=1
+export VLLM_LOGGING_LEVEL=INFO
+# export NCCL_DEBUG=INFO   # uncomment if it still fails to start
+
+# no host CUDA bind; let the image provide user-space CUDA
 nvidia-smi --query-gpu=index,name,driver_version,memory.total --format=csv || true
 
-# IMPORTANT: no host CUDA bind; --nv passes the driver through
 apptainer exec --nv \
   --bind "$HF_HOME":/root/.cache/huggingface \
   --bind "$JOB_SCRATCH":/tmp \
   "$IMG_FILE" \
   python3 -u -m vllm.entrypoints.openai.api_server \
     --model openai/gpt-oss-120b \
-    --tensor-parallel-size "$TENSOR_PARALLEL" \
+    --tensor-parallel-size "$TP" \
     --gpu-memory-utilization 0.90 \
-    --host 0.0.0.0 --port 8000 \
-    --async-scheduling
+    --max-model-len "$MAX_LEN" \
+    --async-scheduling \
+    --host 0.0.0.0 --port 8000
