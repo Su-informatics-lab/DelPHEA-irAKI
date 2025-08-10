@@ -8,7 +8,8 @@ import logging
 from typing import Any, Dict, List, Optional
 
 from llm_backend import LLMBackend
-from messages import DebateComment, ExpertRound1Reply, ExpertRound3Reply
+from messages import ExpertRound1Reply, ExpertRound3Reply
+from models import AssessmentR1, AssessmentR3, DebateTurn
 from prompts.rounds import format_round1_prompt, format_round3_prompt
 from schema import load_qids
 from validators import call_llm_with_schema
@@ -46,11 +47,8 @@ class Expert:
         case: Dict[str, Any],
         questionnaire_path: str,
         repair_hint: Optional[str] = None,  # reserved for future use
-    ) -> Dict[str, Any]:
-        """produce a round-1 assessment using schema-guarded parsing.
-
-        returns a plain dict (json-serializable) shaped like ExpertRound1Reply.
-        """
+    ) -> AssessmentR1:
+        """produce a round-1 assessment using instructor + pydantic conversion."""
         # validate questionnaire early (fail loud if malformed/missing)
         load_qids(questionnaire_path)
 
@@ -65,15 +63,16 @@ class Expert:
         )
 
         reply = call_llm_with_schema(
-            response_model=ExpertRound1Reply,
+            response_model=ExpertRound1Reply,  # messages.* schema for instructor
             prompt_text=prompt_text,
-            backend=self.backend,  # validators will infer base_url/model from backend
+            backend=self.backend,  # validators infer base_url/model
             temperature=0.0,
             max_retries=1,
         )
         payload = reply.model_dump()
         self._log_preview(payload, "[r1 parsed]")
-        return payload
+        # return models.* pydantic to satisfy moderator/aggregator contracts
+        return AssessmentR1(**payload)
 
     def assess_round3(
         self,
@@ -81,11 +80,8 @@ class Expert:
         questionnaire_path: str,
         debate_context: Dict[str, Any],
         repair_hint: Optional[str] = None,  # reserved for future use
-    ) -> Dict[str, Any]:
-        """produce a round-3 reassessment using schema-guarded parsing.
-
-        returns a plain dict (json-serializable) shaped like ExpertRound3Reply.
-        """
+    ) -> AssessmentR3:
+        """produce a round-3 reassessment using instructor + pydantic conversion."""
         load_qids(questionnaire_path)
 
         info = self._extract_case_strings(case)
@@ -100,7 +96,7 @@ class Expert:
         )
 
         reply = call_llm_with_schema(
-            response_model=ExpertRound3Reply,
+            response_model=ExpertRound3Reply,  # messages.* schema for instructor
             prompt_text=prompt_text,
             backend=self.backend,
             temperature=0.0,
@@ -108,7 +104,7 @@ class Expert:
         )
         payload = reply.model_dump()
         self._log_preview(payload, "[r3 parsed]")
-        return payload
+        return AssessmentR3(**payload)
 
     # --------- debate (round 2 single turn) ---------
 
@@ -118,43 +114,25 @@ class Expert:
         round_no: int,
         clinical_context: Dict[str, Any],
         minority_view: str,
-    ) -> Dict[str, Any]:
-        """produce a single debate turn for a specific question.
-
-        returns a plain dict (json-serializable) shaped like DebateComment.
-        """
+    ) -> DebateTurn:
+        """produce a single debate turn for a specific question."""
         if not qid:
             raise ValueError("debate requires a non-empty qid")
         if round_no not in (1, 2, 3):
             raise ValueError(f"unsupported round_no for debate: {round_no}")
 
-        # minimal structured instruction to elicit DebateComment reliably
-        # keep instruction inline (yagni) rather than adding a new prompt file
-        prompt_text = (
-            "you are participating in a focused expert debate.\n"
-            "please respond with a concise, evidence-backed argument.\n\n"
-            f"question_id: {qid}\n"
-            f"expert_id (author): {self.expert_id}\n"
-            f"specialty: {self.specialty}\n"
-            "minority_view_to_address:\n"
-            f"{minority_view}\n\n"
-            "clinical_context:\n"
-            f"{self._flatten_dict_lines(clinical_context)}\n\n"
-            "return a valid DebateComment object. ensure 'text' > 10 chars. "
-            "set 'satisfied' true only if no further debate is needed; "
-            "optionally include 'revised_score' if your stance changed."
-        )
-
-        reply = call_llm_with_schema(
-            response_model=DebateComment,
-            prompt_text=prompt_text,
-            backend=self.backend,
-            temperature=0.0,
-            max_retries=1,
-        )
-        payload = reply.model_dump()
-        self._log_preview(payload, f"[debate {qid} parsed]")
-        return payload
+        # keep using backend's debate hook (yagni: no instructor schema unless needed)
+        payload = {
+            "expert_id": self.expert_id,
+            "specialty": self.specialty,
+            "qid": qid,
+            "round_no": round_no,
+            "clinical_context": clinical_context,
+            "minority_view": minority_view,
+        }
+        raw = self.backend.debate(payload)
+        self._log_preview(raw, f"[debate {qid} raw]")
+        return DebateTurn(**raw)
 
     # --------- helpers ---------
 
