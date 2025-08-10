@@ -20,6 +20,7 @@ from expert import Expert
 from llm_backend import LLMBackend
 from moderator import Moderator
 from router import FullRouter, SparseRouter
+from schema import load_qids  # for logging qid count
 
 # ------------------------------- logging setup -------------------------------
 
@@ -46,13 +47,14 @@ def _to_case_id_from_patient_id(x: str | int) -> str:
 
 
 def _patch_backend_caps(backend: Any, ctx_window: int) -> None:
-    """ensure backend.capabilities() reports our chosen context window."""
+    """ensure backend.capabilities() reports our chosen context window (no recursion)."""
+    orig_caps = getattr(backend, "capabilities", None)
 
     def _caps() -> Dict[str, Any]:
         base: Dict[str, Any] = {}
         try:
-            if hasattr(backend, "capabilities"):
-                got = backend.capabilities()
+            if callable(orig_caps):
+                got = orig_caps()
                 if isinstance(got, dict):
                     base.update(got)
         except Exception:
@@ -60,7 +62,6 @@ def _patch_backend_caps(backend: Any, ctx_window: int) -> None:
         base["context_window"] = int(ctx_window)
         return base
 
-    # attach/wrap
     setattr(backend, "capabilities", _caps)
 
 
@@ -160,67 +161,82 @@ def _build_router(kind: str) -> Any:
 
 
 def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
-    p = argparse.ArgumentParser(
+    parser = argparse.ArgumentParser(
         description="DelPHEA-irAKI — multi-expert Delphi consensus for irAKI"
     )
-    p.add_argument(
+    parser.add_argument(
         "--case",
         required=True,
         help="case id or patient id (e.g., iraki_case_123 or P123)",
     )
-    p.add_argument("--q", required=True, help="path to questionnaire json")
-    p.add_argument("--panel", default="panel.json", help="path to expert panel json")
-    p.add_argument(
+    parser.add_argument("--q", required=True, help="path to questionnaire json")
+    parser.add_argument(
+        "--panel", default="panel.json", help="path to expert panel json"
+    )
+    parser.add_argument(
         "--router", choices=["full", "sparse"], default="full", help="routing strategy"
     )
-    p.add_argument(
+    parser.add_argument(
         "--endpoint-url", default=os.getenv("DELPHEA_ENDPOINT", "http://localhost:8000")
     )
-    p.add_argument(
+    parser.add_argument(
         "--model-name", default=os.getenv("DELPHEA_MODEL", "openai/gpt-oss-120b")
     )
-    p.add_argument(
+    parser.add_argument(
         "--out", default="delphea_run.json", help="where to write the run report (json)"
     )
+
     # token policy knobs (centralized in validators via defaults we set below)
-    p.add_argument(
+    parser.add_argument(
         "--ctx-window",
         type=int,
-        default=200000,
+        default=200_000,
         help="model context window tokens (e.g., 200000)",
     )
-    p.add_argument(
+    parser.add_argument(
         "--out-tokens-init",
         type=int,
-        default=6000,
+        default=6_000,
         help="initial output token budget per attempt",
     )
-    p.add_argument(
+    parser.add_argument(
         "--retries",
         type=int,
         default=2,
         help="number of repair retries on schema/JSON errors",
     )
-    p.add_argument(
+    parser.add_argument(
         "--retry-factor",
         type=float,
         default=1.75,
         help="geometric escalation factor per retry",
     )
-    p.add_argument(
+    parser.add_argument(
         "--reserve-tokens",
         type=int,
-        default=1024,
+        default=1_024,
         help="safety buffer tokens not used by output",
     )
+
+    # per-round temperatures
+    parser.add_argument(
+        "--temperature-r1", type=float, default=0.0, help="temperature for round 1"
+    )
+    parser.add_argument(
+        "--temperature-debate", type=float, default=0.3, help="temperature for debate"
+    )
+    parser.add_argument(
+        "--temperature-r3", type=float, default=0.0, help="temperature for round 3"
+    )
+
     # optional input length control (best-effort)
-    p.add_argument(
+    parser.add_argument(
         "--max-input-chars",
         type=int,
         default=0,
         help="cap total free-text chars from notes (0=off)",
     )
-    return p.parse_args(argv)
+    return parser.parse_args(argv)
 
 
 # ------------------------------------- main ------------------------------------
@@ -247,7 +263,6 @@ def main(argv: Optional[List[str]] = None) -> None:
     # load data
     LOG.info("Loading patient data...")
     loader = DataLoader()
-    # the dataloader prints its own info about counts; we just proceed
     case_id = (
         args.case
         if str(args.case).startswith("iraki_case_")
@@ -287,12 +302,23 @@ def main(argv: Optional[List[str]] = None) -> None:
     # build expert panel
     panel = _load_panel(Path(args.panel))
     LOG.info("constructed expert panel: %s", [spec for spec, _ in panel])
+
+    # show qid count (helpful for budgeting)
+    try:
+        qids = load_qids(args.q)
+        LOG.info("questionnaire qids: %d", len(qids))
+    except Exception:
+        LOG.info("questionnaire qids: (unavailable)")
+
     experts: List[Expert] = [
         Expert(
             expert_id=str(spec),
             specialty=str(spec),
             persona=(persona or {}),
             backend=backend,
+            temperature_r1=args.temperature_r1,
+            temperature_debate=args.temperature_debate,
+            temperature_r3=args.temperature_r3,
         )
         for spec, persona in panel
     ]
@@ -306,14 +332,10 @@ def main(argv: Optional[List[str]] = None) -> None:
         experts=experts, router=router, aggregator=aggregator, qpath=args.q
     )
 
-    # run rounds (r1 → debate → r3) — keep the same entry as before to avoid regressions
-    LOG.info(
-        "[case %s] round 1 start — fan-out %d experts × qids", case_id, len(experts)
-    )
+    # run rounds (r1 → debate → r3)
+    LOG.info("[case %s] round 1 start — fan-out %d experts", case_id, len(experts))
     r1 = moderator.assess_round(1, case)
 
-    # debate and r3 may be no-ops depending on Moderator’s implementation;
-    # we call them if available to preserve the 3-round contract.
     r_debate = None
     if hasattr(moderator, "run_debate"):
         LOG.info("[case %s] debate start", case_id)
@@ -321,6 +343,7 @@ def main(argv: Optional[List[str]] = None) -> None:
             r_debate = moderator.run_debate(case, r1)
         except TypeError:
             r_debate = moderator.run_debate(case_id=case_id, r1=r1)
+
     r3 = None
     if hasattr(moderator, "assess_round"):
         LOG.info("[case %s] round 3 start", case_id)
@@ -345,6 +368,11 @@ def main(argv: Optional[List[str]] = None) -> None:
             "retries": args.retries,
             "retry_factor": args.retry_factor,
             "reserve_tokens": args.reserve_tokens,
+        },
+        "temperatures": {
+            "r1": args.temperature_r1,
+            "debate": args.temperature_debate,
+            "r3": args.temperature_r3,
         },
         "round1": r1,
         "debate": r_debate,

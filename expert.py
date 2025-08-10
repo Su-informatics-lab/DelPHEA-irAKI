@@ -25,8 +25,12 @@ class Expert:
         persona: Dict[str, Any],
         backend: LLMBackend,
         prompts_path: str = "prompts/expert_prompts.json",
+        *,
+        temperature_r1: float = 0.0,
+        temperature_debate: float = 0.3,
+        temperature_r3: float = 0.0,
     ) -> None:
-        """initialize an expert wrapper."""
+        # validate
         if not expert_id:
             raise ValueError("expert_id cannot be empty")
         if backend is None:
@@ -38,7 +42,13 @@ class Expert:
         self.backend = backend
         self.prompts_path = prompts_path
 
-        self.logger = logging.getLogger(f"expert.{expert_id}")
+        # per-round temperatures (cli-controlled via delphea_iraki.py)
+        self.temperature_r1 = float(temperature_r1)
+        self.temperature_debate = float(temperature_debate)
+        self.temperature_r3 = float(temperature_r3)
+
+        # logger
+        self.logger = logging.getLogger(f"expert.{self.expert_id}")
 
     # --------- round 1 / round 3 ---------
 
@@ -63,11 +73,10 @@ class Expert:
         )
 
         reply = call_llm_with_schema(
-            response_model=AssessmentR1,  # strict final model
+            response_model=AssessmentR1,
             prompt_text=prompt_text,
             backend=self.backend,
-            temperature=0.0,
-            max_retries=1,
+            temperature=self.temperature_r1,
         )
         self._log_preview(reply, "r1-validated")
         return reply  # already a validated AssessmentR1
@@ -94,11 +103,10 @@ class Expert:
         )
 
         reply = call_llm_with_schema(
-            response_model=AssessmentR3,  # strict final model
+            response_model=AssessmentR3,
             prompt_text=prompt_text,
             backend=self.backend,
-            temperature=0.0,
-            max_retries=1,
+            temperature=self.temperature_r3,
         )
         self._log_preview(reply, "r3-validated")
         return reply  # already a validated AssessmentR3
@@ -112,7 +120,11 @@ class Expert:
         clinical_context: Dict[str, Any],
         minority_view: str,
     ) -> DebateTurn:
-        """produce a single debate turn for a specific question."""
+        """produce a single debate turn for a specific question.
+
+        note: if your backend supports passing temperature for debate, extend the payload
+        or add a dedicated call that accepts temperature=self.temperature_debate.
+        """
         if not qid:
             raise ValueError("debate requires a non-empty qid")
         if round_no not in (1, 2, 3):
@@ -125,6 +137,8 @@ class Expert:
             "round_no": round_no,
             "clinical_context": clinical_context,
             "minority_view": minority_view,
+            # optionally include temperature for backends that honor it
+            "temperature": self.temperature_debate,
         }
         raw = self.backend.debate(payload)
         self._log_preview(raw, f"[debate {qid} raw]")
@@ -205,7 +219,11 @@ class Expert:
         return "demographics: not available in source case"
 
     def _coerce_notes(self, case: Dict[str, Any]) -> str:
-        """normalize aggregated clinical notes into a single bounded string."""
+        """normalize aggregated clinical notes into a single string (no truncation here).
+
+        input-size control is intentionally handled upstream (delphea_iraki.py) via --max-input-chars
+        and centrally in validators via token budgeting. this function only normalizes.
+        """
         if case.get("notes_agg") is not None:
             notes_val = case["notes_agg"]
         elif case.get("clinical_notes") is not None:
@@ -223,15 +241,19 @@ class Expert:
                 if isinstance(item, str):
                     parts.append(item)
                 elif isinstance(item, dict):
-                    t = item.get("text") or item.get("note") or ""
+                    t = (
+                        item.get("text")
+                        or item.get("note")
+                        or item.get("REPORT_TEXT")
+                        or item.get("report_text")
+                        or ""
+                    )
                     if t:
                         parts.append(str(t))
             notes = "\n---\n".join(p for p in parts if p.strip())
         else:
             notes = str(notes_val)
 
-        if len(notes) > 16000:
-            notes = notes[:16000] + "\n...[truncated]"
         return notes
 
     def _extract_case_strings(self, case: Dict[str, Any]) -> Dict[str, str]:
