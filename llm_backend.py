@@ -66,7 +66,7 @@ class LLMBackend:
         self.temperature_r2: Optional[float] = None
         self.temperature_r3: Optional[float] = None
 
-    # ------------------------ capabilities ------------------------
+    # ------------------------ capabilities / tokenization ------------------------
 
     def set_context_window(self, tokens: int) -> None:
         """set the advertised context window (tokens) for validators/prompt sizing."""
@@ -79,10 +79,17 @@ class LLMBackend:
     def capabilities(self) -> Dict[str, Any]:
         """Advertise backend limits so validators can size prompts correctly."""
         ctx = int(self._context_window) if self._context_window else 32768
-        return {
-            "context_window": ctx,
-            "json_mode": bool(self.supports_json_mode),
-        }
+        return {"context_window": ctx, "json_mode": bool(self.supports_json_mode)}
+
+    def count_tokens(self, text: str) -> int:
+        """approx token count used by validators; server-independent heuristic."""
+        if not isinstance(text, str):
+            try:
+                text = str(text)
+            except Exception:
+                return 1
+        # ~4 chars per token heuristic
+        return max(1, len(text) // 4)
 
     # ------------------------ internal helpers ------------------------
 
@@ -138,3 +145,141 @@ class LLMBackend:
         r.raise_for_status()
         data = r.json()
         return data["choices"][0]["message"]["content"]
+
+    # ----------------------------- debate api ------------------------------
+
+    def debate(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Produce a single debate turn (used by Expert.debate).
+
+        Input payload keys (expected):
+          - expert_id: str
+          - specialty: str
+          - qid: str
+          - round_no: int
+          - clinical_context: dict
+          - minority_view: str
+          - temperature: float
+        Returns:
+          dict suitable for models.DebateTurn(**dict)
+        """
+        expert_id = payload.get("expert_id", "unknown_expert")
+        specialty = payload.get("specialty", "expert")
+        qid = payload.get("qid", "unknown_qid")
+        round_no = int(payload.get("round_no", 2))
+        minority_view = payload.get("minority_view", "")
+        clinical_context = payload.get("clinical_context", {})
+        temperature = float(payload.get("temperature", 0.3))
+
+        system = (
+            "You are a clinical expert participating in a structured, single-turn debate. "
+            "Return ONLY one JSON object with your argument."
+        )
+        user = (
+            f"Role: {specialty} ({expert_id})\n"
+            f"Question ID: {qid}\n"
+            f"Round: {round_no}\n\n"
+            "Clinical context (JSON):\n"
+            f"{json.dumps(clinical_context, ensure_ascii=False)}\n\n"
+            "Minority view summary:\n"
+            f"{minority_view}\n\n"
+            "TASK: Write a concise, evidence-grounded argument (<=150 words) addressing the question.\n"
+            "OUTPUT: Return ONLY a JSON object with fields:\n"
+            "{\n"
+            f'  "expert_id": "{expert_id}",\n'
+            f'  "qid": "{qid}",\n'
+            f'  "round_no": {round_no},\n'
+            '  "content": "short argument text",\n'
+            '  "stance": "support" | "oppose" | "nuanced",\n'
+            '  "citations": ["optional strings"]\n'
+            "}\n"
+        )
+
+        # try JSON-mode completion first
+        try:
+            text = self.generate(
+                user, max_tokens=600, temperature=temperature, system=system
+            )
+            obj = self._safe_first_json(text)
+            if isinstance(obj, dict):
+                # ensure required identifiers present
+                obj.setdefault("expert_id", expert_id)
+                obj.setdefault("qid", qid)
+                obj.setdefault("round_no", round_no)
+                # compatibility: some schemas name the field "argument" instead of "content"
+                if "argument" not in obj and "content" in obj:
+                    obj["argument"] = obj["content"]
+                if "content" not in obj and "argument" in obj:
+                    obj["content"] = obj["argument"]
+                if "citations" not in obj:
+                    obj["citations"] = []
+                return obj
+        except Exception:
+            # fall through to plain completion path below
+            pass
+
+        # fallback: ask plain completion and wrap it
+        try:
+            plain = self.generate(
+                f"{user}\nReturn just the argument text (no JSON) if you cannot return JSON.",
+                max_tokens=400,
+                temperature=temperature,
+                system="You are concise and factual.",
+            )
+        except Exception:
+            plain = "Unable to generate debate content."
+
+        return {
+            "expert_id": expert_id,
+            "qid": qid,
+            "round_no": round_no,
+            "content": plain.strip(),
+            "argument": plain.strip(),  # compatibility with alternate schemas
+            "citations": [],
+            "stance": "nuanced",
+        }
+
+    # ----------------------------- utils ----------------------------------
+
+    @staticmethod
+    def _safe_first_json(text: str) -> Any:
+        """Extract and parse the first JSON object in text; return dict on success or None."""
+        if not isinstance(text, str):
+            return None
+        # fenced block first
+        fence = text.find("```json")
+        if fence == -1:
+            fence = text.find("```JSON")
+        if fence != -1:
+            end = text.find("```", fence + 7)
+            if end != -1:
+                text = text[fence + 7 : end]
+
+        # find first '{' and balance braces
+        start = text.find("{")
+        if start == -1:
+            return None
+        brace = 0
+        in_str = False
+        esc = False
+        for i in range(start, len(text)):
+            ch = text[i]
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == '"':
+                    in_str = False
+            else:
+                if ch == '"':
+                    in_str = True
+                elif ch == "{":
+                    brace += 1
+                elif ch == "}":
+                    brace -= 1
+                    if brace == 0:
+                        try:
+                            return json.loads(text[start : i + 1])
+                        except Exception:
+                            return None
+        return None
