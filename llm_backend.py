@@ -1,6 +1,24 @@
 # llm_backend.py
 # single minimal backend for text generation against a vLLM/OpenAI-compatible server.
 # provides a tiny, reliable .generate(prompt) api and hides transport details.
+#
+# design goals
+# ------------
+# - prefer /v1/chat/completions for instruct/chat models; fallback to /v1/completions
+# - do not force openai "json mode" by default (vllm/model combos may not support it)
+# - aggressively extract a valid json object/array from the returned text when present
+# - fail loud with actionable error messages (http status, body head)
+#
+# usage
+# -----
+# backend = LLMBackend(endpoint_url="http://localhost:8000", model="openai/gpt-oss-120b")
+# text = backend.generate(prompt)
+#
+# notes
+# -----
+# some servers return empty content for unsupported params (e.g., response_format);
+# we therefore keep the default payload minimal and only add extras when explicitly
+# requested by the caller via the `extra` argument.
 
 from __future__ import annotations
 
@@ -14,35 +32,27 @@ import requests
 class LLMBackend:
     """thin client for vLLM/OpenAI-compatible inference servers.
 
-    the project expects one capability at this layer: generate a completion
-    for a raw prompt string. higher-level orchestration (round prompts, debate,
-    aggregation) lives outside this transport.
-
-    Args:
-        endpoint_url: base http url, e.g. "http://localhost:8000".
-        model_name: model identifier; optional if 'model' is provided.
-        model: alias for model_name for compatibility with upstream code.
-        timeout: request timeout in seconds.
-        api_key: optional bearer token.
-        **_: ignore unexpected kwargs gracefully.
-
-    Raises:
-        ValueError: if neither model_name nor model is provided.
+    this class exposes a single method, `generate(prompt)`, that returns a string.
+    it first attempts the Chat Completions endpoint, then falls back to the legacy
+    Completions endpoint. returned text is post-processed to extract valid json if
+    present, which works well with schema validators upstream that expect json.
     """
 
     def __init__(
         self,
-        endpoint_url: str,
-        model_name: Optional[str] = None,
         *,
+        endpoint_url: str,
         model: Optional[str] = None,
-        timeout: float = 60.0,
+        model_name: Optional[str] = None,  # synonym for convenience
+        timeout: float = 120.0,
         api_key: Optional[str] = None,
         **_: Any,  # ignore legacy kwargs gracefully
     ) -> None:
         model_id = model_name or model
         if not model_id:
             raise ValueError("LLMBackend requires 'model' (or 'model_name')")
+        if not endpoint_url:
+            raise ValueError("LLMBackend requires 'endpoint_url'")
         self._base = endpoint_url.rstrip("/")
         self._model = model_id
         self._timeout = timeout
@@ -66,14 +76,40 @@ class LLMBackend:
     ) -> str:
         """return raw text completion for a single prompt string.
 
-        attempts /v1/completions first; if unavailable or blank, falls back to
-        /v1/chat/completions with json mode enabled.
+        attempts /v1/chat/completions first; if unavailable or blank, falls back to
+        /v1/completions. avoids forcing json mode unless explicitly requested in `extra`.
 
         Raises:
             RuntimeError: on network, http, or schema errors, or if both routes
             return no usable text.
         """
-        # try legacy text completions first
+        # 1) try chat api first (most reliable for instruction-tuned models)
+        chat_payload: Dict[str, Any] = {
+            "model": self._model,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+        }
+        # only pass response_format/json mode if explicitly asked by caller
+        if isinstance(extra, dict) and "response_format" in extra:
+            chat_payload["response_format"] = extra["response_format"]
+        if stop:
+            chat_payload["stop"] = stop
+        if seed is not None:
+            chat_payload["seed"] = seed
+        if isinstance(extra, dict):
+            # merge any other extras last
+            for k, v in extra.items():
+                if k == "response_format":
+                    continue
+                chat_payload[k] = v
+
+        text = self._post_and_parse_text(self._chat, chat_payload, mode="chat")
+        text = self._clean_and_maybe_extract_json(text)
+        if text is not None:
+            return text
+
+        # 2) fallback to legacy text completions
         payload = {
             "model": self._model,
             "prompt": prompt,
@@ -85,29 +121,9 @@ class LLMBackend:
         if seed is not None:
             payload["seed"] = seed
         if isinstance(extra, dict):
-            payload.update(extra)
+            payload.update({k: v for k, v in extra.items() if k != "response_format"})
 
         text = self._post_and_parse_text(self._completions, payload, mode="completions")
-        text = self._clean_and_maybe_extract_json(text)
-        if text is not None:
-            return text
-
-        # fallback to chat api; request json if supported
-        chat_payload: Dict[str, Any] = {
-            "model": self._model,
-            "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": max_tokens,
-            "temperature": temperature,
-            "response_format": {"type": "json_object"},
-        }
-        if stop:
-            chat_payload["stop"] = stop
-        if seed is not None:
-            chat_payload["seed"] = seed
-        if isinstance(extra, dict):
-            chat_payload.update(extra)
-
-        text = self._post_and_parse_text(self._chat, chat_payload, mode="chat")
         text = self._clean_and_maybe_extract_json(text)
         if text is not None:
             return text
@@ -129,17 +145,15 @@ class LLMBackend:
             resp = requests.post(
                 url, headers=self._headers(), json=payload, timeout=self._timeout
             )
-        except requests.RequestException as e:
-            # for completions mode allow chat fallback by returning None
-            if mode == "completions":
-                return None
-            raise RuntimeError(f"LLMBackend: request error for {url}: {e}") from e
-
-        # allow fallback on missing route
-        if resp.status_code == 404 and mode == "completions":
+        except requests.RequestException:
+            # allow fallback by returning None unless this is the last route
             return None
 
-        if resp.status_code // 100 != 2:
+        # allow fallback on missing route
+        if resp.status_code == 404:
+            return None
+
+        if resp.status_code != 200:
             body_head = resp.text[:500]
             raise RuntimeError(
                 f"LLMBackend: HTTP {resp.status_code} for {url}; body head: {body_head}"
@@ -150,43 +164,50 @@ class LLMBackend:
         except json.JSONDecodeError as e:
             raise RuntimeError(f"LLMBackend: non-JSON response from {url}: {e}") from e
 
+        # normalize to a text string if possible
         try:
-            if mode == "completions":
+            if mode == "chat":
                 choices = data.get("choices") or []
                 if not choices:
                     return None
-                text = choices[0].get("text")
-                return text if isinstance(text, str) and text.strip() else None
+                msg = choices[0].get("message") or {}
 
-            # chat mode
+                # primary: regular assistant content
+                content = msg.get("content")
+                if isinstance(content, str) and content.strip():
+                    return content
+
+                # some servers may put text under 'delta' even when not streaming
+                delta = choices[0].get("delta") or {}
+                dcontent = delta.get("content")
+                if isinstance(dcontent, str) and dcontent.strip():
+                    return dcontent
+
+                # no text content
+                return None
+
+            # completions mode
             choices = data.get("choices") or []
             if not choices:
                 return None
-            msg = choices[0].get("message") or {}
-
-            # primary: regular assistant content
-            content = msg.get("content")
-            if isinstance(content, str) and content.strip():
-                return content
-
-            # secondary: function/tool calls
-            tool_calls = msg.get("tool_calls") or []
-            for tc in tool_calls:
-                fn = tc.get("function") or {}
-                args = fn.get("arguments")
-                if isinstance(args, (dict, list)):
-                    return json.dumps(args)
-                if isinstance(args, str) and args.strip():
-                    return args
-
-            return None
+            text = choices[0].get("text")
+            return text if isinstance(text, str) and text.strip() else None
 
         except Exception as e:  # noqa: BLE001
+            # defensive: convert any schema surprises into a loud, actionable error
             raise RuntimeError(
-                f"LLMBackend: failed to parse response schema from {url}: {e}"
+                f"LLMBackend: unexpected response schema from {url}: {data!r}"
             ) from e
 
-    # -------------------- helpers --------------------
+    # -------------------- text post-processing helpers --------------------
+
+    @staticmethod
+    def _is_valid_json(s: str) -> bool:
+        try:
+            json.loads(s)
+            return True
+        except Exception:  # noqa: BLE001
+            return False
 
     def _clean_and_maybe_extract_json(self, text: Optional[str]) -> Optional[str]:
         """normalize empty to None; if text contains json, extract and return it."""
@@ -217,16 +238,8 @@ class LLMBackend:
         if arr and self._is_valid_json(arr):
             return arr
 
-        # no valid json found; return None so caller can fallback/raise
-        return None
-
-    @staticmethod
-    def _is_valid_json(s: str) -> bool:
-        try:
-            json.loads(s)
-            return True
-        except Exception:
-            return False
+        # no valid json found; return original (non-json) text to upstream caller
+        return s
 
     @staticmethod
     def _extract_first_braced(s: str, *, opener: str, closer: str) -> Optional[str]:
