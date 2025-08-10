@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=gptoss_native
+#SBATCH --job-name=gptoss_auto
 #SBATCH --partition=nextgen-gpu
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:h100:2
@@ -13,98 +13,124 @@
 
 set -euo pipefail
 
-# ---------- Modules (no host CUDA module needed) ----------
-module purge
-module load GCCcore/13.3.0
-module load Python/3.12.3-GCCcore-13.3.0
-
-# ---------- Paths ----------
+# -------------------- config you can tweak --------------------
+# Model: start with 20B to validate; flip to 120B once stable
+export MODEL="${MODEL:-openai/gpt-oss-20b}"
+export PORT="${PORT:-8000}"
+export GMU="${GMU:-0.90}"                 # gpu-memory-utilization
+export MAX_MODEL_LEN="${MAX_MODEL_LEN:-16384}"
 export HF_HOME="${HF_HOME:-$HOME/hf-cache}"
-export HF_HUB_ENABLE_HF_TRANSFER=1
+export VENV_DIR="${VENV_DIR:-$HOME/.venvs/gptoss-cu128-py312}"
+export IMG_FILE="${IMG_FILE:-$HOME/containers/vllm-gptoss.sif}"
+
+# Torch nightly pinned to match vllm==0.10.1+gptoss
+export TORCH_INDEX="https://download.pytorch.org/whl/nightly/cu128"
+export TORCH_VER="2.9.0.dev20250804+cu128"
+
 mkdir -p "$HF_HOME" logs
 
-# Persistent venv
-export VENV_DIR="${VENV_DIR:-$HOME/.venvs/gptoss-cu128-py312}"
-mkdir -p "$(dirname "$VENV_DIR")"
+# -------------------- basic hardware info --------------------
+echo "=== host info ==="
+echo "node: $(hostname) | job: $SLURM_JOB_ID"
+nvidia-smi --query-gpu=index,name,driver_version,memory.total --format=csv || true
+GPU_COUNT=$(nvidia-smi -L 2>/dev/null | wc -l | awk '{print $1}')
+GPU_COUNT=${GPU_COUNT:-2}
+export TP="${TP:-$GPU_COUNT}"
 
-# Job scratch
-export JOB_SCRATCH="${JOB_SCRATCH:-$HOME/DelPHEA-irAKI/tmp/$SLURM_JOB_ID}"
-mkdir -p "$JOB_SCRATCH"
+# -------------------- detect GLIBC --------------------
+glibc_str="$(getconf GNU_LIBC_VERSION 2>/dev/null || true)"
+if [[ -z "$glibc_str" ]]; then
+  glibc_str="$(ldd --version 2>&1 | head -n1 || true)"
+fi
+echo "GLIBC reported: ${glibc_str:-unknown}"
 
-# ---------- Exact Torch nightly required by vLLM gptoss ----------
-# As of Aug 10, 2025 the wheel pins Torch to this build:
-export TORCH_INDEX="https://download.pytorch.org/whl/nightly/cu128"
-export TORCH_VER="2.9.0.dev20250804+cu128"   # must match vllm==0.10.1+gptoss
-
-# ---------- Bootstrap venv (idempotent, fast on re-run) ----------
-if [[ ! -x "$VENV_DIR/bin/python" ]]; then
-  python -m venv "$VENV_DIR"
-  "$VENV_DIR/bin/python" -m pip install -U pip uv
+# parse major.minor
+glibc_ver="$(echo "$glibc_str" | grep -Eo '[0-9]+\.[0-9]+' | head -n1 || true)"
+use_native=0
+if [[ -n "$glibc_ver" ]]; then
+  maj="${glibc_ver%%.*}"
+  min="${glibc_ver##*.}"
+  if (( maj > 2 || (maj == 2 && min >= 32) )); then
+    use_native=1
+  fi
 fi
 
-source "$VENV_DIR/bin/activate"
-
-# Ensure pinned Torch is installed first (avoid solver conflicts)
-if ! python - <<'PY' | grep -q "$TORCH_VER"; then
-import sys
-try:
-    import torch
-    print(getattr(torch, "__version__", ""))
-except Exception:
-    print("none")
-PY
-  uv pip uninstall -y torch || true
-  uv pip install --pre "torch==$TORCH_VER" --index-url "$TORCH_INDEX"
-fi
-
-
-# Install vLLM GPT-OSS wheel and deps
-uv pip install --pre "vllm==0.10.1+gptoss" \
-  --extra-index-url https://wheels.vllm.ai/gpt-oss/ \
-  --extra-index-url "$TORCH_INDEX" \
-  --index-strategy unsafe-best-match
-
-# Newer transformers works best with gpt-oss configs
-python -m pip install -U "transformers>=4.46.0"
-
-# ---------- Runtime env (H100 + V1 + FA3) ----------
+# -------------------- common runtime env --------------------
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
 export VLLM_USE_V1=1
 export VLLM_DISABLE_FLASHINFER=1
-# If you want to be explicit:
-# export VLLM_ATTENTION_BACKEND=FLASH_ATTN
-# export VLLM_FLASH_ATTN_VERSION=3
 export VLLM_CONFIGURE_LOGGING=1
 export VLLM_LOGGING_LEVEL="${VLLM_LOGGING_LEVEL:-INFO}"
 
-# ---------- Tunables (overridable with sbatch --export=...) ----------
-export MODEL="${MODEL:-openai/gpt-oss-20b}"   # switch to openai/gpt-oss-120b after first boot
-export PORT="${PORT:-8000}"
-export GMU="${GMU:-0.90}"
-GPU_COUNT=$(nvidia-smi -L | wc -l | awk '{print $1}')
-export TP="${TP:-$GPU_COUNT}"
-export MAX_MODEL_LEN="${MAX_MODEL_LEN:-16384}"
+trap 'echo "[serve] received USR1 at $(date); exiting cleanly"; exit 0' USR1
 
-# ---------- Preflight ----------
-echo "=== gpt-oss serve (native) ==="
-echo "node: $(hostname) | job: $SLURM_JOB_ID"
-nvidia-smi --query-gpu=index,name,driver_version,memory.total --format=csv
-python - <<'PY'
+if (( use_native )); then
+  echo "=== path: NATIVE (GLIBC >= 2.32) ==="
+
+  # modules (no host CUDA module needed)
+  module purge
+  module load GCCcore/13.3.0
+  module load Python/3.12.3-GCCcore-13.3.0
+
+  # persistent venv
+  mkdir -p "$(dirname "$VENV_DIR")"
+  if [[ ! -x "$VENV_DIR/bin/python" ]]; then
+    python -m venv "$VENV_DIR"
+    "$VENV_DIR/bin/python" -m pip install -U pip uv
+  fi
+  source "$VENV_DIR/bin/activate"
+
+  # ensure pinned torch is present (force-reinstall is safer than uninstall)
+  if ! python - <<PY | grep -q "$TORCH_VER"; then
+import sys
+try:
+    import torch
+    print(getattr(torch, "__version__", "none"))
+except Exception:
+    print("none")
+PY
+  then
+    uv pip install --pre "torch==$TORCH_VER" --force-reinstall --index-url "$TORCH_INDEX"
+  fi
+
+  # install vLLM GPT-OSS wheel & deps
+  uv pip install --pre "vllm==0.10.1+gptoss" \
+    --extra-index-url https://wheels.vllm.ai/gpt-oss/ \
+    --extra-index-url "$TORCH_INDEX" \
+    --index-strategy unsafe-best-match
+  python -m pip install -U "transformers>=4.46.0"
+
+  echo "=== versions (native) ==="
+  python - <<'PY'
 import torch, vllm, transformers
-print("torch:", torch.__version__)
-print("vllm:", vllm.__version__)
-print("transformers:", transformers.__version__)
+print("torch:", torch.__version__, "cuda:", getattr(torch.version, "cuda", "?"))
+print("vllm :", vllm.__version__)
+print("trxf :", transformers.__version__)
 from transformers.models.auto.configuration_auto import CONFIG_MAPPING_NAMES
 print("has gpt_oss config:", any("gpt_oss" in k for k in CONFIG_MAPPING_NAMES.keys()))
 PY
 
-trap 'echo "[serve] received USR1 at $(date); exiting"; exit 0' USR1
+  echo "model=$MODEL tp=$TP gmu=$GMU max_len=$MAX_MODEL_LEN port=$PORT"
+  exec vllm serve "$MODEL" \
+    --tensor-parallel-size "$TP" \
+    --gpu-memory-utilization "$GMU" \
+    --max-model-len "$MAX_MODEL_LEN" \
+    --async-scheduling \
+    --host 0.0.0.0 --port "$PORT"
 
-# ---------- Serve ----------
-echo "model=$MODEL tp=$TP gmu=$GMU max_len=$MAX_MODEL_LEN port=$PORT"
-vllm serve "$MODEL" \
-  --tensor-parallel-size "$TP" \
-  --gpu-memory-utilization "$GMU" \
-  --max-model-len "$MAX_MODEL_LEN" \
-  --async-scheduling \
-  --host 0.0.0.0 --port "$PORT"
+else
+  echo "=== path: CONTAINER (GLIBC < 2.32) ==="
+  echo "Using image: $IMG_FILE"
+  mkdir -p "$HOME/containers" "$HF_HOME"
+
+  # Launch vLLM GPT-OSS in container (V1 + FA3 on H100). Do NOT bind host CUDA.
+  apptainer exec --nv \
+    --bind "$HF_HOME":/root/.cache/huggingface \
+    "$IMG_FILE" \
+    vllm serve openai/gpt-oss-20b \
+      --tensor-parallel-size "$TP" \
+      --gpu-memory-utilization "$GMU" \
+      --max-model-len "$MAX_MODEL_LEN" \
+      --async-scheduling \
+      --host 0.0.0.0 --port "$PORT"
+fi
