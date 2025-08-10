@@ -1,20 +1,6 @@
 # validators.py
 # -------------
 # validation & llm→schema glue for delphea-iraki (pydantic v2 idioms).
-#
-# surface
-# -------
-# - call_llm_with_schema: ask backend for json and validate with a pydantic model
-# - validate_round1_payload / validate_round3_payload: quick shape checks
-# - log_debate_status: structured single-line debate lifecycle logging
-#
-# notes
-# -----
-# - avoid package-relative imports; repo is run as scripts, not a package.
-# - use PydanticCustomError + InitErrorDetails (pydantic v2) for fail-loud errors.
-# - token policy is controlled by cli args passed through delphea_iraki.py into
-#   call_llm_with_schema (ctx_window, out_tokens_init, retries, retry_factor, reserve_tokens).
-#   no env knobs here.
 
 from __future__ import annotations
 
@@ -48,7 +34,6 @@ def _raise_ve(
     inp: Any,
     ctx: Optional[Dict[str, Any]] = None,
 ) -> None:
-    """raise a pydantic.ValidationError with one line error."""
     err = InitErrorDetails(
         type=PydanticCustomError(etype, msg, (ctx or {})),
         loc=loc,
@@ -62,16 +47,6 @@ def _raise_ve(
 
 
 def _extract_first_json_object(text: str) -> str:
-    """extract first balanced json object from raw model text.
-
-    behavior
-    --------
-    - finds the first '{' and scans with a brace counter
-    - tracks string literals and escape characters to ignore braces inside strings
-    - returns the substring containing the balanced object
-    - if no '{' found → json_missing_object
-      if unbalanced at end → json_unbalanced
-    """
     if not isinstance(text, str) or not text:
         _raise_ve(
             "llm_response",
@@ -81,7 +56,6 @@ def _extract_first_json_object(text: str) -> str:
             inp=text,
         )
 
-    # fast path: if we see a fenced ```json block, prefer that region
     fence_start = text.find("```json")
     if fence_start == -1:
         fence_start = text.find("```JSON")
@@ -89,10 +63,8 @@ def _extract_first_json_object(text: str) -> str:
         fence_end = text.find("```", fence_start + 7)
         if fence_end != -1:
             fenced = text[fence_start + 7 : fence_end].strip()
-            # recurse on fenced region (may or may not include braces)
             return _extract_first_json_object(fenced)
 
-    # general scan for first balanced object
     start = text.find("{")
     if start == -1:
         _raise_ve(
@@ -128,7 +100,6 @@ def _extract_first_json_object(text: str) -> str:
                     return text[start : i + 1]
         i += 1
 
-    # reached end without closing
     _raise_ve(
         "llm_response",
         etype="json_unbalanced",
@@ -142,28 +113,135 @@ def _extract_first_json_object(text: str) -> str:
 
 
 def _count_tokens(backend: Any, text: str) -> int:
-    """best-effort token count; prefers backend.count_tokens(); falls back to ~4 chars/token."""
     if hasattr(backend, "count_tokens") and callable(getattr(backend, "count_tokens")):
         try:
             return int(backend.count_tokens(text))  # type: ignore[arg-type]
         except Exception:
             pass
-    # crude fallback; fail-loud would be worse here
     return max(1, len(text) // 4)
 
 
 def _discover_context_window(backend: Any) -> int:
-    """discover context window from backend.capabilities(); else default."""
     try:
         if hasattr(backend, "capabilities"):
-            caps = (
-                backend.capabilities()
-            )  # e.g., {"context_window": 200000, "json_mode": True}
+            caps = backend.capabilities()
             if isinstance(caps, dict) and "context_window" in caps:
                 return int(caps["context_window"])
     except Exception:
         pass
     return DEFAULT_CTX_WINDOW
+
+
+# --------------------------- coercion helpers ---------------------------
+
+
+def _to_float(x: Any, default: float | None = None) -> float | None:
+    try:
+        return float(x)
+    except Exception:
+        return default
+
+
+def _to_int(x: Any, default: int | None = None) -> int | None:
+    try:
+        i = int(float(x)) if isinstance(x, str) and x.replace(".", "", 1).isdigit() else int(x)  # type: ignore[arg-type]
+        return i
+    except Exception:
+        return default
+
+
+def _split_lines_semicolons(s: str) -> List[str]:
+    parts: List[str] = []
+    for chunk in s.replace("\r", "").split("\n"):
+        for seg in chunk.split(";"):
+            t = seg.strip(" •- \t")
+            if t:
+                parts.append(t)
+    return parts
+
+
+def _coerce_for_model_like_r1_r3(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Lenient normalization for common slip-ups in AssessmentR1/R3 payloads."""
+    d = dict(data)
+
+    # scores: cast values to int when safe
+    if isinstance(d.get("scores"), dict):
+        fixed: Dict[str, int] = {}
+        for k, v in d["scores"].items():
+            iv = _to_int(v)
+            if iv is not None:
+                fixed[k] = iv
+            else:
+                fixed[k] = v  # let Pydantic complain later if truly invalid
+        d["scores"] = fixed
+
+    # evidence: allow string or list to become a dict
+    ev = d.get("evidence")
+    if isinstance(ev, str):
+        d["evidence"] = {"overall": ev.strip()}
+    elif isinstance(ev, list):
+        # accept [{"qid": "...", "text": "..."}, ...] or ["..", ".."]
+        out: Dict[str, str] = {}
+        for i, item in enumerate(ev):
+            if isinstance(item, dict):
+                q = item.get("qid") or item.get("id") or f"item_{i}"
+                t = item.get("text") or item.get("evidence") or ""
+                if t:
+                    out[str(q)] = str(t)
+            elif isinstance(item, str) and item.strip():
+                out[f"item_{i}"] = item.strip()
+        if out:
+            d["evidence"] = out
+
+    # p_iraki / confidence / confidence_in_verdict / ci_iraki: cast to float(s)
+    for key in ("p_iraki", "confidence", "confidence_in_verdict"):
+        if key in d and not isinstance(d[key], (int, float)):
+            f = _to_float(d[key])
+            if f is not None:
+                d[key] = f
+    if (
+        "ci_iraki" in d
+        and isinstance(d["ci_iraki"], (list, tuple))
+        and len(d["ci_iraki"]) == 2
+    ):
+        lo = _to_float(d["ci_iraki"][0])
+        hi = _to_float(d["ci_iraki"][1])
+        if lo is not None and hi is not None:
+            d["ci_iraki"] = [lo, hi]
+
+    # R3-specific conveniences (safe no-ops for R1)
+    ch = d.get("changes_from_round1")
+    if isinstance(ch, str):
+        d["changes_from_round1"] = {"overall": ch.strip()}
+    elif isinstance(ch, dict):
+        # mirror nested debate_influence up if author placed it inside changes_from_round1
+        if "debate_influence" in ch and "debate_influence" not in d:
+            d["debate_influence"] = ch.get("debate_influence", "")
+
+    # verdict: accept yes/no/true/false/positive/negative → bool
+    if "verdict" in d and not isinstance(d["verdict"], bool):
+        if isinstance(d["verdict"], str):
+            val = d["verdict"].strip().lower()
+            truey = {"true", "yes", "y", "present", "positive", "likely"}
+            falsey = {"false", "no", "n", "absent", "negative", "unlikely"}
+            if val in truey:
+                d["verdict"] = True
+            elif val in falsey:
+                d["verdict"] = False
+
+    # recommendations: accept string → list[str]
+    recs = d.get("recommendations")
+    if isinstance(recs, str):
+        items = _split_lines_semicolons(recs)
+        d["recommendations"] = items if items else ([])
+
+    # backfill confidence_in_verdict when missing (R3)
+    if "confidence_in_verdict" not in d and "confidence" in d:
+        cf = _to_float(d.get("confidence"))
+        if cf is not None:
+            d["confidence_in_verdict"] = cf
+
+    return d
 
 
 # --------------------------- llm → schema validator ---------------------------
@@ -175,32 +253,15 @@ def call_llm_with_schema(
     prompt_text: str,
     backend: Any,
     temperature: float = 0.0,
-    # policy (controlled by delphea_iraki.py; leave as None to use defaults above)
     ctx_window: Optional[int] = None,
     out_tokens_init: Optional[int] = None,
     max_retries: Optional[int] = None,
     retry_factor: Optional[float] = None,
     reserve_tokens: Optional[int] = None,
-    # compatibility alias; if provided, treated as out_tokens_init
     max_tokens: Optional[int] = None,
 ) -> T:
-    """call backend, extract first json, validate with response_model.
+    """call backend, extract first json, validate with response_model."""
 
-    token policy (centralized)
-    --------------------------
-    the caller (delphea_iraki.py) passes:
-    - ctx_window: full model window (e.g., 200000)
-    - out_tokens_init: starting output budget per attempt
-    - max_retries: number of repair attempts (in addition to first try)
-    - retry_factor: geometric escalation factor per retry
-    - reserve_tokens: safety buffer not to be used by the model output
-
-    safeguards
-    ----------
-    - never allocate more output tokens than (context - input - reserve)
-    - if input alone exceeds (context - minimal_out), fail loud with 'input_too_long'
-    - on json_unbalanced / json_missing_object, include partial and escalate budget
-    """
     # resolve policy
     ctx = int(
         ctx_window if ctx_window is not None else _discover_context_window(backend)
@@ -215,9 +276,8 @@ def call_llm_with_schema(
     reserve = int(
         reserve_tokens if reserve_tokens is not None else DEFAULT_RESERVE_TOKENS
     )
-    minimal_out = 128  # require at least some room to reply
+    minimal_out = 128
 
-    # compute input length and available budget
     input_tokens = _count_tokens(backend, prompt_text)
     available_out = ctx - input_tokens - reserve
     if available_out < minimal_out:
@@ -235,7 +295,6 @@ def call_llm_with_schema(
             },
         )
 
-    # helper: backend generation
     def _gen_once(prompt: str, tokens: int) -> str:
         if hasattr(backend, "generate"):
             return backend.generate(prompt, max_tokens=tokens, temperature=temperature)  # type: ignore[attr-defined]
@@ -243,7 +302,6 @@ def call_llm_with_schema(
             return backend.get_completions(prompt, temperature=temperature, max_tokens=tokens)  # type: ignore[attr-defined]
         raise RuntimeError("llm backend does not expose a known generation method")
 
-    # build output contract suffix
     try:
         expected_keys = list(response_model.model_fields.keys())  # pydantic v2
     except Exception:
@@ -264,7 +322,6 @@ def call_llm_with_schema(
     last_raw: Optional[str] = None
 
     for attempt in range(retries + 1):
-        # compute escalated budget but never exceed available_out
         target_out = int(out_init * (rfactor**attempt))
         tokens_for_attempt = max(min(target_out, available_out), minimal_out)
 
@@ -274,7 +331,6 @@ def call_llm_with_schema(
             err_types = {e["type"] for e in (last_err.errors() if last_err else [])}
             if {"json_unbalanced", "json_missing_object"} & err_types and last_raw:
                 partial = last_raw.strip()
-                # include only the tail to keep prompt bounded and relevant
                 if len(partial) > 6000:
                     partial = partial[-6000:]
                 prompt = (
@@ -294,11 +350,9 @@ def call_llm_with_schema(
             json_text = _extract_first_json_object(raw)
             data = json.loads(json_text)
 
-            # small coercion for ci field if present
-            if isinstance(data, dict) and "ci_iraki" in data:
-                ci = data["ci_iraki"]
-                if isinstance(ci, list) and len(ci) == 2:
-                    data["ci_iraki"] = [float(ci[0]), float(ci[1])]
+            # light normalizations common to both R1 and R3 payloads
+            if isinstance(data, dict):
+                data = _coerce_for_model_like_r1_r3(data)
 
             return response_model(**data)
 
@@ -385,7 +439,6 @@ def _validate_prob_triplet(
 def validate_round1_payload(
     payload: Dict[str, Any], *, required_evidence: int = 8
 ) -> None:
-    """validate minimal r1 shape; raise pydantic.ValidationError on failure."""
     title = "round1"
     _require_keys(
         payload,
@@ -449,7 +502,6 @@ def validate_round1_payload(
 
 
 def validate_round3_payload(payload: Dict[str, Any]) -> None:
-    """validate minimal r3 shape; raise pydantic.ValidationError on failure."""
     title = "round3"
     _require_keys(
         payload,
@@ -506,16 +558,7 @@ def validate_round3_payload(payload: Dict[str, Any]) -> None:
 
 
 def log_debate_status(*args, **kwargs) -> None:
-    """structured logger for debate lifecycle events (compat shim).
-
-    supports both:
-        log_debate_status(logger, case_id, question_id, expert_id, status, reason=None, meta=None)
-    and:
-        log_debate_status(
-            logger=..., case_id=..., question_id=..., expert_id=..., status=..., stage="debate",
-            reason=None, meta=None
-        )
-    """
+    """structured logger for debate lifecycle events (compat shim)."""
     logger = kwargs.pop("logger", args[0] if args else None)
     if not isinstance(logger, logging.Logger):
         raise TypeError(
