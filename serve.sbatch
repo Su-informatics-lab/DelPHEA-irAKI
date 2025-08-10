@@ -24,40 +24,34 @@ mkdir -p "$HF_HOME" "$IMG_DIR" logs
 export JOB_SCRATCH="$HOME/DelPHEA-irAKI/tmp/$SLURM_JOB_ID"
 mkdir -p "$JOB_SCRATCH"
 
-# CUDA tool-chain setup
+# CUDA tool-chain inside container
 export CUDA_HOME=/usr/local/cuda
 export PATH=$CUDA_HOME/bin:$PATH
 
-# CRITICAL: Set TORCH_CUDA_ARCH_LIST for H100
-export TORCH_CUDA_ARCH_LIST="9.0"
-
-# CRITICAL: Disable v1 engine and use stable v0
+# ===========================================
+# CRITICAL FIX: Force v0 engine to avoid v1 multiprocessing error
+# ===========================================
 export VLLM_USE_V1=0
-export VLLM_ENABLE_V1_MULTIPROCESSING=0
+export TORCH_CUDA_ARCH_LIST="9.0"  # H100 architecture
 
 # Additional stability settings
 export VLLM_ATTENTION_BACKEND="FLASH_ATTN"
-export NCCL_IB_DISABLE=1
 export CUDA_VISIBLE_DEVICES=0,1
+export NCCL_IB_DISABLE=1
 
-# logging
-export VLLM_LOGGING_LEVEL=INFO
+# Optional debugging (comment out after it works)
+# export VLLM_LOGGING_LEVEL=DEBUG
+# export FLASHINFER_DISABLE_JIT=1  # only for debug
 
-# diagnostics
-echo "========================================="
-echo "vLLM GPT-OSS-120B Server Configuration"
-echo "========================================="
-echo "Job ID: ${SLURM_JOB_ID}"
-echo "Node: ${SLURMD_NODENAME}"
-echo "CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES}"
-echo "TORCH_CUDA_ARCH_LIST: ${TORCH_CUDA_ARCH_LIST}"
-echo "VLLM_USE_V1: ${VLLM_USE_V1}"
-echo "========================================="
-
-nvidia-smi --query-gpu=index,name,memory.total --format=csv
-
-# launch vLLM with v0 engine
+# launch vLLM inside Apptainer container
 export TENSOR_PARALLEL=${SLURM_JOB_GPUS_PER_NODE:-2}
+
+echo "========================================="
+echo "vLLM Server Starting"
+echo "Model: openai/gpt-oss-120b"
+echo "Tensor Parallel: $TENSOR_PARALLEL"
+echo "Engine: v0 (VLLM_USE_V1=$VLLM_USE_V1)"
+echo "========================================="
 
 apptainer exec --nv \
   --bind "$HF_HOME":/root/.cache/huggingface \
@@ -65,11 +59,9 @@ apptainer exec --nv \
   --bind "$JOB_SCRATCH":/tmp \
   --env CUDA_HOME="$CUDA_HOME" \
   --env PATH="$PATH" \
-  --env TORCH_CUDA_ARCH_LIST="$TORCH_CUDA_ARCH_LIST" \
   --env VLLM_USE_V1="$VLLM_USE_V1" \
-  --env VLLM_ENABLE_V1_MULTIPROCESSING="$VLLM_ENABLE_V1_MULTIPROCESSING" \
+  --env TORCH_CUDA_ARCH_LIST="$TORCH_CUDA_ARCH_LIST" \
   --env VLLM_ATTENTION_BACKEND="$VLLM_ATTENTION_BACKEND" \
-  --env VLLM_LOGGING_LEVEL="$VLLM_LOGGING_LEVEL" \
   --env CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES" \
   --env NCCL_IB_DISABLE="$NCCL_IB_DISABLE" \
   "$IMG_FILE" \
@@ -81,3 +73,5 @@ apptainer exec --nv \
     --port 8000 \
     --trust-remote-code \
     --disable-log-requests
+
+echo "Server terminated at $(date)"
