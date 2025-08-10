@@ -28,29 +28,29 @@ mkdir -p "$JOB_SCRATCH"
 export CUDA_HOME=/usr/local/cuda
 export PATH=$CUDA_HOME/bin:$PATH
 
-# ===========================================
-# CRITICAL FIX: Force v0 engine to avoid v1 multiprocessing error
-# ===========================================
-export VLLM_USE_V1=0
-export TORCH_CUDA_ARCH_LIST="9.0"  # H100 architecture
+# ============================================
+# FIX FOR GPT-OSS 'sinks' ERROR
+# ============================================
+export VLLM_USE_V1=0                      # Force stable v0 engine
+export VLLM_ATTENTION_BACKEND="XFORMERS"  # Bypass FlashAttention issue
+export TORCH_CUDA_ARCH_LIST="9.0"         # H100 SM_90 architecture
 
-# Additional stability settings
-export VLLM_ATTENTION_BACKEND="FLASH_ATTN"
+# Additional settings
 export CUDA_VISIBLE_DEVICES=0,1
 export NCCL_IB_DISABLE=1
 
-# Optional debugging (comment out after it works)
-# export VLLM_LOGGING_LEVEL=DEBUG
-# export FLASHINFER_DISABLE_JIT=1  # only for debug
+# Optional: Add logging to debug if needed
+# export VLLM_LOGGING_LEVEL=INFO
 
 # launch vLLM inside Apptainer container
 export TENSOR_PARALLEL=${SLURM_JOB_GPUS_PER_NODE:-2}
 
 echo "========================================="
-echo "vLLM Server Starting"
-echo "Model: openai/gpt-oss-120b"
+echo "vLLM GPT-OSS-120B Server Configuration"
+echo "Container: vllm-gptoss.sif (0.10.1+gptoss)"
+echo "Attention Backend: XFORMERS (FlashAttention bypass)"
+echo "Engine: v0 (stable)"
 echo "Tensor Parallel: $TENSOR_PARALLEL"
-echo "Engine: v0 (VLLM_USE_V1=$VLLM_USE_V1)"
 echo "========================================="
 
 apptainer exec --nv \
@@ -60,8 +60,8 @@ apptainer exec --nv \
   --env CUDA_HOME="$CUDA_HOME" \
   --env PATH="$PATH" \
   --env VLLM_USE_V1="$VLLM_USE_V1" \
-  --env TORCH_CUDA_ARCH_LIST="$TORCH_CUDA_ARCH_LIST" \
   --env VLLM_ATTENTION_BACKEND="$VLLM_ATTENTION_BACKEND" \
+  --env TORCH_CUDA_ARCH_LIST="$TORCH_CUDA_ARCH_LIST" \
   --env CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES" \
   --env NCCL_IB_DISABLE="$NCCL_IB_DISABLE" \
   "$IMG_FILE" \
@@ -74,4 +74,6 @@ apptainer exec --nv \
     --trust-remote-code \
     --disable-log-requests
 
+echo "========================================="
 echo "Server terminated at $(date)"
+echo "========================================="
