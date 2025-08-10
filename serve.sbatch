@@ -29,27 +29,24 @@ export CUDA_HOME=/usr/local/cuda
 export PATH=$CUDA_HOME/bin:$PATH
 
 # ============================================
-# FIX FOR GPT-OSS 'sinks' ERROR
+# WORKING CONFIGURATION FOR GPT-OSS
 # ============================================
-export VLLM_USE_V1=0                      # Force stable v0 engine
-export VLLM_ATTENTION_BACKEND="XFORMERS"  # Bypass FlashAttention issue
-export TORCH_CUDA_ARCH_LIST="9.0"         # H100 SM_90 architecture
+export VLLM_USE_V1=0                        # Force stable v0 engine
+export VLLM_ATTENTION_BACKEND="FLASHINFER"  # Use FLASHINFER (available & works)
+export TORCH_CUDA_ARCH_LIST="9.0"           # H100 SM_90 architecture
 
 # Additional settings
 export CUDA_VISIBLE_DEVICES=0,1
 export NCCL_IB_DISABLE=1
 
-# Optional: Add logging to debug if needed
-# export VLLM_LOGGING_LEVEL=INFO
-
 # launch vLLM inside Apptainer container
 export TENSOR_PARALLEL=${SLURM_JOB_GPUS_PER_NODE:-2}
 
 echo "========================================="
-echo "vLLM GPT-OSS-120B Server Configuration"
+echo "vLLM GPT-OSS-120B Server Starting"
 echo "Container: vllm-gptoss.sif (0.10.1+gptoss)"
-echo "Attention Backend: XFORMERS (FlashAttention bypass)"
-echo "Engine: v0 (stable)"
+echo "Attention Backend: FLASHINFER ✓"
+echo "Engine: v0 (stable) ✓"
 echo "Tensor Parallel: $TENSOR_PARALLEL"
 echo "========================================="
 
