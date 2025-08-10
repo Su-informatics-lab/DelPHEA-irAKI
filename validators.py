@@ -1,18 +1,18 @@
 """
 validators.py
 -------------
-validation & llm→schema glue for delphea-iraki.
+validation & llm→schema glue for delphea-iraki (pydantic v2 idioms).
 
-yagni: keep a tight surface. this module provides:
-  - call_llm_with_schema: ask backend for json and validate with a pydantic model
-  - validate_round1_payload / validate_round3_payload: fast shape checks w/ loud failures
-  - log_debate_status: structured single-line logging for debate lifecycle
+surface
+-------
+- call_llm_with_schema: ask backend for json and validate with a pydantic model
+- validate_round1_payload / validate_round3_payload: quick shape checks
+- log_debate_status: structured single-line debate lifecycle logging
 
-design notes
-------------
-* do not silently "fix" payloads; raise pydantic.ValidationError so the moderator
-  can trigger one-shot repair or fallback logic.
-* tolerate dict or json string from the model; extract the first valid json object.
+notes
+-----
+- do not synthesize v1-style error codes; use PydanticCustomError + InitErrorDetails
+  and raise once via ValidationError.from_exception_data. see pydantic v2 guidance.
 """
 
 from __future__ import annotations
@@ -21,26 +21,58 @@ import json
 import logging
 import re
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterable, Optional, Tuple, Type, TypeVar
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Type, TypeVar
 
 from pydantic import BaseModel, ValidationError
+from pydantic_core import InitErrorDetails, PydanticCustomError
 
-# --------- helpers: json extraction & validation utilities ---------
+# -------------------------- helpers: error builders ---------------------------
+
+
+def _ve(
+    title: str,
+    *,
+    etype: str,
+    msg: str,
+    loc: Tuple[Any, ...],
+    inp: Any,
+    ctx: Optional[Dict[str, Any]] = None,
+) -> ValidationError:
+    """build a single-line ValidationError using v2 primitives."""
+    err = InitErrorDetails(
+        type=PydanticCustomError(etype, msg, ctx or {}),
+        loc=loc,
+        input=inp,
+        ctx=ctx or {},
+    )
+    return ValidationError.from_exception_data(title=title, line_errors=[err])
+
+
+def _raise_ve(
+    title: str,
+    *,
+    etype: str,
+    msg: str,
+    loc: Tuple[Any, ...],
+    inp: Any,
+    ctx: Optional[Dict[str, Any]] = None,
+) -> None:
+    raise _ve(title, etype=etype, msg=msg, loc=loc, inp=inp, ctx=ctx)
+
+
+# --------------------- helpers: json extraction/normalization -----------------
 
 
 def _extract_first_json_object(text: str) -> str:
     """return the first balanced json object found in text; fail loud if none."""
+    title = "llm_response"
     if not isinstance(text, str) or not text.strip():
-        raise ValidationError.from_exception_data(
-            "llm_response",
-            [
-                {
-                    "type": "value_error",
-                    "loc": ("content",),
-                    "msg": "empty response",
-                    "input": text,
-                }
-            ],
+        _raise_ve(
+            title,
+            etype="empty_response",
+            msg="empty model response",
+            loc=("content",),
+            inp=text,
         )
 
     # fenced ```json blocks
@@ -53,42 +85,48 @@ def _extract_first_json_object(text: str) -> str:
     # find first balanced {...}
     start = text.find("{")
     if start == -1:
-        raise ValidationError.from_exception_data(
-            "llm_response",
-            [
-                {
-                    "type": "value_error.json.missing_object",
-                    "loc": ("content",),
-                    "msg": "no json object found",
-                    "input": text[:200],
-                }
-            ],
+        _raise_ve(
+            title,
+            etype="json_missing_object",
+            msg="no json object found",
+            loc=("content",),
+            inp=text[:200],
         )
 
     depth = 0
+    in_string = False
+    escape = False
     for i in range(start, len(text)):
         ch = text[i]
-        if ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0:
-                return text[start : i + 1]
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        else:
+            if ch == '"':
+                in_string = True
+                continue
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return text[start : i + 1]
 
-    raise ValidationError.from_exception_data(
-        "llm_response",
-        [
-            {
-                "type": "value_error.json.unbalanced",
-                "loc": ("content",),
-                "msg": "unbalanced json braces",
-                "input": text[start : start + 200],
-            }
-        ],
+    _raise_ve(
+        title,
+        etype="json_unbalanced",
+        msg="unbalanced json braces",
+        loc=("content",),
+        inp=text[start : min(start + 200, len(text))],
     )
 
 
-# --------- public: llm → pydantic schema glue ---------
+# ----------------------------- public: llm glue -------------------------------
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -107,7 +145,7 @@ def call_llm_with_schema(
     args:
         response_model: pydantic model class (e.g., messages.ExpertRound1Reply).
         prompt_text: fully-rendered prompt to send to the backend.
-        backend: object exposing `.generate(prompt, ...)` (llm_backend.LLMBackend).
+        backend: object exposing `.generate(prompt, ...)` or `.get_completions(...)`.
         temperature: decoding temperature.
         max_tokens: upper bound for generation length.
         max_retries: number of additional attempts after a parse/validate failure.
@@ -127,7 +165,7 @@ def call_llm_with_schema(
             return backend.get_completions(prompt, temperature=temperature, max_tokens=max_tokens)  # type: ignore[attr-defined]
         raise RuntimeError("llm backend does not expose a known generation method")
 
-    last_err: Optional[Exception] = None
+    last_err: Optional[ValidationError] = None
     for attempt in range(max_retries + 1):
         prompt = (
             f"{prompt_text}\n\n"
@@ -138,128 +176,84 @@ def call_llm_with_schema(
         )
 
         raw = _gen_once(prompt)
-        if not isinstance(raw, str) or not raw.strip():
-            last_err = ValidationError.from_exception_data(
-                "llm_response",
-                [
-                    {
-                        "type": "value_error",
-                        "loc": ("content",),
-                        "msg": "empty text",
-                        "input": raw,
-                    }
-                ],
-            )
-            continue
-
         try:
             json_text = _extract_first_json_object(raw)
             data = json.loads(json_text)
-            obj = response_model.model_validate(data)
-            return obj
         except ValidationError as ve:
             last_err = ve
+            continue
         except json.JSONDecodeError as je:
-            last_err = ValidationError.from_exception_data(
+            last_err = _ve(
                 "llm_response",
-                [
-                    {
-                        "type": "value_error.json.decode",
-                        "loc": ("content",),
-                        "msg": str(je),
-                        "input": raw[:200],
-                    }
-                ],
+                etype="json_decode_error",
+                msg="json decode error: {error}",
+                loc=("content",),
+                inp=raw[:200],
+                ctx={"error": str(je)},
             )
+            continue
         except Exception as e:
-            last_err = ValidationError.from_exception_data(
+            last_err = _ve(
                 "llm_response",
-                [
-                    {
-                        "type": "value_error",
-                        "loc": ("content",),
-                        "msg": f"{type(e).__name__}: {e}",
-                        "input": str(raw)[:200],
-                    }
-                ],
+                etype="unexpected_error",
+                msg="{error}",
+                loc=("content",),
+                inp=str(raw)[:200],
+                ctx={"error": f"{type(e).__name__}: {e}"},
             )
+            continue
+
+        # pydantic does the real validation; this will raise ValidationError on failure
+        return response_model.model_validate(data)
 
     assert last_err is not None
     raise last_err
 
 
-# --------- public: payload validators for moderator ---------
+# ------------------------- public: payload validators -------------------------
 
 
 def _require_keys(obj: Dict[str, Any], keys: Iterable[str], title: str) -> None:
     missing = [k for k in keys if k not in obj]
     if missing:
-        raise ValidationError.from_exception_data(
+        _raise_ve(
             title,
-            [
-                {
-                    "type": "missing",
-                    "loc": tuple(missing),
-                    "msg": f"missing required keys: {missing}",
-                    "input": obj,
-                }
-            ],
+            etype="missing_keys",
+            msg=f"missing required keys: {missing}",
+            loc=tuple(missing),
+            inp=obj,
         )
 
 
 def _validate_prob_triplet(
     p: float, ci: Tuple[float, float], conf: float, *, title: str
 ) -> None:
-    errs = []
+    errs: List[InitErrorDetails] = []
+
+    def _add(etype: str, msg: str, loc: Tuple[Any, ...], inp: Any) -> None:
+        errs.append(
+            InitErrorDetails(
+                type=PydanticCustomError(etype, msg, {}), loc=loc, input=inp, ctx={}
+            )
+        )
+
     if not isinstance(p, (int, float)) or not (0.0 <= float(p) <= 1.0):
-        errs.append(
-            {
-                "type": "value_error",
-                "loc": ("p_iraki",),
-                "msg": f"p_iraki must be in [0,1], got {p}",
-                "input": p,
-            }
-        )
+        _add("range_error", "p_iraki must be in [0,1]", ("p_iraki",), p)
     if not (isinstance(ci, (list, tuple)) and len(ci) == 2):
-        errs.append(
-            {
-                "type": "value_error",
-                "loc": ("ci_iraki",),
-                "msg": "ci_iraki must be a pair [lower, upper]",
-                "input": ci,
-            }
-        )
+        _add("type_error", "ci_iraki must be a pair [lower, upper]", ("ci_iraki",), ci)
     else:
         lo, hi = float(ci[0]), float(ci[1])
         if not (0.0 <= lo <= 1.0 and 0.0 <= hi <= 1.0):
-            errs.append(
-                {
-                    "type": "value_error",
-                    "loc": ("ci_iraki",),
-                    "msg": f"ci bounds must be within [0,1], got [{lo}, {hi}]",
-                    "input": ci,
-                }
+            _add(
+                "range_error", "ci_iraki bounds must be within [0,1]", ("ci_iraki",), ci
             )
         if lo > hi:
-            errs.append(
-                {
-                    "type": "value_error",
-                    "loc": ("ci_iraki",),
-                    "msg": "ci lower bound > upper bound",
-                    "input": ci,
-                }
-            )
+            _add("bound_error", "ci_iraki lower bound > upper bound", ("ci_iraki",), ci)
     if not isinstance(conf, (int, float)) or not (0.0 <= float(conf) <= 1.0):
-        errs.append(
-            {
-                "type": "value_error",
-                "loc": ("confidence",),
-                "msg": f"confidence must be in [0,1], got {conf}",
-                "input": conf,
-            }
-        )
+        _add("range_error", "confidence must be in [0,1]", ("confidence",), conf)
+
     if errs:
-        raise ValidationError.from_exception_data(title, errs)
+        raise ValidationError.from_exception_data(title=title, line_errors=errs)
 
 
 def validate_round1_payload(
@@ -285,58 +279,42 @@ def validate_round1_payload(
 
     scores = payload.get("scores", {})
     if not isinstance(scores, dict) or not scores:
-        raise ValidationError.from_exception_data(
+        _raise_ve(
             title,
-            [
-                {
-                    "type": "value_error",
-                    "loc": ("scores",),
-                    "msg": "scores must be a non-empty dict",
-                    "input": scores,
-                }
-            ],
+            etype="type_error",
+            msg="scores must be a non-empty dict",
+            loc=("scores",),
+            inp=scores,
         )
     bad_scores = {
         k: v for k, v in scores.items() if not isinstance(v, int) or not (1 <= v <= 10)
     }
     if bad_scores:
-        raise ValidationError.from_exception_data(
+        _raise_ve(
             title,
-            [
-                {
-                    "type": "value_error",
-                    "loc": ("scores",),
-                    "msg": f"invalid scores (must be 1..10): {bad_scores}",
-                    "input": scores,
-                }
-            ],
+            etype="range_error",
+            msg=f"invalid scores (must be 1..10): {bad_scores}",
+            loc=("scores",),
+            inp=scores,
         )
 
     evidence = payload.get("evidence", {})
     if not isinstance(evidence, dict):
-        raise ValidationError.from_exception_data(
+        _raise_ve(
             title,
-            [
-                {
-                    "type": "value_error",
-                    "loc": ("evidence",),
-                    "msg": "evidence must be a dict",
-                    "input": evidence,
-                }
-            ],
+            etype="type_error",
+            msg="evidence must be a dict",
+            loc=("evidence",),
+            inp=evidence,
         )
     non_empty = sum(1 for v in evidence.values() if isinstance(v, str) and v.strip())
     if non_empty < min(required_evidence, len(scores)):
-        raise ValidationError.from_exception_data(
+        _raise_ve(
             title,
-            [
-                {
-                    "type": "value_error",
-                    "loc": ("evidence",),
-                    "msg": f"insufficient evidence texts: {non_empty} < {min(required_evidence, len(scores))}",
-                    "input": evidence,
-                }
-            ],
+            etype="insufficient_evidence",
+            msg=f"insufficient evidence texts: {non_empty} < {min(required_evidence, len(scores))}",
+            loc=("evidence",),
+            inp=evidence,
         )
 
     _validate_prob_triplet(
@@ -364,31 +342,23 @@ def validate_round3_payload(payload: Dict[str, Any]) -> None:
 
     scores = payload.get("scores", {})
     if not isinstance(scores, dict) or not scores:
-        raise ValidationError.from_exception_data(
+        _raise_ve(
             title,
-            [
-                {
-                    "type": "value_error",
-                    "loc": ("scores",),
-                    "msg": "scores must be a non-empty dict",
-                    "input": scores,
-                }
-            ],
+            etype="type_error",
+            msg="scores must be a non-empty dict",
+            loc=("scores",),
+            inp=scores,
         )
     bad_scores = {
         k: v for k, v in scores.items() if not isinstance(v, int) or not (1 <= v <= 10)
     }
     if bad_scores:
-        raise ValidationError.from_exception_data(
+        _raise_ve(
             title,
-            [
-                {
-                    "type": "value_error",
-                    "loc": ("scores",),
-                    "msg": f"invalid scores (must be 1..10): {bad_scores}",
-                    "input": scores,
-                }
-            ],
+            etype="range_error",
+            msg=f"invalid scores (must be 1..10): {bad_scores}",
+            loc=("scores",),
+            inp=scores,
         )
 
     _validate_prob_triplet(
@@ -397,20 +367,16 @@ def validate_round3_payload(payload: Dict[str, Any]) -> None:
 
     ch = payload.get("changes_from_round1")
     if not isinstance(ch, dict):
-        raise ValidationError.from_exception_data(
+        _raise_ve(
             title,
-            [
-                {
-                    "type": "value_error",
-                    "loc": ("changes_from_round1",),
-                    "msg": "must be a dict",
-                    "input": ch,
-                }
-            ],
+            etype="type_error",
+            msg="changes_from_round1 must be a dict",
+            loc=("changes_from_round1",),
+            inp=ch,
         )
 
 
-# --------- public: structured debate logging ---------
+# --------------------- public: structured debate logging ----------------------
 
 
 def log_debate_status(*args, **kwargs) -> None:
@@ -466,7 +432,7 @@ def log_debate_status(*args, **kwargs) -> None:
             json.dumps(meta)
         except Exception as e:
             raise ValueError(
-                f"log_debate_status: 'meta' must be json-serializable: {e}"
+                f"log_debate_status: 'meta' must be JSON-serializable: {e}"
             ) from e
 
     payload: Dict[str, Any] = {
