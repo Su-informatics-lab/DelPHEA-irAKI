@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=gptoss_server
+#SBATCH --job-name=gptoss_native
 #SBATCH --partition=nextgen-gpu
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:h100:2
@@ -10,64 +10,95 @@
 #SBATCH --output=logs/%j.out
 #SBATCH --error=logs/%j.err
 #SBATCH --signal=USR1@120
+
+# usage:
+#   sbatch serve.sbatch
+#   sbatch --export=MODEL=openai/gpt-oss-120b,PORT=8001,TP=2,MAX_MODEL_LEN=32768 serve.sbatch
+
 set -euo pipefail
 
-# paths
-export HF_HOME="$HOME/hf-cache"
-export IMG_FILE="$HOME/containers/vllm-gptoss.sif"   # use the GPT-OSS image
-export JOB_SCRATCH="$HOME/DelPHEA-irAKI/tmp/$SLURM_JOB_ID"
-mkdir -p "$HF_HOME" logs "$JOB_SCRATCH"
+# -------------------- modules (no cuda module required) --------------------
+module purge
+module load GCCcore/13.3.0
+module load Python/3.12.3-GCCcore-13.3.0
 
-# gpu env
-export CUDA_VISIBLE_DEVICES=0,1
-export NCCL_IB_DISABLE=1
-export TORCH_CUDA_ARCH_LIST="9.0"   # H100 (sm_90)
+# -------------------- paths & caches --------------------
+export HF_HOME="${HF_HOME:-$HOME/hf-cache}"
+export HF_HUB_ENABLE_HF_TRANSFER=1
+mkdir -p "$HF_HOME" logs
 
-# vllm v1 on hopper selects FA3 automatically; do NOT force Triton
+# persistent venv to avoid reinstall every job
+export VENV_DIR="${VENV_DIR:-$HOME/.venvs/gptoss-cu128-py312}"
+mkdir -p "$(dirname "$VENV_DIR")"
+
+# job scratch
+export JOB_SCRATCH="${JOB_SCRATCH:-$HOME/DelPHEA-irAKI/tmp/$SLURM_JOB_ID}"
+mkdir -p "$JOB_SCRATCH"
+
+# -------------------- venv bootstrap (idempotent) --------------------
+if [[ ! -x "$VENV_DIR/bin/python" ]]; then
+  python -m venv "$VENV_DIR"
+  "$VENV_DIR/bin/python" -m pip install -U pip uv
+  # install torch nightly cu128 + vllm gpt-oss + recent transformers
+  "$VENV_DIR/bin/uv" pip install --pre "torch>=2.5.0.dev" \
+      --index-url https://download.pytorch.org/whl/nightly/cu128
+  "$VENV_DIR/bin/uv" pip install --pre "vllm==0.10.1+gptoss" \
+      --extra-index-url https://wheels.vllm.ai/gpt-oss/
+  "$VENV_DIR/bin/python" -m pip install -U "transformers>=4.46.0"
+  touch "$VENV_DIR/.setup-complete"
+fi
+
+# activate venv
+source "$VENV_DIR/bin/activate"
+
+# -------------------- runtime env (h100 + v1 + fa3) --------------------
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"   # slurm usually sets this; keep explicit
 export VLLM_USE_V1=1
-unset VLLM_ATTENTION_BACKEND
-export VLLM_DISABLE_FLASHINFER=1
+export VLLM_DISABLE_FLASHINFER=1                             # stay on flash-attn path
+# leave backend selection to vllm v1 on hopper (fa3). uncomment to force:
+# export VLLM_ATTENTION_BACKEND=FLASH_ATTN
+# export VLLM_FLASH_ATTN_VERSION=3
+
+# quieter logs once stable; during bring-up, keep info
 export VLLM_CONFIGURE_LOGGING=1
-export VLLM_LOGGING_LEVEL=INFO
+export VLLM_LOGGING_LEVEL="${VLLM_LOGGING_LEVEL:-INFO}"
 
-# tensor parallel
-export TENSOR_PARALLEL=2
+# nccl tweaks are optional; uncomment if ib issues arise
+# export NCCL_IB_DISABLE=1
+# export NCCL_DEBUG=WARN
 
-echo "=== vLLM gpt-oss-120b on $(hostname) job=$SLURM_JOB_ID ==="
-nvidia-smi --query-gpu=index,name,memory.total,driver_version --format=csv
+# -------------------- parameters (overridable via --export) --------------------
+# start with 20b to verify the stack, then switch to 120b
+export MODEL="${MODEL:-openai/gpt-oss-20b}"
+export PORT="${PORT:-8000}"
+export GMU="${GMU:-0.90}"                       # gpu memory utilization
+# auto-detect gpus for tp if not provided
+GPU_COUNT=$(nvidia-smi -L | wc -l | awk '{print $1}')
+export TP="${TP:-$GPU_COUNT}"
+# conservative first boot; raise after verifying
+export MAX_MODEL_LEN="${MAX_MODEL_LEN:-16384}"
 
-# --- sanity: print versions and confirm transformers sees 'gpt_oss'
-apptainer exec --nv \
-  --bind "$HF_HOME":/root/.cache/huggingface \
-  --bind "$JOB_SCRATCH":/tmp \
-  "$IMG_FILE" \
-  python3 - << 'PY'
-import importlib, sys
-import torch, vllm
-print("torch:", torch.__version__)
+# -------------------- preflight: show versions & driver --------------------
+echo "=== gpt-oss serve (native) ==="
+echo "node: $(hostname) | job: $SLURM_JOB_ID"
+nvidia-smi --query-gpu=index,name,driver_version,memory.total --format=csv
+python - <<'PY'
+import torch, vllm, transformers
+print("torch:", torch.__version__, "cuda:", torch.version.cuda, "gpus:", torch.cuda.device_count())
 print("vllm:", vllm.__version__)
-try:
-    import transformers
-    from transformers.models.auto.configuration_auto import CONFIG_MAPPING_NAMES
-    print("transformers:", transformers.__version__)
-    print("has gpt_oss in CONFIG_MAPPING_NAMES:",
-          any("gpt_oss" in k for k in CONFIG_MAPPING_NAMES.keys()))
-except Exception as e:
-    print("transformers import failed:", e, file=sys.stderr)
-    sys.exit(1)
+print("transformers:", transformers.__version__)
+from transformers.models.auto.configuration_auto import CONFIG_MAPPING_NAMES
+print("has gpt_oss config:", any("gpt_oss" in k for k in CONFIG_MAPPING_NAMES.keys()))
 PY
 
-# serve (keep context modest for first boot; raise later)
-apptainer exec --nv \
-  --bind "$HF_HOME":/root/.cache/huggingface \
-  --bind "$JOB_SCRATCH":/tmp \
-  "$IMG_FILE" \
-  vllm serve openai/gpt-oss-120b \
-    --tensor-parallel-size "$TENSOR_PARALLEL" \
-    --gpu-memory-utilization 0.90 \
-    --max-model-len 8192 \
-    --host 0.0.0.0 \
-    --port 8000 \
-    --async-scheduling
+# graceful shutdown on preemption
+trap 'echo "[serve] received usr1, exiting gracefully at $(date)"; exit 0' USR1
 
-echo "server terminated at $(date)"
+# -------------------- serve --------------------
+echo "model=$MODEL tp=$TP gmu=$GMU max_len=$MAX_MODEL_LEN port=$PORT"
+vllm serve "$MODEL" \
+  --tensor-parallel-size "$TP" \
+  --gpu-memory-utilization "$GMU" \
+  --max-model-len "$MAX_MODEL_LEN" \
+  --async-scheduling \
+  --host 0.0.0.0 --port "$PORT"
