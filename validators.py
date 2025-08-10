@@ -1,51 +1,42 @@
-"""
-validators.py
--------------
-validation & llm→schema glue for delphea-iraki (pydantic v2 idioms).
-
-surface
--------
-- call_llm_with_schema: ask backend for json and validate with a pydantic model
-- validate_round1_payload / validate_round3_payload: quick shape checks
-- log_debate_status: structured single-line debate lifecycle logging
-
-notes
------
-- avoid package-relative imports; repo is run as scripts, not a package.
-- use PydanticCustomError + InitErrorDetails (pydantic v2) for fail-loud errors.
-"""
+# validators.py
+# -------------
+# validation & llm→schema glue for delphea-iraki (pydantic v2 idioms).
+#
+# surface
+# -------
+# - call_llm_with_schema: ask backend for json and validate with a pydantic model
+# - validate_round1_payload / validate_round3_payload: quick shape checks
+# - log_debate_status: structured single-line debate lifecycle logging
+#
+# notes
+# -----
+# - avoid package-relative imports; repo is run as scripts, not a package.
+# - use PydanticCustomError + InitErrorDetails (pydantic v2) for fail-loud errors.
+# - token policy is controlled by cli args passed through delphea_iraki.py into
+#   call_llm_with_schema (ctx_window, out_tokens_init, retries, retry_factor, reserve_tokens).
+#   no env knobs here.
 
 from __future__ import annotations
 
 import json
 import logging
-import re
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Type, TypeVar
 
 from pydantic import BaseModel, ValidationError
 from pydantic_core import InitErrorDetails, PydanticCustomError
 
-# -------------------------- helpers: error builders ---------------------------
+T = TypeVar("T", bound=BaseModel)
+
+# sensible defaults; overridden by delphea_iraki.py via function args
+DEFAULT_CTX_WINDOW = 32768
+DEFAULT_OUT_TOKENS_INIT = 3200
+DEFAULT_RETRIES = 2
+DEFAULT_RETRY_FACTOR = 1.5
+DEFAULT_RESERVE_TOKENS = 512
 
 
-def _ve(
-    title: str,
-    *,
-    etype: str,
-    msg: str,
-    loc: Tuple[Any, ...],
-    inp: Any,
-    ctx: Optional[Dict[str, Any]] = None,
-) -> ValidationError:
-    """build a single-line ValidationError using v2 primitives."""
-    err = InitErrorDetails(
-        type=PydanticCustomError(etype, msg, ctx or {}),
-        loc=loc,
-        input=inp,
-        ctx=ctx or {},
-    )
-    return ValidationError.from_exception_data(title=title, line_errors=[err])
+# ------------------------------ error helpers ------------------------------
 
 
 def _raise_ve(
@@ -57,68 +48,89 @@ def _raise_ve(
     inp: Any,
     ctx: Optional[Dict[str, Any]] = None,
 ) -> None:
-    raise _ve(title, etype=etype, msg=msg, loc=loc, inp=inp, ctx=ctx)
+    """raise a pydantic.ValidationError with one line error."""
+    err = InitErrorDetails(
+        type=PydanticCustomError(etype, msg, (ctx or {})),
+        loc=loc,
+        input=inp,
+        ctx=(ctx or {}),
+    )
+    raise ValidationError.from_exception_data(title=title, line_errors=[err])
 
 
-# --------------------- helpers: json extraction/normalization -----------------
+# ------------------------------- json parser -------------------------------
 
 
 def _extract_first_json_object(text: str) -> str:
-    """return the first balanced json object found in text; fail loud if none."""
-    title = "llm_response"
-    if not isinstance(text, str) or not text.strip():
+    """extract first balanced json object from raw model text.
+
+    behavior
+    --------
+    - finds the first '{' and scans with a brace counter
+    - tracks string literals and escape characters to ignore braces inside strings
+    - returns the substring containing the balanced object
+    - if no '{' found → json_missing_object
+      if unbalanced at end → json_unbalanced
+    """
+    if not isinstance(text, str) or not text:
         _raise_ve(
-            title,
-            etype="empty_response",
-            msg="empty model response",
+            "llm_response",
+            etype="json_missing_object",
+            msg="no content to scan for json object",
             loc=("content",),
             inp=text,
         )
 
-    # fenced ```json blocks
-    fence = re.search(
-        r"```(?:json)?\s*(\{.*?\})\s*```", text, flags=re.DOTALL | re.IGNORECASE
-    )
-    if fence:
-        return fence.group(1)
+    # fast path: if we see a fenced ```json block, prefer that region
+    fence_start = text.find("```json")
+    if fence_start == -1:
+        fence_start = text.find("```JSON")
+    if fence_start != -1:
+        fence_end = text.find("```", fence_start + 7)
+        if fence_end != -1:
+            fenced = text[fence_start + 7 : fence_end].strip()
+            # recurse on fenced region (may or may not include braces)
+            return _extract_first_json_object(fenced)
 
-    # find first balanced {...} while respecting strings/escapes
+    # general scan for first balanced object
     start = text.find("{")
     if start == -1:
         _raise_ve(
-            title,
+            "llm_response",
             etype="json_missing_object",
-            msg="no json object found",
+            msg="no json object found in model output",
             loc=("content",),
             inp=text[:200],
         )
 
-    depth = 0
-    in_string = False
-    escape = False
-    for i in range(start, len(text)):
+    brace = 0
+    i = start
+    in_str = False
+    esc = False
+
+    while i < len(text):
         ch = text[i]
-        if in_string:
-            if escape:
-                escape = False
+        if in_str:
+            if esc:
+                esc = False
             elif ch == "\\":
-                escape = True
+                esc = True
             elif ch == '"':
-                in_string = False
-            continue
+                in_str = False
         else:
             if ch == '"':
-                in_string = True
-                continue
-            if ch == "{":
-                depth += 1
+                in_str = True
+            elif ch == "{":
+                brace += 1
             elif ch == "}":
-                depth -= 1
-                if depth == 0:
+                brace -= 1
+                if brace == 0:
                     return text[start : i + 1]
+        i += 1
 
+    # reached end without closing
     _raise_ve(
-        title,
+        "llm_response",
         etype="json_unbalanced",
         msg="unbalanced json braces",
         loc=("content",),
@@ -126,9 +138,35 @@ def _extract_first_json_object(text: str) -> str:
     )
 
 
-# ----------------------------- public: llm glue -------------------------------
+# ------------------------------ token helpers ------------------------------
 
-T = TypeVar("T", bound=BaseModel)
+
+def _count_tokens(backend: Any, text: str) -> int:
+    """best-effort token count; prefers backend.count_tokens(); falls back to ~4 chars/token."""
+    if hasattr(backend, "count_tokens") and callable(getattr(backend, "count_tokens")):
+        try:
+            return int(backend.count_tokens(text))  # type: ignore[arg-type]
+        except Exception:
+            pass
+    # crude fallback; fail-loud would be worse here
+    return max(1, len(text) // 4)
+
+
+def _discover_context_window(backend: Any) -> int:
+    """discover context window from backend.capabilities(); else default."""
+    try:
+        if hasattr(backend, "capabilities"):
+            caps = (
+                backend.capabilities()
+            )  # e.g., {"context_window": 200000, "json_mode": True}
+            if isinstance(caps, dict) and "context_window" in caps:
+                return int(caps["context_window"])
+    except Exception:
+        pass
+    return DEFAULT_CTX_WINDOW
+
+
+# --------------------------- llm → schema validator ---------------------------
 
 
 def call_llm_with_schema(
@@ -137,89 +175,151 @@ def call_llm_with_schema(
     prompt_text: str,
     backend: Any,
     temperature: float = 0.0,
-    max_tokens: int = 1400,
-    max_retries: int = 1,
+    # policy (controlled by delphea_iraki.py; leave as None to use defaults above)
+    ctx_window: Optional[int] = None,
+    out_tokens_init: Optional[int] = None,
+    max_retries: Optional[int] = None,
+    retry_factor: Optional[float] = None,
+    reserve_tokens: Optional[int] = None,
+    # compatibility alias; if provided, treated as out_tokens_init
+    max_tokens: Optional[int] = None,
 ) -> T:
-    """call backend, extract json, validate with response_model; one-shot repair on partial json."""
-    # derive expected keys from the pydantic model so the contract matches r1 or r3 automatically
+    """call backend, extract first json, validate with response_model.
+
+    token policy (centralized)
+    --------------------------
+    the caller (delphea_iraki.py) passes:
+    - ctx_window: full model window (e.g., 200000)
+    - out_tokens_init: starting output budget per attempt
+    - max_retries: number of repair attempts (in addition to first try)
+    - retry_factor: geometric escalation factor per retry
+    - reserve_tokens: safety buffer not to be used by the model output
+
+    safeguards
+    ----------
+    - never allocate more output tokens than (context - input - reserve)
+    - if input alone exceeds (context - minimal_out), fail loud with 'input_too_long'
+    - on json_unbalanced / json_missing_object, include partial and escalate budget
+    """
+    # resolve policy
+    ctx = int(
+        ctx_window if ctx_window is not None else _discover_context_window(backend)
+    )
+    out_init = int(
+        out_tokens_init
+        if out_tokens_init is not None
+        else (int(max_tokens) if max_tokens is not None else DEFAULT_OUT_TOKENS_INIT)
+    )
+    retries = int(max_retries if max_retries is not None else DEFAULT_RETRIES)
+    rfactor = float(retry_factor if retry_factor is not None else DEFAULT_RETRY_FACTOR)
+    reserve = int(
+        reserve_tokens if reserve_tokens is not None else DEFAULT_RESERVE_TOKENS
+    )
+    minimal_out = 128  # require at least some room to reply
+
+    # compute input length and available budget
+    input_tokens = _count_tokens(backend, prompt_text)
+    available_out = ctx - input_tokens - reserve
+    if available_out < minimal_out:
+        _raise_ve(
+            "llm_response",
+            etype="input_too_long",
+            msg="prompt uses {input_tokens} tokens, leaving {available_out} for output; reduce input or raise context window",
+            loc=("content",),
+            inp=f"[prompt starts] {prompt_text[:200]}",
+            ctx={
+                "input_tokens": input_tokens,
+                "available_out": max(available_out, 0),
+                "ctx_window": ctx,
+                "reserve": reserve,
+            },
+        )
+
+    # helper: backend generation
+    def _gen_once(prompt: str, tokens: int) -> str:
+        if hasattr(backend, "generate"):
+            return backend.generate(prompt, max_tokens=tokens, temperature=temperature)  # type: ignore[attr-defined]
+        if hasattr(backend, "get_completions"):
+            return backend.get_completions(prompt, temperature=temperature, max_tokens=tokens)  # type: ignore[attr-defined]
+        raise RuntimeError("llm backend does not expose a known generation method")
+
+    # build output contract suffix
     try:
         expected_keys = list(response_model.model_fields.keys())  # pydantic v2
     except Exception:
         expected_keys = []
-
-    def _gen_once(prompt: str) -> str:
-        if hasattr(backend, "generate"):
-            return backend.generate(prompt, max_tokens=max_tokens, temperature=temperature)  # type: ignore[attr-defined]
-        if hasattr(backend, "get_completions"):
-            return backend.get_completions(prompt, temperature=temperature, max_tokens=max_tokens)  # type: ignore[attr-defined]
-        raise RuntimeError("llm backend does not expose a known generation method")
-
-    def _contract_suffix() -> str:
-        keys_clause = (
-            f"- top-level keys must be exactly: {expected_keys}.\n"
+    contract = (
+        "\n\nOUTPUT CONTRACT — return ONLY one JSON object matching the schema.\n"
+        + (
+            f"- top-level keys must be exactly: {expected_keys}\n"
             if expected_keys
-            else "- return a single valid json object matching the provided schema.\n"
+            else ""
         )
-        return (
-            "\n\nOUTPUT CONTRACT — READ CAREFULLY:\n"
-            "- return ONLY a single valid JSON object (no prose, no markdown fences).\n"
-            f"{keys_clause}"
-            "- echo the provided case_id and your expert_id exactly.\n"
-            "- 'ci_iraki' must be an array of two floats: [lower, upper].\n"
-        )
+        + "- no prose, no markdown fences.\n"
+        + "- include exact case_id and expert_id fields if present in the schema.\n"
+        + "- 'ci_iraki' must be [lower, upper] floats if present.\n"
+    )
 
     last_err: Optional[ValidationError] = None
     last_raw: Optional[str] = None
 
-    for attempt in range(max_retries + 1):
+    for attempt in range(retries + 1):
+        # compute escalated budget but never exceed available_out
+        target_out = int(out_init * (rfactor**attempt))
+        tokens_for_attempt = max(min(target_out, available_out), minimal_out)
+
         if attempt == 0:
-            prompt = f"{prompt_text}{_contract_suffix()}"
+            prompt = f"{prompt_text}{contract}"
         else:
             err_types = {e["type"] for e in (last_err.errors() if last_err else [])}
             if {"json_unbalanced", "json_missing_object"} & err_types and last_raw:
                 partial = last_raw.strip()
-                partial = partial[-3000:] if len(partial) > 3000 else partial
+                # include only the tail to keep prompt bounded and relevant
+                if len(partial) > 6000:
+                    partial = partial[-6000:]
                 prompt = (
-                    f"{prompt_text}{_contract_suffix()}\n"
+                    f"{prompt_text}{contract}\n"
                     "the previous output was a PARTIAL json object. "
                     "complete it to a SINGLE valid json object that matches the contract exactly.\n\n"
                     "partial_json:\n```json\n"
                     f"{partial}\n```"
                 )
             else:
-                prompt = f"{prompt_text}{_contract_suffix()}"
+                prompt = f"{prompt_text}{contract}"
 
-        raw = _gen_once(prompt)
+        raw = _gen_once(prompt, tokens_for_attempt)
         last_raw = raw
 
         try:
             json_text = _extract_first_json_object(raw)
             data = json.loads(json_text)
 
-            # strict tuple for ci_iraki to satisfy strict model fields if configured
-            ci = data.get("ci_iraki")
-            if isinstance(ci, list) and len(ci) == 2:
-                data["ci_iraki"] = (float(ci[0]), float(ci[1]))
+            # small coercion for ci field if present
+            if isinstance(data, dict) and "ci_iraki" in data:
+                ci = data["ci_iraki"]
+                if isinstance(ci, list) and len(ci) == 2:
+                    data["ci_iraki"] = [float(ci[0]), float(ci[1])]
 
-            return response_model.model_validate(data)
+            return response_model(**data)
+
         except ValidationError as ve:
             last_err = ve
             continue
-        except json.JSONDecodeError as je:
+
+        except json.JSONDecodeError as jde:
             line_err = InitErrorDetails(
                 type=PydanticCustomError(
                     "json_decode_error",
-                    "json decode error: {error}",
-                    {"error": str(je)},
+                    "json decoding failed: {msg}",
+                    {"msg": str(jde)},
                 ),
                 loc=("content",),
                 input=raw[:200] if isinstance(raw, str) else str(raw)[:200],
-                ctx={"error": str(je)},
+                ctx={"error": f"JSONDecodeError: {jde}"},
             )
-            last_err = ValidationError.from_exception_data(
-                title="llm_response", line_errors=[line_err]
-            )
+            last_err = ValidationError.from_exception_data("llm_response", [line_err])
             continue
+
         except Exception as e:
             line_err = InitErrorDetails(
                 type=PydanticCustomError(
@@ -229,9 +329,7 @@ def call_llm_with_schema(
                 input=raw[:200] if isinstance(raw, str) else str(raw)[:200],
                 ctx={"error": f"{type(e).__name__}: {e}"},
             )
-            last_err = ValidationError.from_exception_data(
-                title="llm_response", line_errors=[line_err]
-            )
+            last_err = ValidationError.from_exception_data("llm_response", [line_err])
             continue
 
     assert last_err is not None
