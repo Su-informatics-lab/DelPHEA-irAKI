@@ -18,9 +18,6 @@ mkdir -p logs
 mkdir -p cache/hf
 mkdir -p cache/models
 
-# load apptainer
-module load apptainer
-
 # print basic info
 echo "Starting GPT-OSS-120B on $(hostname)"
 echo "Job ID: ${SLURM_JOB_ID}"
