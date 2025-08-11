@@ -27,19 +27,22 @@ nvidia-smi
 # Set cache location
 export HF_HOME=$(pwd)/cache/hf
 
+# CRITICAL: Force V0 engine for GPT-OSS compatibility
+export VLLM_USE_V1=0
+
 # run vllm server with bind mounts for cache
-# Note: Using --enforce-eager to disable compilation and CUDA graphs for compatibility
 apptainer run --nv \
     --bind $(pwd)/cache/hf:/workspace/hf_cache \
     --bind $(pwd)/cache/models:/workspace/models \
     --env HF_HOME=/workspace/hf_cache \
+    --env VLLM_USE_V1=0 \
     gpt-oss-120b.sif \
     vllm serve openai/gpt-oss-120b \
     --host 0.0.0.0 \
     --port 8000 \
     --tensor-parallel-size 2 \
     --gpu-memory-utilization 0.95 \
-    --enforce-eager \
+    --max-num-batched-tokens 1024 \
     --download-dir /workspace/models
 
 echo "Job finished at $(date)"
