@@ -41,8 +41,10 @@ apptainer run --nv \
     --host 0.0.0.0 \
     --port 8000 \
     --tensor-parallel-size 2 \
+    --max-model-len 65536 \
+    --max-num-batched-tokens 8192 \
+    --max-num-seqs 64 \
     --gpu-memory-utilization 0.95 \
-    --max-num-batched-tokens 1024 \
     --download-dir /workspace/models
 
 echo "Job finished at $(date)"
