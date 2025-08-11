@@ -28,7 +28,7 @@ export CUDA_HOME=/usr/local/cuda
 export PATH="$CUDA_HOME/bin:$PATH"
 
 # stability: avoid v1 multiprocess + JIT flakiness on HPC
-export VLLM_ENABLE_V1_MULTIPROCESSING=0     # force no v1 multiprocessing :contentReference[oaicite:1]{index=1}
+export VLLM_ENABLE_V1_MULTIPROCESSING=0     # force no v1 multiprocessing
 export FLASHINFER_DISABLE_JIT=1             # skip flashinfer JIT (more deterministic)
 export TRANSFORMERS_NO_ADVISORY_WARNINGS=1  # quiet hub warnings
 ulimit -l unlimited || true                 # allow mlock if permitted
@@ -54,13 +54,14 @@ apptainer exec --nv \
   --env CUDA_HOME="$CUDA_HOME" \
   --env PATH="$PATH" \
   "$IMG_FILE" \
+  bash -c "pip install 'numpy<2.3' && \
   python3 -m vllm.entrypoints.openai.api_server \
     --model openai/gpt-oss-120b \
-    --tensor-parallel-size "$TENSOR_PARALLEL" \
-    --distributed-executor-backend uni \  # single-process v1 executor :contentReference[oaicite:2]{index=2}
+    --tensor-parallel-size \"$TENSOR_PARALLEL\" \
+    --distributed-executor-backend uni \
     --gpu-memory-utilization 0.85 \
     --max-model-len 8192 \
     --max-num-batched-tokens 1024 \
-    --host 0.0.0.0 --port 8000
+    --host 0.0.0.0 --port 8000"
 
 echo "job finished at $(date)"
