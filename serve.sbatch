@@ -27,6 +27,12 @@ mkdir -p "$JOB_SCRATCH"
 export CUDA_HOME=/usr/local/cuda
 export PATH="$CUDA_HOME/bin:$PATH"
 
+# stability: avoid v1 multiprocess + JIT flakiness on HPC
+export VLLM_ENABLE_V1_MULTIPROCESSING=0     # force no v1 multiprocessing :contentReference[oaicite:1]{index=1}
+export FLASHINFER_DISABLE_JIT=1             # skip flashinfer JIT (more deterministic)
+export TRANSFORMERS_NO_ADVISORY_WARNINGS=1  # quiet hub warnings
+ulimit -l unlimited || true                 # allow mlock if permitted
+
 # tensor-parallel from slurm (fallback to gpu count)
 if [[ -n "${SLURM_GPUS_ON_NODE:-}" ]]; then
   TENSOR_PARALLEL="$SLURM_GPUS_ON_NODE"
@@ -40,7 +46,7 @@ echo "starting gpt-oss-120b | job ${SLURM_JOB_ID} on $(hostname)"
 date
 nvidia-smi || true
 
-# launch vLLM inside apptainer
+# launch vLLM inside apptainer (python3 in container)
 apptainer exec --nv \
   --bind "$HF_HOME":/root/.cache/huggingface \
   --bind /mnt/shared/moduleapps/eb/CUDA/12.3.0:/mnt/shared/moduleapps/eb/CUDA/12.3.0 \
@@ -51,7 +57,10 @@ apptainer exec --nv \
   python3 -m vllm.entrypoints.openai.api_server \
     --model openai/gpt-oss-120b \
     --tensor-parallel-size "$TENSOR_PARALLEL" \
-    --gpu-memory-utilization 0.90 \
+    --distributed-executor-backend uni \  # single-process v1 executor :contentReference[oaicite:2]{index=2}
+    --gpu-memory-utilization 0.85 \
+    --max-model-len 8192 \
+    --max-num-batched-tokens 1024 \
     --host 0.0.0.0 --port 8000
 
 echo "job finished at $(date)"
