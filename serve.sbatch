@@ -13,21 +13,21 @@
 
 set -euo pipefail
 
-# host-side caches & images
+# ---- caches & image ----
 export HF_HOME="$HOME/hf-cache"
 export IMG_DIR="$HOME/containers"
 export IMG_FILE="$IMG_DIR/vllm-gptoss.sif"
 mkdir -p "$HF_HOME" "$IMG_DIR" logs
 
-# per-job scratch inside project
+# per-job scratch
 export JOB_SCRATCH="$HOME/DelPHEA-irAKI/tmp/$SLURM_JOB_ID"
 mkdir -p "$JOB_SCRATCH"
 
-# cuda toolchain path exposed inside container
+# cuda toolchain
 export CUDA_HOME=/usr/local/cuda
 export PATH="$CUDA_HOME/bin:$PATH"
 
-# tensor-parallel from slurm, fallback to gpu count
+# pick tensor parallel from slurm; fallback to gpu count
 if [[ -n "${SLURM_GPUS_ON_NODE:-}" ]]; then
   TENSOR_PARALLEL="$SLURM_GPUS_ON_NODE"
 elif [[ -n "${SLURM_JOB_GPUS_PER_NODE:-}" ]]; then
@@ -36,14 +36,25 @@ else
   TENSOR_PARALLEL="$(nvidia-smi -L | wc -l || echo 2)"
 fi
 
-# optional: quiet minor hub warnings
-export TRANSFORMERS_NO_ADVISORY_WARNINGS=1
-
 echo "starting gpt-oss-120b | job ${SLURM_JOB_ID} on $(hostname)"
 date
 nvidia-smi || true
+ulimit -l unlimited || true   # allow IPC_LOCK if possible
 
-# launch vLLM inside apptainer (use python3 inside container)
+# ---- stability knobs (v1-safe) ----
+# avoid v1 multiprocess shared-memory pitfalls on HPC
+export VLLM_ENABLE_V1_MULTIPROCESSING=0
+# use flashinfer backend (supports sinks; avoids FA3 kwarg mismatches)
+EXTRA_ARGS=(--attention-backend flashinfer --async-scheduling)
+# modest utilization to leave headroom; bump if stable
+EXTRA_ARGS+=(--gpu-memory-utilization 0.90)
+# optional: throttle batch tokens if TP=1 (rare here)
+if [[ "${TENSOR_PARALLEL}" == "1" ]]; then
+  EXTRA_ARGS+=(--max-num-batched-tokens 1024)
+fi
+export TRANSFORMERS_NO_ADVISORY_WARNINGS=1
+
+# ---- run ----
 apptainer exec --nv \
   --bind "$HF_HOME":/root/.cache/huggingface \
   --bind /mnt/shared/moduleapps/eb/CUDA/12.3.0:/mnt/shared/moduleapps/eb/CUDA/12.3.0 \
@@ -54,7 +65,7 @@ apptainer exec --nv \
   python3 -m vllm.entrypoints.openai.api_server \
     --model openai/gpt-oss-120b \
     --tensor-parallel-size "$TENSOR_PARALLEL" \
-    --gpu-memory-utilization 0.90 \
-    --host 0.0.0.0 --port 8000
+    --host 0.0.0.0 --port 8000 \
+    "${EXTRA_ARGS[@]}"
 
 echo "job finished at $(date)"
