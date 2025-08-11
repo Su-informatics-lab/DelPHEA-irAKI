@@ -36,32 +36,50 @@ else
   TENSOR_PARALLEL="$(nvidia-smi -L | wc -l || echo 2)"
 fi
 
-echo "starting gpt-oss-120b | job ${SLURM_JOB_ID} on $(hostname)"
+# pick a localhost port for torch rendezvous
+MASTER_PORT="$(shuf -i 20000-29999 -n 1)"
+
+echo "starting gpt-oss-120b | job ${SLURM_JOB_ID} on $(hostname) | TP=${TENSOR_PARALLEL} | MASTER_PORT=${MASTER_PORT}"
 date
 nvidia-smi || true
 
-# run in container:
-# 1) install numpy<2.3 into /tmp/pydeps (writable, job-scoped)
-# 2) prepend /tmp/pydeps to PYTHONPATH so numba sees a compatible numpy
-# 3) launch vLLM with v1 single-process backend for HPC stability
+# launch inside apptainer:
+# - pin torch dist to localhost (no IB)
+# - fix numpy for numba (numpy<2.3)
+# - run vLLM v1 single-process executor with TP=2
 apptainer exec --nv --cleanenv \
   --bind "$HF_HOME":/root/.cache/huggingface \
   --bind /mnt/shared/moduleapps/eb/CUDA/12.3.0:/mnt/shared/moduleapps/eb/CUDA/12.3.0 \
   --bind "$JOB_SCRATCH":/tmp \
   --env CUDA_HOME="$CUDA_HOME" \
   --env PATH="$PATH" \
+  --env BASH_ENV=/dev/null \
   "$IMG_FILE" \
   bash -lc '
     set -euo pipefail
+    # fix numba/numPy
     PYDEPS=/tmp/pydeps
     mkdir -p "$PYDEPS"
-    python3 -m pip install --no-cache-dir --target "$PYDEPS" "numpy<2.3"
+    python3 -m pip install --no-cache-dir --target "$PYDEPS" "numpy<2.3" >/tmp/pip.out 2>&1 || cat /tmp/pip.out
     export PYTHONPATH="$PYDEPS:${PYTHONPATH-}"
-    export TRANSFORMERS_NO_ADVISORY_WARNINGS=1
+
+    # torch/vllm distributed on localhost only
+    export MASTER_ADDR=127.0.0.1
+    export MASTER_PORT='"$MASTER_PORT"'
+    export GLOO_SOCKET_IFNAME=lo
+    export NCCL_SOCKET_IFNAME=lo
+    export NCCL_IB_DISABLE=1
+    export NCCL_P2P_DISABLE=0
+    export NCCL_SHM_DISABLE=0
+    export NCCL_ASYNC_ERROR_HANDLING=1
+    export TORCH_DISTRIBUTED_DEBUG=OFF
+    export VLLM_WORKER_MULTIPROC_METHOD=spawn
     export VLLM_ENABLE_V1_MULTIPROCESSING=0
+    export TRANSFORMERS_NO_ADVISORY_WARNINGS=1
+
     python3 -m vllm.entrypoints.openai.api_server \
       --model openai/gpt-oss-120b \
-      --tensor-parallel-size "'"$TENSOR_PARALLEL"'" \
+      --tensor-parallel-size '"$TENSOR_PARALLEL"' \
       --distributed-executor-backend uni \
       --gpu-memory-utilization 0.85 \
       --max-model-len 8192 \
