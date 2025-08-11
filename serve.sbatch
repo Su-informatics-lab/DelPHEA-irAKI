@@ -31,6 +31,7 @@ export HF_HOME=$(pwd)/cache/hf
 export VLLM_USE_V1=0
 
 # run vllm server with bind mounts for cache
+# Using balanced settings for 2xH100 GPUs
 apptainer run --nv \
     --bind $(pwd)/cache/hf:/workspace/hf_cache \
     --bind $(pwd)/cache/models:/workspace/models \
@@ -41,9 +42,7 @@ apptainer run --nv \
     --host 0.0.0.0 \
     --port 8000 \
     --tensor-parallel-size 2 \
-    --max-model-len 65536 \
-    --max-num-batched-tokens 8192 \
-    --max-num-seqs 64 \
+    --max-model-len 8192 \
     --gpu-memory-utilization 0.95 \
     --download-dir /workspace/models
 
