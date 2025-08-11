@@ -13,53 +13,53 @@
 
 set -euo pipefail
 
-# create directories
+# ---------- dirs ----------
 mkdir -p logs
-mkdir -p $HOME/hf-cache
-mkdir -p tmp/$SLURM_JOB_ID
+export HF_HOME="$HOME/hf-cache"
+mkdir -p "$HF_HOME"
+export JOB_SCRATCH="$(pwd)/tmp/${SLURM_JOB_ID}"
+mkdir -p "$JOB_SCRATCH"
 
-# print basic info
-echo "Starting GPT-OSS-120B on $(hostname)"
-echo "Job ID: ${SLURM_JOB_ID}"
-echo "Time: $(date)"
-nvidia-smi
+# ---------- basic info ----------
+echo "starting gpt-oss-120b on $(hostname)"
+echo "job id: ${SLURM_JOB_ID}"
+date
+nvidia-smi || true
 
-# Set paths
-export HF_CACHE_DIR=$HOME/hf-cache
-export JOB_SCRATCH=$(pwd)/tmp/$SLURM_JOB_ID
+# ---------- tensor parallel auto (fallback to 2 if unknown) ----------
+TP="${SLURM_GPUS_ON_NODE:-}"
+if [[ -z "${TP}" ]]; then
+  TP="$(nvidia-smi -L | wc -l || echo 2)"
+fi
 
-# CUDA setup for container
-export CUDA_HOME=/usr/local/cuda
-export PATH=$CUDA_HOME/bin:$PATH
+# ---------- image (official vLLM gpt-oss build with FA3 + cu128) ----------
+# if you can't pull at runtime, pre-pull with:
+#   apptainer pull gptoss.sif docker://vllm/vllm-openai:gptoss
+IMAGE="${IMAGE:-docker://vllm/vllm-openai:gptoss}"
 
-# CRITICAL: Use V0 engine
-export VLLM_USE_V1=0
+# ---------- env (H100 path uses defaults; no legacy TRITON/V0 flags) ----------
+# keep caches clean and silence TRANSFORMERS_CACHE deprecation
+export TRANSFORMERS_NO_ADVISORY_WARNINGS=1
 
-# Use Triton attention backend for attention sinks support without FA3
-export VLLM_ATTENTION_BACKEND=TRITON
-export VLLM_USE_FLASHINFER_MXFP4_BF16_MOE=1
+# known limitation: tp1 on H100 can OOM unless we cap batched tokens (vLLM docs)
+EXTRA_ARGS=()
+if [[ "${TP}" == "1" ]]; then
+  EXTRA_ARGS+=(--gpu-memory-utilization 0.95 --max-num-batched-tokens 1024)
+fi
 
-# Tensor parallelism based on GPU count
-export TENSOR_PARALLEL=${SLURM_JOB_GPUS_PER_NODE:-2}
+# optional: async scheduling improves throughput (not compatible with structured output)
+EXTRA_ARGS+=(--async-scheduling)
 
-# Run vLLM - explicitly set HF_HOME and TRANSFORMERS_CACHE inside container
+# ---------- run ----------
 apptainer exec --nv \
-    --bind $HF_CACHE_DIR:/root/.cache/huggingface \
-    --bind $JOB_SCRATCH:/tmp \
-    --env HF_HOME=/root/.cache/huggingface \
-    --env TRANSFORMERS_CACHE=/root/.cache/huggingface \
-    --env CUDA_HOME=$CUDA_HOME \
-    --env PATH=$PATH \
-    --env VLLM_USE_V1=0 \
-    --env VLLM_ATTENTION_BACKEND=TRITON \
-    --env VLLM_USE_FLASHINFER_MXFP4_BF16_MOE=1 \
-    gpt-oss-120b.sif \
-    python3 -m vllm.entrypoints.openai.api_server \
-        --model openai/gpt-oss-120b \
-        --tensor-parallel-size $TENSOR_PARALLEL \
-        --gpu-memory-utilization 0.90 \
-        --max-model-len 8192 \
-        --host 0.0.0.0 \
-        --port 8000
+  --bind "$HF_HOME":/root/.cache/huggingface \
+  --bind "$JOB_SCRATCH":/tmp \
+  "$IMAGE" \
+  python -m vllm.entrypoints.openai.api_server \
+    --model openai/gpt-oss-120b \
+    --tensor-parallel-size "${TP}" \
+    --host 0.0.0.0 \
+    --port 8000 \
+    "${EXTRA_ARGS[@]}"
 
-echo "Job finished at $(date)"
+echo "job finished at $(date)"
