@@ -24,8 +24,8 @@ echo "Job ID: ${SLURM_JOB_ID}"
 echo "Time: $(date)"
 nvidia-smi
 
-# Set environment variables - use HOME paths like the working script
-export HF_HOME=$HOME/hf-cache
+# Set paths
+export HF_CACHE_DIR=$HOME/hf-cache
 export JOB_SCRATCH=$(pwd)/tmp/$SLURM_JOB_ID
 
 # CUDA setup for container
@@ -42,10 +42,12 @@ export VLLM_USE_FLASHINFER_MXFP4_BF16_MOE=1
 # Tensor parallelism based on GPU count
 export TENSOR_PARALLEL=${SLURM_JOB_GPUS_PER_NODE:-2}
 
-# Run vLLM using Python module directly - matching the working script's bind paths
+# Run vLLM - explicitly set HF_HOME and TRANSFORMERS_CACHE inside container
 apptainer exec --nv \
-    --bind $HF_HOME:/root/.cache/huggingface \
+    --bind $HF_CACHE_DIR:/root/.cache/huggingface \
     --bind $JOB_SCRATCH:/tmp \
+    --env HF_HOME=/root/.cache/huggingface \
+    --env TRANSFORMERS_CACHE=/root/.cache/huggingface \
     --env CUDA_HOME=$CUDA_HOME \
     --env PATH=$PATH \
     --env VLLM_USE_V1=0 \
