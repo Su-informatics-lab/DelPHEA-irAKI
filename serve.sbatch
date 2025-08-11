@@ -24,14 +24,11 @@ echo "Job ID: ${SLURM_JOB_ID}"
 echo "Time: $(date)"
 nvidia-smi
 
-# CRITICAL: Disable V1 engine which has issues with GPT-OSS
-export VLLM_USE_V1=0
+# CRITICAL: Use Triton attention backend for GPT-OSS attention sinks support
+export VLLM_ATTENTION_BACKEND=TRITON_ATTN_VLLM_V1
 
-# Set required environment variables for H100 GPUs
-export VLLM_USE_TRTLLM_ATTENTION=1
-export VLLM_USE_TRTLLM_DECODE_ATTENTION=1
-export VLLM_USE_TRTLLM_CONTEXT_ATTENTION=1
-export VLLM_USE_FLASHINFER_MXFP4_BF16_MOE=1
+# Disable V1 engine
+export VLLM_USE_V1=0
 
 # Set cache location
 export HF_HOME=$(pwd)/cache/hf
@@ -42,10 +39,7 @@ apptainer run --nv \
     --bind $(pwd)/cache/models:/workspace/models \
     --env HF_HOME=/workspace/hf_cache \
     --env VLLM_USE_V1=0 \
-    --env VLLM_USE_TRTLLM_ATTENTION=1 \
-    --env VLLM_USE_TRTLLM_DECODE_ATTENTION=1 \
-    --env VLLM_USE_TRTLLM_CONTEXT_ATTENTION=1 \
-    --env VLLM_USE_FLASHINFER_MXFP4_BF16_MOE=1 \
+    --env VLLM_ATTENTION_BACKEND=TRITON_ATTN_VLLM_V1 \
     gpt-oss-120b.sif \
     vllm serve openai/gpt-oss-120b \
     --host 0.0.0.0 \
