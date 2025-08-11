@@ -13,8 +13,10 @@
 
 set -euo pipefail
 
-# create logs directory if it doesn't exist
+# create local directories for cache
 mkdir -p logs
+mkdir -p cache/hf
+mkdir -p cache/models
 
 # print basic info
 echo "Starting GPT-OSS-120B on $(hostname)"
@@ -22,12 +24,20 @@ echo "Job ID: ${SLURM_JOB_ID}"
 echo "Time: $(date)"
 nvidia-smi
 
-# run vllm server
-apptainer run --nv gpt-oss-120b.sif \
+# set cache location
+export HF_HOME=$(pwd)/cache/hf
+
+# run vllm server with bind mounts for cache
+apptainer run --nv \
+    --bind $(pwd)/cache/hf:/workspace/hf_cache \
+    --bind $(pwd)/cache/models:/workspace/models \
+    --env HF_HOME=/workspace/hf_cache \
+    gpt-oss-120b.sif \
     vllm serve openai/gpt-oss-120b \
     --host 0.0.0.0 \
     --port 8000 \
     --tensor-parallel-size 2 \
-    --gpu-memory-utilization 0.90
+    --gpu-memory-utilization 0.90 \
+    --download-dir /workspace/models
 
 echo "Job finished at $(date)"
