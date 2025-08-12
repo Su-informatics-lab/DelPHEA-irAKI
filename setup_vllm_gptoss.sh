@@ -53,7 +53,7 @@ done
 echo -e "\n[3/3] Creating optimized SLURM script..."
 cat > "$PROJECT_DIR/serve.sbatch" << 'EOF'
 #!/bin/bash
-#SBATCH --job-name=gptoss_server
+#SBATCH --job-name=gptoss_server_tp2
 #SBATCH --partition=nextgen-gpu
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:h100:2
@@ -67,54 +67,55 @@ cat > "$PROJECT_DIR/serve.sbatch" << 'EOF'
 
 set -euo pipefail
 
-# Paths
+# caches & image
 export HF_HOME="$HOME/hf-cache"
-export IMG_FILE="$HOME/containers/vllm-gptoss.sif"
+export IMG_DIR="$HOME/containers"
+export IMG_FILE="$IMG_DIR/vllm-gptoss.sif"
+mkdir -p "$HF_HOME" "$IMG_DIR" logs
+
+# per-job scratch
 export JOB_SCRATCH="$HOME/DelPHEA-irAKI/tmp/$SLURM_JOB_ID"
+mkdir -p "$JOB_SCRATCH"
 
-mkdir -p "$HF_HOME" logs "$JOB_SCRATCH"
-
-# CUDA setup
+# cuda toolchain
 export CUDA_HOME=/usr/local/cuda
-export PATH=$CUDA_HOME/bin:$PATH
+export PATH="$CUDA_HOME/bin:$PATH"
 
-# GPU configuration
-export CUDA_VISIBLE_DEVICES=0,1
-export TORCH_CUDA_ARCH_LIST="9.0"  # H100 architecture
+# scale TP with allocation (fallback to 2)
+export TENSOR_PARALLEL="${SLURM_JOB_GPUS_PER_NODE:-2}"
+
+# hpc-friendly nccl setting (intra-node only)
 export NCCL_IB_DISABLE=1
 
-# Get tensor parallel size from SLURM
-export TENSOR_PARALLEL=${SLURM_JOB_GPUS_PER_NODE:-2}
+echo "starting gpt-oss-120b tp=${TENSOR_PARALLEL} | job ${SLURM_JOB_ID} on $(hostname)"
+date
+nvidia-smi || true
 
-echo "========================================="
-echo "vLLM GPT-OSS-120B Server"
-echo "Node: $(hostname)"
-echo "GPUs: $TENSOR_PARALLEL x H100"
-echo "Container: vllm-gptoss.sif"
-echo "========================================="
-
-# Show GPU info
-nvidia-smi --query-gpu=index,name,memory.total --format=csv
-
-# Launch vLLM server
-apptainer exec --nv \
+apptainer exec --nv --cleanenv \
   --bind "$HF_HOME":/root/.cache/huggingface \
   --bind /mnt/shared/moduleapps/eb/CUDA/12.3.0:/mnt/shared/moduleapps/eb/CUDA/12.3.0 \
   --bind "$JOB_SCRATCH":/tmp \
   --env CUDA_HOME="$CUDA_HOME" \
   --env PATH="$PATH" \
-  --env TORCH_CUDA_ARCH_LIST="$TORCH_CUDA_ARCH_LIST" \
-  --env CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES" \
   --env NCCL_IB_DISABLE="$NCCL_IB_DISABLE" \
+  --env BASH_ENV=/dev/null \
   "$IMG_FILE" \
-  vllm serve openai/gpt-oss-120b \
-    --tensor-parallel-size "$TENSOR_PARALLEL" \
-    --gpu-memory-utilization 0.90 \
-    --host 0.0.0.0 \
-    --port 8000 \
-    --async-scheduling
+  bash -lc "
+    set -euo pipefail
+    PYDEPS=/tmp/pydeps
+    mkdir -p \"\$PYDEPS\"
+    python3 -m pip install --no-cache-dir --target \"\$PYDEPS\" 'numpy<2.3' >/tmp/pip.out 2>&1 || cat /tmp/pip.out
+    export PYTHONPATH=\"\$PYDEPS:\${PYTHONPATH-}\"
+    export TRANSFORMERS_NO_ADVISORY_WARNINGS=1
+    python3 -m vllm.entrypoints.openai.api_server \
+      --model openai/gpt-oss-120b \
+      --tensor-parallel-size \"$TENSOR_PARALLEL\" \
+      --gpu-memory-utilization 0.90 \
+      --max-model-len 8192 \
+      --host 127.0.0.1 --port 8000
+  "
 
-echo "Server terminated at $(date)"
+echo "job finished at $(date)"
 EOF
 
 echo -e "\n========================================="
