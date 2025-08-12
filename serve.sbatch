@@ -1,8 +1,8 @@
 #!/bin/bash
-#SBATCH --job-name=gptoss_server_tp1
+#SBATCH --job-name=gptoss_server_tp2
 #SBATCH --partition=nextgen-gpu
 #SBATCH --nodes=1
-#SBATCH --gres=gpu:h100:1
+#SBATCH --gres=gpu:h100:2
 #SBATCH --cpus-per-gpu=4
 #SBATCH --mem=128G
 #SBATCH --time=1-00:00:00
@@ -27,35 +27,38 @@ mkdir -p "$JOB_SCRATCH"
 export CUDA_HOME=/usr/local/cuda
 export PATH="$CUDA_HOME/bin:$PATH"
 
-echo "starting gpt-oss-120b tp=1 | job ${SLURM_JOB_ID} on $(hostname)"
+# scale TP with allocation (fallback to 2)
+export TENSOR_PARALLEL="${SLURM_JOB_GPUS_PER_NODE:-2}"
+
+# hpc-friendly nccl setting (intra-node only)
+export NCCL_IB_DISABLE=1
+
+echo "starting gpt-oss-120b tp=${TENSOR_PARALLEL} | job ${SLURM_JOB_ID} on $(hostname)"
 date
 nvidia-smi || true
 
-# run inside container:
-# - pin numpy<2.3 for numba
-# - bind caches
-# - start api on localhost:8000 with tp=1
 apptainer exec --nv --cleanenv \
   --bind "$HF_HOME":/root/.cache/huggingface \
   --bind /mnt/shared/moduleapps/eb/CUDA/12.3.0:/mnt/shared/moduleapps/eb/CUDA/12.3.0 \
   --bind "$JOB_SCRATCH":/tmp \
   --env CUDA_HOME="$CUDA_HOME" \
   --env PATH="$PATH" \
+  --env NCCL_IB_DISABLE="$NCCL_IB_DISABLE" \
   --env BASH_ENV=/dev/null \
   "$IMG_FILE" \
-  bash -lc '
+  bash -lc "
     set -euo pipefail
     PYDEPS=/tmp/pydeps
-    mkdir -p "$PYDEPS"
-    python3 -m pip install --no-cache-dir --target "$PYDEPS" "numpy<2.3" >/tmp/pip.out 2>&1 || cat /tmp/pip.out
-    export PYTHONPATH="$PYDEPS:${PYTHONPATH-}"
+    mkdir -p \"\$PYDEPS\"
+    python3 -m pip install --no-cache-dir --target \"\$PYDEPS\" 'numpy<2.3' >/tmp/pip.out 2>&1 || cat /tmp/pip.out
+    export PYTHONPATH=\"\$PYDEPS:\${PYTHONPATH-}\"
     export TRANSFORMERS_NO_ADVISORY_WARNINGS=1
     python3 -m vllm.entrypoints.openai.api_server \
       --model openai/gpt-oss-120b \
-      --tensor-parallel-size 1 \
+      --tensor-parallel-size \"$TENSOR_PARALLEL\" \
       --gpu-memory-utilization 0.90 \
       --max-model-len 8192 \
       --host 127.0.0.1 --port 8000
-  '
+  "
 
 echo "job finished at $(date)"
