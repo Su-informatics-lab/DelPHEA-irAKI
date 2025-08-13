@@ -91,18 +91,44 @@ def test_round1_scripted(monkeypatch):
     # Keep prompts minimal/fast
     monkeypatch.setattr(expert_mod, "format_round1_prompt", lambda **_: "R1 PROMPT")
 
-    # Intercept schema call to return a valid AssessmentR1 directly
     def _fake_call_llm_with_schema(response_model, **kwargs):
-        assert response_model is AssessmentR1
-        return AssessmentR1(
-            case_id="iraki_case_1",
-            expert_id="E1",
-            scores={"Q1": 5, "Q2": 3},
-            evidence={"Q1": "ev1", "Q2": "ev2"},
-            clinical_reasoning="x" * 220,
-            primary_diagnosis="ATIN",
-            differential_diagnosis=["ATN", "Prerenal"],
-        )
+        if response_model is AssessmentR1:
+            qids = ["Q1", "Q2"]
+            return AssessmentR1(
+                case_id="iraki_case_1",
+                expert_id="E1",
+                scores={"Q1": 3, "Q2": 4},
+                evidence={"Q1": "ev minority", "Q2": "ev minority 2"},
+                clinical_reasoning="x" * 220,
+                primary_diagnosis="ATIN?",
+                differential_diagnosis=["ATN", "Prerenal"],
+                rationale={q: "minority rationale" for q in qids},
+                q_confidence={q: 0.65 for q in qids},
+                importance={q: 1 for q in qids},  # INTs
+                p_iraki=0.5,
+                ci_iraki=(0.4, 0.6),  # TUPLE
+                confidence=0.7,
+            )
+        elif response_model is AssessmentR3:
+            # Not used by this test, but keep types correct just in case:
+            return AssessmentR3(
+                case_id="iraki_case_1",
+                expert_id="E1",
+                scores={"Q1": 6, "Q2": 5},
+                evidence={"Q1": "ev updated", "Q2": "ev updated 2"},
+                changes_from_round1={"summary": "updated", "debate_influence": "minor"},
+                final_diagnosis="ATIN",
+                recommendations=["Rx A"],
+                p_iraki=0.65,
+                ci_iraki=(0.5, 0.8),  # TUPLE
+                confidence=0.7,
+                rationale={"Q1": "updated rationale", "Q2": "updated rationale 2"},
+                q_confidence={"Q1": 0.7, "Q2": 0.68},
+                importance={"Q1": 1, "Q2": 1},  # INTs
+                verdict=True,  # BOOL
+                confidence_in_verdict=0.72,  # FLOAT
+            )
+        raise AssertionError("Unexpected response_model")
 
     monkeypatch.setattr(expert_mod, "call_llm_with_schema", _fake_call_llm_with_schema)
 
@@ -168,6 +194,7 @@ def test_round3_scripted(monkeypatch):
 
     def _fake_call_llm_with_schema(response_model, **kwargs):
         assert response_model is AssessmentR3
+        qids = ["Q1", "Q2"]
         return AssessmentR3(
             case_id="iraki_case_1",
             expert_id="E1",
@@ -177,8 +204,13 @@ def test_round3_scripted(monkeypatch):
             final_diagnosis="ATIN",
             recommendations=["Rx A", "Rx B"],
             p_iraki=0.7,
-            ci_iraki=[0.6, 0.8],
+            ci_iraki=(0.6, 0.8),  # TUPLE
             confidence=0.8,
+            rationale={q: "updated rationale" for q in qids},
+            q_confidence={q: 0.75 for q in qids},
+            importance={q: 1 for q in qids},  # INTs
+            verdict=True,  # BOOL
+            confidence_in_verdict=0.7,  # FLOAT
         )
 
     monkeypatch.setattr(expert_mod, "call_llm_with_schema", _fake_call_llm_with_schema)
@@ -241,27 +273,36 @@ def test_full_pipeline_scripted(monkeypatch):
         if response_model is AssessmentR1:
             return AssessmentR1(
                 case_id="iraki_case_1",
-                expert_id=kwargs.get("prompt_text", "E?") and "E1",
+                expert_id="E1",
                 scores={"Q1": 3},
                 evidence={"Q1": "ev minority"},
                 clinical_reasoning="x" * 220,
                 primary_diagnosis="ATIN?",
                 differential_diagnosis=["ATN", "Prerenal"],
+                rationale={"Q1": "minority rationale"},
+                q_confidence={"Q1": 0.65},
+                importance={"Q1": 1},  # INT
+                p_iraki=0.5,
+                ci_iraki=(0.4, 0.6),  # TUPLE
+                confidence=0.7,
             )
         elif response_model is AssessmentR3:
-            # Echo whatever expert_id we’re currently calling (Moderator injects it)
-            # but we don’t have that directly; use a neutral E? and patch later if needed.
             return AssessmentR3(
                 case_id="iraki_case_1",
-                expert_id="E?",
+                expert_id="E1",
                 scores={"Q1": 6},
                 evidence={"Q1": "ev updated"},
                 changes_from_round1={"summary": "updated", "debate_influence": "minor"},
                 final_diagnosis="ATIN",
                 recommendations=["Rx A"],
                 p_iraki=0.65,
-                ci_iraki=[0.5, 0.8],
+                ci_iraki=(0.5, 0.8),  # TUPLE
                 confidence=0.7,
+                rationale={"Q1": "updated reasoning"},
+                q_confidence={"Q1": 0.72},
+                importance={"Q1": 1},  # INT
+                verdict=True,  # BOOL
+                confidence_in_verdict=0.75,  # FLOAT
             )
         raise AssertionError("Unexpected response_model")
 
@@ -306,6 +347,12 @@ def test_full_pipeline_scripted(monkeypatch):
                 clinical_reasoning="x" * 220,
                 primary_diagnosis="ATIN?",
                 differential_diagnosis=["ATN", "Prerenal"],
+                rationale={"Q1": "minority rationale"},
+                q_confidence={"Q1": 0.65},
+                importance={"Q1": 1},  # INT
+                p_iraki=0.5,
+                ci_iraki=(0.4, 0.6),  # TUPLE
+                confidence=0.7,
             ),
         ),
         (
@@ -318,6 +365,12 @@ def test_full_pipeline_scripted(monkeypatch):
                 clinical_reasoning="y" * 220,
                 primary_diagnosis="ATN",
                 differential_diagnosis=["ATIN", "Prerenal"],
+                rationale={"Q1": "majority rationale"},
+                q_confidence={"Q1": 0.75},
+                importance={"Q1": 1},  # INT
+                p_iraki=0.55,
+                ci_iraki=(0.45, 0.65),  # TUPLE
+                confidence=0.72,
             ),
         ),
     ]
