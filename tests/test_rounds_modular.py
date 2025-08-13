@@ -225,7 +225,9 @@ def test_round3_scripted(monkeypatch):
     )
     assert isinstance(a3, AssessmentR3)
     assert a3.p_iraki == pytest.approx(0.7)
-    assert a3.ci_iraki == [0.6, 0.8]
+    lo, hi = a3.ci_iraki
+    assert lo == pytest.approx(0.6)
+    assert hi == pytest.approx(0.8)
     assert 0.0 <= a3.confidence <= 1.0
 
 
@@ -391,3 +393,22 @@ def test_full_pipeline_scripted(monkeypatch):
     cd = cons.model_dump()
     assert 0.0 <= cd["iraki_probability"] <= 1.0
     assert cd["ci_iraki"][0] <= cd["iraki_probability"] <= cd["ci_iraki"][1]
+
+
+def test_r1_importance_must_sum_100():
+    with pytest.raises(Exception):  # or ValidationError if you import it
+        AssessmentR1(
+            case_id="c1",
+            expert_id="E1",
+            scores={"Q1": 3, "Q2": 4},
+            evidence={"Q1": "e1", "Q2": "e2"},
+            clinical_reasoning="x" * 220,
+            primary_diagnosis="Dx",
+            differential_diagnosis=["Alt1", "Alt2"],
+            rationale={"Q1": "r1", "Q2": "r2"},
+            q_confidence={"Q1": 0.6, "Q2": 0.4},
+            importance={"Q1": 70, "Q2": 20},  # sums to 90 -> should fail
+            p_iraki=0.5,
+            ci_iraki=(0.4, 0.6),
+            confidence=0.7,
+        )
