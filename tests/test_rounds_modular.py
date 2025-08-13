@@ -104,13 +104,12 @@ def test_round1_scripted(monkeypatch):
                 differential_diagnosis=["ATN", "Prerenal"],
                 rationale={q: "minority rationale" for q in qids},
                 q_confidence={q: 0.65 for q in qids},
-                importance={q: 1 for q in qids},  # INTs
+                importance={"Q1": 60, "Q2": 40},  # <-- sum to 100
                 p_iraki=0.5,
-                ci_iraki=(0.4, 0.6),  # TUPLE
+                ci_iraki=(0.4, 0.6),
                 confidence=0.7,
             )
         elif response_model is AssessmentR3:
-            # Not used by this test, but keep types correct just in case:
             return AssessmentR3(
                 case_id="iraki_case_1",
                 expert_id="E1",
@@ -120,13 +119,13 @@ def test_round1_scripted(monkeypatch):
                 final_diagnosis="ATIN",
                 recommendations=["Rx A"],
                 p_iraki=0.65,
-                ci_iraki=(0.5, 0.8),  # TUPLE
+                ci_iraki=(0.5, 0.8),
                 confidence=0.7,
                 rationale={"Q1": "updated rationale", "Q2": "updated rationale 2"},
                 q_confidence={"Q1": 0.7, "Q2": 0.68},
-                importance={"Q1": 1, "Q2": 1},  # INTs
-                verdict=True,  # BOOL
-                confidence_in_verdict=0.72,  # FLOAT
+                importance={"Q1": 55, "Q2": 45},  # <-- sum to 100
+                verdict=True,
+                confidence_in_verdict=0.72,
             )
         raise AssertionError("Unexpected response_model")
 
@@ -204,13 +203,13 @@ def test_round3_scripted(monkeypatch):
             final_diagnosis="ATIN",
             recommendations=["Rx A", "Rx B"],
             p_iraki=0.7,
-            ci_iraki=(0.6, 0.8),  # TUPLE
+            ci_iraki=(0.6, 0.8),
             confidence=0.8,
             rationale={q: "updated rationale" for q in qids},
             q_confidence={q: 0.75 for q in qids},
-            importance={q: 1 for q in qids},  # INTs
-            verdict=True,  # BOOL
-            confidence_in_verdict=0.7,  # FLOAT
+            importance={"Q1": 50, "Q2": 50},  # <-- sum to 100
+            verdict=True,
+            confidence_in_verdict=0.7,
         )
 
     monkeypatch.setattr(expert_mod, "call_llm_with_schema", _fake_call_llm_with_schema)
@@ -281,9 +280,9 @@ def test_full_pipeline_scripted(monkeypatch):
                 differential_diagnosis=["ATN", "Prerenal"],
                 rationale={"Q1": "minority rationale"},
                 q_confidence={"Q1": 0.65},
-                importance={"Q1": 1},  # INT
+                importance={"Q1": 100},  # <-- single QID -> 100
                 p_iraki=0.5,
-                ci_iraki=(0.4, 0.6),  # TUPLE
+                ci_iraki=(0.4, 0.6),
                 confidence=0.7,
             )
         elif response_model is AssessmentR3:
@@ -296,13 +295,13 @@ def test_full_pipeline_scripted(monkeypatch):
                 final_diagnosis="ATIN",
                 recommendations=["Rx A"],
                 p_iraki=0.65,
-                ci_iraki=(0.5, 0.8),  # TUPLE
+                ci_iraki=(0.5, 0.8),
                 confidence=0.7,
                 rationale={"Q1": "updated reasoning"},
                 q_confidence={"Q1": 0.72},
-                importance={"Q1": 1},  # INT
-                verdict=True,  # BOOL
-                confidence_in_verdict=0.75,  # FLOAT
+                importance={"Q1": 100},  # <-- single QID -> 100
+                verdict=True,
+                confidence_in_verdict=0.75,
             )
         raise AssertionError("Unexpected response_model")
 
@@ -349,9 +348,9 @@ def test_full_pipeline_scripted(monkeypatch):
                 differential_diagnosis=["ATN", "Prerenal"],
                 rationale={"Q1": "minority rationale"},
                 q_confidence={"Q1": 0.65},
-                importance={"Q1": 1},  # INT
+                importance={"Q1": 100},  # <-- single QID -> 100
                 p_iraki=0.5,
-                ci_iraki=(0.4, 0.6),  # TUPLE
+                ci_iraki=(0.4, 0.6),
                 confidence=0.7,
             ),
         ),
@@ -367,9 +366,9 @@ def test_full_pipeline_scripted(monkeypatch):
                 differential_diagnosis=["ATIN", "Prerenal"],
                 rationale={"Q1": "majority rationale"},
                 q_confidence={"Q1": 0.75},
-                importance={"Q1": 1},  # INT
+                importance={"Q1": 100},  # <-- single QID -> 100
                 p_iraki=0.55,
-                ci_iraki=(0.45, 0.65),  # TUPLE
+                ci_iraki=(0.45, 0.65),
                 confidence=0.72,
             ),
         ),
