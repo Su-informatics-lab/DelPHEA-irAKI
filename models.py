@@ -7,6 +7,7 @@ from typing import Dict, List, Optional, Tuple
 
 from pydantic import (
     BaseModel,
+    ConfigDict,
     Field,
     ValidationInfo,
     computed_field,
@@ -129,12 +130,17 @@ class AssessmentR3(AssessmentBase):
 
 
 class DebateTurn(BaseModel):
-    """single debate turn from an expert."""
+    model_config = ConfigDict(strict=True, extra="ignore")
 
+    expert_id: str
+    qid: str
+    round_no: int
     text: str
+    satisfied: bool = False
     citations: List[str] = Field(default_factory=list)
-    satisfied: bool
-    revised_score: Optional[int] = None
+
+    # new optional controls
+    revised_score: Optional[int] = Field(default=None, ge=1, le=9)
     handoff_to: Optional[str] = None
 
 

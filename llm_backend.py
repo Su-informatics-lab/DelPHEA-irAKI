@@ -225,16 +225,12 @@ class LLMBackend:
     def debate(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         """Produce a single debate turn (used by Expert.debate).
 
-        Input payload keys (expected):
-          - expert_id: str
-          - specialty: str
-          - qid: str
-          - round_no: int
-          - clinical_context: dict  (may include 'role' and 'peer_turns')
-          - minority_view: str
-          - temperature: float
-
-        Returns: dict for models.DebateTurn(**dict)
+        Accepts plain-text with control lines or a JSON blob, and returns a normalized dict:
+          {
+            "expert_id": str, "qid": str, "round_no": int,
+            "text": str, "satisfied": bool,
+            "revised_score": Optional[int], "handoff_to": Optional[str]
+          }
         """
         expert_id = str(payload.get("expert_id") or "unknown_expert")
         specialty = str(payload.get("specialty") or "expert")
@@ -244,20 +240,20 @@ class LLMBackend:
         clinical_context = payload.get("clinical_context") or {}
         temperature = float(payload.get("temperature") or self.temperature_r2 or 0.3)
 
-        # role hint
+        # role hint & prior turns
+        role_hint = ""
         try:
-            role_hint = str(
-                (
-                    clinical_context.get("role")
-                    if isinstance(clinical_context, dict)
-                    else ""
-                )
-                or ""
+            r = (
+                clinical_context.get("role")
+                if isinstance(clinical_context, dict)
+                else None
             )
+            if r:
+                role_hint = str(r)
         except Exception:
-            role_hint = ""
+            pass
 
-        # peer history snippet
+        peer_snippet = ""
         try:
             peer_turns = (
                 clinical_context.get("peer_turns")
@@ -268,9 +264,9 @@ class LLMBackend:
                 peer_turns, max_turns=8, max_chars=320
             )
         except Exception:
-            peer_snippet = ""
+            pass
 
-        # Best-effort case id (optional, for prompt context only)
+        # optional case id for prompt
         case_id = None
         try:
             case = (
@@ -285,7 +281,7 @@ class LLMBackend:
                         case_id = str(v)
                         break
         except Exception:
-            case_id = None
+            pass
 
         header = f"Debate turn for question {qid} (round {round_no})."
         role = f"Role: {expert_id} ({specialty})."
@@ -313,15 +309,13 @@ class LLMBackend:
             "HANDOFF: <expert_id>|none\n"
         )
 
-        # optional dump root
+        # optional dumps
         dump_root_env = os.getenv("DELPHEA_OUT_DIR")
         dump_base: Optional[Path] = Path(dump_root_env) if dump_root_env else None
         safe_case = self._safe_name(case_id or "unknown_case", "unknown_case")
         safe_eid = self._safe_name(expert_id, "unknown_expert")
         safe_qid = self._safe_name(qid, "Q")
         subdir = f"{safe_case}/experts/{safe_eid}/debate/{safe_qid}"
-
-        # dump prompt + meta (best-effort, never raise)
         self._dump_write(dump_base, f"{subdir}/prompt.txt", prompt)
         self._dump_json(
             dump_base,
@@ -342,89 +336,89 @@ class LLMBackend:
             },
         )
 
+        # --- call model (force plain completion) ---
         try:
             text = self.generate(
                 prompt,
                 max_tokens=512,
                 temperature=temperature,
                 system="You are a clinical expert generating short, plain-text debate arguments. No markdown, no JSON.",
-                prefer_json=False,  # force plain completion
+                prefer_json=False,
             )
         except Exception:
             text = "Unable to generate debate content."
 
-        # normalize & salvage if JSON slipped through
-        try:
-            raw = (text or "").strip()
-        except Exception:
-            raw = "Unable to generate debate content."
-        if raw.startswith("{") and raw.endswith("}"):
-            try:
-                obj = json.loads(raw)
-                for key in ("text", "content", "argument", "message"):
-                    if isinstance(obj.get(key), str) and obj.get(key).strip():
-                        raw = obj[key].strip()
-                        break
-                else:
-                    raw = json.dumps(obj, ensure_ascii=False)
-            except Exception:
-                pass
-
-        # parse control lines
-        import re
-
-        satisfied_flag: Optional[bool] = None
+        # --- normalize result, supporting accidental JSON replies ---
+        satisfied: Optional[bool] = None
         revised_score: Optional[int] = None
         handoff_to: Optional[str] = None
 
-        try:
-            sat_m = re.search(r"(?mi)^\s*SATISFIED\s*:\s*(yes|no)\b", raw)
-            if sat_m:
-                satisfied_flag = sat_m.group(1).lower() == "yes"
-            rs_m = re.search(r"(?mi)^\s*REVISED_SCORE\s*:\s*(\d+|same)\b", raw)
-            if rs_m:
-                token = rs_m.group(1).lower()
-                if token.isdigit():
-                    v = int(token)
-                    if 1 <= v <= 9:
-                        revised_score = v
-            ho_m = re.search(r"(?mi)^\s*HANDOFF\s*:\s*([A-Za-z0-9_.-]+|none)\b", raw)
-            if ho_m:
-                hv = ho_m.group(1)
-                if hv.lower() != "none":
-                    handoff_to = hv
-        except Exception:
-            pass
+        s = (text or "").strip()
+        if s.startswith("{") and s.endswith("}"):
+            try:
+                obj = json.loads(s)
+                if isinstance(obj.get("text"), str) and obj["text"].strip():
+                    s = obj["text"].strip()
+                # pass through optional controls if present
+                if isinstance(obj.get("satisfied"), bool):
+                    satisfied = obj["satisfied"]
+                rs = obj.get("revised_score", None)
+                if isinstance(rs, int) and 1 <= rs <= 9:
+                    revised_score = rs
+                ht = obj.get("handoff_to", None)
+                if isinstance(ht, str) and ht.strip().lower() not in {"", "none"}:
+                    handoff_to = ht.strip()
+            except Exception:
+                # leave as original s
+                pass
 
-        # strip control lines from visible text
-        def _strip_ctrl(s: str) -> str:
-            def _is_ctrl(ln: str) -> bool:
-                u = ln.strip().upper()
-                return (
-                    u.startswith("SATISFIED:")
-                    or u.startswith("REVISED_SCORE:")
-                    or u.startswith("HANDOFF:")
-                )
+        # --- parse control lines from plain text (and strip them from body) ---
+        lines = [ln.rstrip() for ln in s.splitlines()]
+        body: List[str] = []
+        for ln in lines:
+            low = ln.strip().lower()
+            if low.startswith("satisfied:"):
+                val = low.split(":", 1)[1].strip()
+                if val in {"yes", "no"}:
+                    satisfied = val == "yes"
+                continue
+            if low.startswith("revised_score:"):
+                val = low.split(":", 1)[1].strip()
+                if val != "same":
+                    try:
+                        num = int(val)
+                        if 1 <= num <= 9:
+                            revised_score = num
+                    except Exception:
+                        pass
+                continue
+            if low.startswith("handoff:"):
+                val = low.split(":", 1)[1].strip()
+                if val and val.lower() not in {"none", "null", "-"}:
+                    handoff_to = val
+                else:
+                    handoff_to = None
+                continue
+            body.append(ln)
 
-            return "\n".join(ln for ln in s.splitlines() if not _is_ctrl(ln)).strip()
+        cleaned_text = "\n".join(body).strip()
+        if not cleaned_text:
+            cleaned_text = "No argument produced."
 
-        visible_text = _strip_ctrl(raw) if raw else "No argument produced."
+        if satisfied is None:
+            satisfied = bool(len(cleaned_text) >= 20)
 
-        result: Dict[str, Any] = {
+        result = {
             "expert_id": expert_id,
             "qid": qid,
             "round_no": round_no,
-            "text": visible_text,
+            "text": cleaned_text,
+            "satisfied": bool(satisfied),
         }
-        # only set satisfied if explicitly parsed; Expert._coerce_debate_turn will infer otherwise
-        if satisfied_flag is not None:
-            result["satisfied"] = bool(satisfied_flag)
         if revised_score is not None:
             result["revised_score"] = revised_score
         if handoff_to:
             result["handoff_to"] = handoff_to
 
-        # dump turn (best-effort)
         self._dump_json(dump_base, f"{subdir}/turn.json", result)
-
         return result

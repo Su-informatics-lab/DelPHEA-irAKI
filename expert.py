@@ -244,15 +244,13 @@ class Expert:
     # --------- helpers ---------
 
     def _coerce_debate_turn(self, raw: Any, *, qid: str, round_no: int) -> DebateTurn:
-        """best-effort coercion of backend reply into DebateTurn fields.
+        """Coerce backend reply into DebateTurn fields.
 
-        guarantees:
-          - expert_id, qid, round_no
-          - text: uses raw['text'] or raw['content'] or raw['argument'] or raw_string
-          - satisfied: prefer explicit boolean; else heuristic based on text length
-          - citations: list[str] if present else []
-          - revised_score: optional int
-          - handoff_to: optional str
+        Guarantees:
+          - expert_id, qid, round_no, text, satisfied
+          - citations: list[str]
+          - revised_score: Optional[int] in [1,9]
+          - handoff_to: Optional[str]
         """
         # accept dict, pydantic-like, or json string
         if hasattr(raw, "model_dump"):
@@ -266,7 +264,7 @@ class Expert:
         if not isinstance(raw, dict):
             raw = {}
 
-        # choose the best available text field
+        # choose best text field
         text = (
             (raw.get("text") if isinstance(raw.get("text"), str) else None)
             or (raw.get("content") if isinstance(raw.get("content"), str) else None)
@@ -274,38 +272,47 @@ class Expert:
             or ""
         ).strip()
 
-        # satisfied: prefer explicit; else infer from text length
+        # satisfied: prefer explicit bool; else infer by length
         sat = raw.get("satisfied")
         if not isinstance(sat, bool):
             sat = bool(len(text) >= 20)
 
-        # citations (optional)
+        # citations: normalize to list[str]
         citations = raw.get("citations")
         if not isinstance(citations, list):
             citations = []
-        else:
-            citations = [str(x) for x in citations]
+        citations = [str(x) for x in citations]
 
-        # optional revised_score
-        revised_score = raw.get("revised_score")
-        if not isinstance(revised_score, int):
+        # revised_score (optional int 1..9)
+        rs = raw.get("revised_score")
+        if isinstance(rs, int) and 1 <= rs <= 9:
+            revised_score = rs
+        else:
             revised_score = None
 
-        # optional handoff_to
-        handoff_to = raw.get("handoff_to")
-        if not isinstance(handoff_to, str) or not handoff_to.strip():
-            handoff_to = None
+        # handoff_to (optional str)
+        ht = raw.get("handoff_to")
+        handoff_to = None
+        if (
+            isinstance(ht, str)
+            and ht.strip()
+            and ht.strip().lower() not in {"none", "null", "-"}
+        ):
+            handoff_to = ht.strip()
 
         base = {
             "expert_id": self.expert_id,
             "qid": qid,
             "round_no": int(round_no),
             "text": text if text else "[auto-repair] debate content missing.",
-            "satisfied": sat,
+            "satisfied": bool(sat),
             "citations": citations,
-            "revised_score": revised_score,
-            "handoff_to": handoff_to,
         }
+        if revised_score is not None:
+            base["revised_score"] = revised_score
+        if handoff_to:
+            base["handoff_to"] = handoff_to
+
         return DebateTurn(**base)
 
     def _expert_name(self) -> str:
