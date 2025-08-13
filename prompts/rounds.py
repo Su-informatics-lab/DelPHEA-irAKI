@@ -13,14 +13,12 @@ from .loader import load_unified_round
 
 
 def _stringify(x: Any) -> str:
-    # pretty json for dict/list; pass-through for strings
     if isinstance(x, (dict, list)):
         return json.dumps(x, ensure_ascii=False, indent=2)
     return str(x)
 
 
 def _safe_format(template: str, mapping: Dict[str, Any]) -> str:
-    # leave unknown placeholders intact rather than crashing
     class _Safe(dict):
         def __missing__(self, key):
             return "{" + key + "}"
@@ -36,8 +34,29 @@ def _qtexts(qpath: str | Path) -> Dict[str, str]:
 
 
 def _render_questions(qtexts: Dict[str, str]) -> str:
-    # stable "QID: text" lines
     return "\n".join(f"{qid}: {text}" for qid, text in qtexts.items())
+
+
+def _output_contract_block() -> str:
+    return (
+        "OUTPUT JSON CONTRACT (STRICT):\n"
+        "{\n"
+        '  "answers": [\n'
+        '    {"qid":"Q1","score":7,"reason":"concise rationale grounded in case","confidence":0.78,"importance":12},\n'
+        '    {"qid":"Q2","score":3,"reason":"concise rationale grounded in case","confidence":0.42,"importance":8}\n'
+        "  ],\n"
+        '  "p_iraki": 0.62,\n'
+        '  "ci_iraki": [0.45, 0.77],\n'
+        '  "confidence": 0.70,\n'
+        "  ... round-specific fields ...\n"
+        "}\n\n"
+        "RULES:\n"
+        "- score: integer 1..9 (higher = more consistent with irAKI for that question)\n"
+        "- reason: ≤6 sentences; cite the most discriminative facts from this case\n"
+        "- confidence: 0..1 (two decimals suggested) for THIS question only\n"
+        "- importance: integer; allocate points so the TOTAL across all questions is EXACTLY 100 (constant-sum)\n"
+        "- return ONLY JSON — no prose, no markdown fences\n"
+    )
 
 
 def _assemble_prompt(
@@ -53,6 +72,8 @@ def _assemble_prompt(
         bundle["ci_instructions"],
         "SCHEMA:",
         bundle["schema_block"],
+        "JSON FORMAT OVERRIDE:",
+        _output_contract_block(),  # <— explicit shape we want the model to follow
         "CHECK BEFORE RETURNING JSON:",
         bundle["checklist"],
         f"{bundle['repair_heading']} follow any moderator 'repair' instructions strictly if provided.",
@@ -70,7 +91,7 @@ def format_round1_prompt(
     qpath: str | Path,
     debate_status: Optional[str] = None,
     debate_plan: Optional[str] = None,
-    **_: Any,  # ignore legacy kwargs gracefully
+    **_: Any,
 ) -> str:
     qtexts = _qtexts(qpath)
     bundle = load_unified_round(round_key="r1", qids=qtexts.keys())
@@ -108,7 +129,7 @@ def format_round3_prompt(
     peer_feedback_summary: Optional[str] = None,
     debate_status: Optional[str] = None,
     debate_plan: Optional[str] = None,
-    **_: Any,  # ignore legacy kwargs gracefully
+    **_: Any,
 ) -> str:
     qtexts = _qtexts(qpath)
     bundle = load_unified_round(round_key="r3", qids=qtexts.keys())
