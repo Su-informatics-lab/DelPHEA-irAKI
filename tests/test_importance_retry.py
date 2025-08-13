@@ -10,8 +10,6 @@ from models import AssessmentR1, AssessmentR3
 
 
 class ScriptedDebateBackend:
-    """Just to satisfy Expert() ctor; debate path unused here."""
-
     def __init__(self, script=None):
         self.script = script or {}
 
@@ -27,22 +25,29 @@ def _mk_case():
     }
 
 
+class FakeVE(Exception):
+    """Duck-typed ValidationError with .errors()."""
+
+    def __init__(self, errors_list):
+        self._errors = errors_list
+
+    def errors(self):
+        return self._errors
+
+
 @pytest.mark.parametrize("bad_sum", [90, 2020])
 def test_r1_importance_sum_triggers_retry_with_hint(monkeypatch, bad_sum):
-    """
-    If R1 validation complains 'importance must sum to 100 (got X)',
-    Moderator should retry Expert.assess_round1 with a repair_hint that
-    includes that exact message.
-    """
     import expert as expert_mod
 
-    # Stable qids and trivial prompts so we don't touch disk
+    # Use our fake ValidationError inside moderator
+    monkeypatch.setattr(mod, "ValidationError", FakeVE, raising=True)
+
+    # stable qids and prompt
     monkeypatch.setattr(expert_mod, "load_qids", lambda _p: ["Q1", "Q2"])
     monkeypatch.setattr(expert_mod, "format_round1_prompt", lambda **_: "R1 PROMPT")
 
-    # 1) Make schema call always produce a valid AssessmentR1 (importance OK).
-    #    We'll inject the *error* via moderator.validate_round1_payload to force a retry.
-    def _fake_call_llm_with_schema(response_model, **kwargs):
+    # schema call produces a valid model; we inject the error via validator
+    def _fake_schema(response_model, **kwargs):
         assert response_model is AssessmentR1
         return AssessmentR1(
             case_id="iraki_case_retry",
@@ -54,32 +59,19 @@ def test_r1_importance_sum_triggers_retry_with_hint(monkeypatch, bad_sum):
             differential_diagnosis=["ATN", "Prerenal"],
             rationale={"Q1": "r", "Q2": "r2"},
             q_confidence={"Q1": 0.6, "Q2": 0.7},
-            importance={
-                "Q1": 50,
-                "Q2": 50,
-            },  # model is valid; we force error downstream
+            importance={"Q1": 50, "Q2": 50},
             p_iraki=0.5,
             ci_iraki=(0.4, 0.6),
             confidence=0.7,
         )
 
-    monkeypatch.setattr(expert_mod, "call_llm_with_schema", _fake_call_llm_with_schema)
+    monkeypatch.setattr(expert_mod, "call_llm_with_schema", _fake_schema)
 
-    # 2) Patch moderator.ValidationError to a local class we can raise,
-    #    and patch validate_round1_payload to fail once with our custom message.
-    class FakeVE(mod.ValidationError):  # keep isinstance checks happy
-        def __init__(self, errors_list):
-            super().__init__("fake validation error")
-            self._errors = errors_list
+    first = {"flag": True}
 
-        def errors(self):
-            return self._errors
-
-    first_call = {"flag": True}
-
-    def _fail_once_validate_round1_payload(vd, required_evidence=12):
-        if first_call["flag"]:
-            first_call["flag"] = False
+    def _fail_once(vd, required_evidence=12):
+        if first["flag"]:
+            first["flag"] = False
             raise FakeVE(
                 [
                     {
@@ -88,24 +80,24 @@ def test_r1_importance_sum_triggers_retry_with_hint(monkeypatch, bad_sum):
                     }
                 ]
             )
-        # pass on retry
+        # else pass
 
-    monkeypatch.setattr(
-        mod, "validate_round1_payload", _fail_once_validate_round1_payload
-    )
+    monkeypatch.setattr(mod, "validate_round1_payload", _fail_once)
 
-    # 3) Wrap Expert.assess_round1 to record the repair_hint passed on retry.
+    # capture repair_hint regardless of Expert signature
     recorded_hints = []
+    orig = expert_mod.Expert.assess_round1
 
-    orig_assess_round1 = expert_mod.Expert.assess_round1
+    def _wrapped(self, case, questionnaire_path, repair_hint=None, **kw):
+        recorded_hints.append(repair_hint)
+        try:
+            return orig(self, case, questionnaire_path, repair_hint=repair_hint, **kw)
+        except TypeError:
+            return orig(self, case, questionnaire_path, **kw)
 
-    def _wrapped_assess_round1(self, case, questionnaire_path, *args, **kwargs):
-        recorded_hints.append(kwargs.get("repair_hint"))
-        return orig_assess_round1(self, case, questionnaire_path, *args, **kwargs)
+    monkeypatch.setattr(expert_mod.Expert, "assess_round1", _wrapped)
 
-    monkeypatch.setattr(expert_mod.Expert, "assess_round1", _wrapped_assess_round1)
-
-    # 4) Build a Moderator (no debate invoked here).
+    # build moderator and run R1
     monkeypatch.setattr(mod, "load_qids", lambda _p: ["Q1", "Q2"])
     monkeypatch.setattr(
         mod,
@@ -124,30 +116,24 @@ def test_r1_importance_sum_triggers_retry_with_hint(monkeypatch, bad_sum):
         logger=logging.getLogger("moderator-test"),
     )
 
-    # 5) Run R1: should call assess_round1 twice (None, then a hint with our message).
     out = M.assess_round(1, _mk_case())
     assert isinstance(out[0][1], AssessmentR1)
-
-    assert recorded_hints[0] is None, "first call should have no repair hint"
-    assert (
-        isinstance(recorded_hints[1], str) and recorded_hints[1]
-    ), "retry must pass a repair hint"
+    assert recorded_hints[0] is None
+    assert isinstance(recorded_hints[1], str)
     assert f"importance must sum to 100 (got {bad_sum})" in recorded_hints[1]
 
 
 @pytest.mark.parametrize("bad_sum", [90, 2020])
 def test_r3_importance_sum_triggers_retry_with_hint(monkeypatch, bad_sum):
-    """
-    Same as above, but for R3 path via Moderator._call_round3_with_repair.
-    """
     import expert as expert_mod
 
-    # Stable qids and trivial prompts
+    # Use our fake ValidationError inside moderator
+    monkeypatch.setattr(mod, "ValidationError", FakeVE, raising=True)
+
     monkeypatch.setattr(expert_mod, "load_qids", lambda _p: ["Q1", "Q2"])
     monkeypatch.setattr(expert_mod, "format_round3_prompt", lambda **_: "R3 PROMPT")
 
-    # Valid R3 returned by the schema call; we'll fail validation once in moderator.
-    def _fake_call_llm_with_schema(response_model, **kwargs):
+    def _fake_schema(response_model, **kwargs):
         assert response_model is AssessmentR3
         return AssessmentR3(
             case_id="iraki_case_retry",
@@ -159,7 +145,7 @@ def test_r3_importance_sum_triggers_retry_with_hint(monkeypatch, bad_sum):
             recommendations=["Rx A"],
             rationale={"Q1": "r", "Q2": "r2"},
             q_confidence={"Q1": 0.7, "Q2": 0.65},
-            importance={"Q1": 50, "Q2": 50},  # valid; error injected downstream
+            importance={"Q1": 50, "Q2": 50},
             p_iraki=0.65,
             ci_iraki=(0.5, 0.8),
             confidence=0.7,
@@ -167,22 +153,13 @@ def test_r3_importance_sum_triggers_retry_with_hint(monkeypatch, bad_sum):
             confidence_in_verdict=0.72,
         )
 
-    monkeypatch.setattr(expert_mod, "call_llm_with_schema", _fake_call_llm_with_schema)
+    monkeypatch.setattr(expert_mod, "call_llm_with_schema", _fake_schema)
 
-    # Patch moderator's validator to fail once with the 'importance' message.
-    class FakeVE(mod.ValidationError):
-        def __init__(self, errors_list):
-            super().__init__("fake validation error")
-            self._errors = errors_list
+    first = {"flag": True}
 
-        def errors(self):
-            return self._errors
-
-    first_call = {"flag": True}
-
-    def _fail_once_validate_round3_payload(vd):
-        if first_call["flag"]:
-            first_call["flag"] = False
+    def _fail_once(vd):
+        if first["flag"]:
+            first["flag"] = False
             raise FakeVE(
                 [
                     {
@@ -191,28 +168,31 @@ def test_r3_importance_sum_triggers_retry_with_hint(monkeypatch, bad_sum):
                     }
                 ]
             )
-        # pass on retry
+        # else pass
 
-    monkeypatch.setattr(
-        mod, "validate_round3_payload", _fail_once_validate_round3_payload
-    )
+    monkeypatch.setattr(mod, "validate_round3_payload", _fail_once)
 
-    # Capture repair_hint on Expert.assess_round3
     recorded_hints = []
+    orig = expert_mod.Expert.assess_round3
 
-    orig_assess_round3 = expert_mod.Expert.assess_round3
-
-    def _wrapped_assess_round3(
-        self, case, questionnaire_path, debate_context, *args, **kwargs
+    def _wrapped(
+        self, case, questionnaire_path, debate_context, repair_hint=None, **kw
     ):
-        recorded_hints.append(kwargs.get("repair_hint"))
-        return orig_assess_round3(
-            self, case, questionnaire_path, debate_context, *args, **kwargs
-        )
+        recorded_hints.append(repair_hint)
+        try:
+            return orig(
+                self,
+                case,
+                questionnaire_path,
+                debate_context,
+                repair_hint=repair_hint,
+                **kw,
+            )
+        except TypeError:
+            return orig(self, case, questionnaire_path, debate_context, **kw)
 
-    monkeypatch.setattr(expert_mod.Expert, "assess_round3", _wrapped_assess_round3)
+    monkeypatch.setattr(expert_mod.Expert, "assess_round3", _wrapped)
 
-    # Build Moderator and run round 3
     monkeypatch.setattr(mod, "load_qids", lambda _p: ["Q1", "Q2"])
     monkeypatch.setattr(
         mod,
@@ -233,7 +213,6 @@ def test_r3_importance_sum_triggers_retry_with_hint(monkeypatch, bad_sum):
 
     out = M.assess_round(3, _mk_case(), debate_ctx={"debate_skipped": True})
     assert isinstance(out[0][1], AssessmentR3)
-
     assert recorded_hints[0] is None
-    assert isinstance(recorded_hints[1], str) and recorded_hints[1]
+    assert isinstance(recorded_hints[1], str)
     assert f"importance must sum to 100 (got {bad_sum})" in recorded_hints[1]
