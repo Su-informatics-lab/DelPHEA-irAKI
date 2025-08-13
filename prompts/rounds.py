@@ -41,21 +41,17 @@ def _output_contract_block() -> str:
     return (
         "OUTPUT JSON CONTRACT (STRICT):\n"
         "{\n"
-        '  "answers": [\n'
-        '    {"qid":"Q1","score":7,"reason":"concise rationale grounded in case","confidence":0.78,"importance":12},\n'
-        '    {"qid":"Q2","score":3,"reason":"concise rationale grounded in case","confidence":0.42,"importance":8}\n'
-        "  ],\n"
+        '  "scores": {"Q1": 7, "Q2": 3},\n'
+        '  "rationale": {"Q1": "argument for Q1", "Q2": "argument for Q2"},\n'
+        '  "evidence": {"Q1": "supporting snippet for Q1", "Q2": "support for Q2"},\n'
+        '  "q_confidence": {"Q1": 0.78, "Q2": 0.42},\n'
+        '  "importance": {"Q1": 60, "Q2": 40},\n'
         '  "p_iraki": 0.62,\n'
         '  "ci_iraki": [0.45, 0.77],\n'
         '  "confidence": 0.70,\n'
         "  ... round-specific fields ...\n"
-        "}\n\n"
-        "RULES:\n"
-        "- score: integer 1..9 (higher = more consistent with irAKI for that question)\n"
-        "- reason: ≤6 sentences; cite the most discriminative facts from this case\n"
-        "- confidence: 0..1 (two decimals suggested) for THIS question only\n"
-        "- importance: integer; allocate points so the TOTAL across all questions is EXACTLY 100 (constant-sum)\n"
-        "- return ONLY JSON — no prose, no markdown fences\n"
+        "}\n"
+        "- Return ONLY JSON — no prose, no markdown fences.\n"
     )
 
 

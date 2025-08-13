@@ -1,11 +1,13 @@
 # validators.py
 # -------------
 # validation & llm→schema glue for delphea-iraki (pydantic v2 idioms).
-# this version enforces the new per-question "answers[]" contract:
-#   - each element: {qid, score (1..9), reason, confidence (0..1), importance (int)}
-#   - importance represents the question's CONTRIBUTION WEIGHT to the overall assessment
-#     (not the same as the score), and must form a constant-sum of 100 across all questions.
-# it also supports appending a strict output contract to prompts and validates JSON outputs.
+# contract: five parallel per-question dicts keyed by qid
+#   - scores:       {qid: int in [1,9]}
+#   - rationale:    {qid: non-empty str}  ← argument/explanation
+#   - evidence:     {qid: non-empty str}  ← supporting snippet/paragraph
+#   - q_confidence: {qid: float in [0,1]}
+#   - importance:   {qid: nonnegative int}, with TOTAL across all qids = 100
+# 'importance' is a CONTRIBUTION WEIGHT to the overall assessment (not a second score).
 
 from __future__ import annotations
 
@@ -22,15 +24,11 @@ from pydantic_core import InitErrorDetails, PydanticCustomError
 
 T = TypeVar("T", bound=BaseModel)
 
-# sensible defaults; overridden by delphea_iraki.py via function args
 DEFAULT_CTX_WINDOW = 32768
 DEFAULT_OUT_TOKENS_INIT = 3200
 DEFAULT_RETRIES = 2
 DEFAULT_RETRY_FACTOR = 1.5
 DEFAULT_RESERVE_TOKENS = 512
-
-
-# ------------------------------ error helpers ------------------------------
 
 
 def _raise_ve(
@@ -51,11 +49,7 @@ def _raise_ve(
     raise ValidationError.from_exception_data(title=title, line_errors=[err])
 
 
-# ------------------------------- json parser -------------------------------
-
-
 def _extract_first_json_object(text: str) -> str:
-    # parse first top-level json object; supports fenced ```json blocks
     if not isinstance(text, str) or not text:
         _raise_ve(
             "llm_response",
@@ -118,11 +112,7 @@ def _extract_first_json_object(text: str) -> str:
     )
 
 
-# ------------------------------ token helpers ------------------------------
-
-
 def _count_tokens(backend: Any, text: str) -> int:
-    # crude fallback when backend doesn't expose a counter
     if hasattr(backend, "count_tokens") and callable(getattr(backend, "count_tokens")):
         try:
             return int(backend.count_tokens(text))  # type: ignore[arg-type]
@@ -142,23 +132,9 @@ def _discover_context_window(backend: Any) -> int:
     return DEFAULT_CTX_WINDOW
 
 
-# --------------------------- coercion helpers ---------------------------
-
-
 def _to_float(x: Any, default: float | None = None) -> float | None:
     try:
         return float(x)
-    except Exception:
-        return default
-
-
-def _to_int(x: Any, default: int | None = None) -> int | None:
-    try:
-        if isinstance(x, str):
-            # allow "7" or "7.0"
-            if x.replace(".", "", 1).isdigit():
-                return int(float(x))
-        return int(x)  # type: ignore[arg-type]
     except Exception:
         return default
 
@@ -174,17 +150,14 @@ def _split_lines_semicolons(s: str) -> List[str]:
 
 
 def _coerce_for_model_like_r1_r3(data: Dict[str, Any]) -> Dict[str, Any]:
-    """lenient numeric/text casts that don't change structure.
-    keep this minimal to honor 'fail fast'—no structural rewrites to 'answers'.
-    """
     d = dict(data)
 
-    # p_iraki / confidence / confidence_in_verdict / ci_iraki: cast to float(s)
     for key in ("p_iraki", "confidence", "confidence_in_verdict"):
         if key in d and not isinstance(d[key], (int, float)):
             f = _to_float(d[key])
             if f is not None:
                 d[key] = f
+
     if (
         "ci_iraki" in d
         and isinstance(d["ci_iraki"], (list, tuple))
@@ -195,7 +168,6 @@ def _coerce_for_model_like_r1_r3(data: Dict[str, Any]) -> Dict[str, Any]:
         if lo is not None and hi is not None:
             d["ci_iraki"] = [lo, hi]
 
-    # verdict: accept yes/no/true/false/positive/negative → bool
     if "verdict" in d and not isinstance(d["verdict"], bool):
         if isinstance(d["verdict"], str):
             val = d["verdict"].strip().lower()
@@ -206,7 +178,6 @@ def _coerce_for_model_like_r1_r3(data: Dict[str, Any]) -> Dict[str, Any]:
             elif val in falsey:
                 d["verdict"] = False
 
-    # recommendations: accept string → list[str]
     recs = d.get("recommendations")
     if isinstance(recs, str):
         items = _split_lines_semicolons(recs)
@@ -215,14 +186,11 @@ def _coerce_for_model_like_r1_r3(data: Dict[str, Any]) -> Dict[str, Any]:
     return d
 
 
-# --------------------------- dump helpers (optional) ---------------------------
-
 _CASE_RE = re.compile(r'-\s*"case_id":\s*"([^"]+)"')
 _EXP_RE = re.compile(r'-\s*"expert_id":\s*"([^"]+)"')
 
 
 def _ids_from_prompt(prompt: str) -> tuple[str, str]:
-    """best-effort extraction of (case_id, expert_id) from the 'IMPORTANT' block."""
     case_id = "unknown_case"
     expert_id = "unknown_expert"
     m1 = _CASE_RE.search(prompt)
@@ -251,7 +219,6 @@ def _dump_write(base: Optional[Path], rel: str, content: str) -> None:
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content)
     except Exception:
-        # never let dumping break validation
         pass
 
 
@@ -266,9 +233,6 @@ def _dump_json(base: Optional[Path], rel: str, obj: Any) -> None:
         pass
 
 
-# --------------------------- llm → schema validator ---------------------------
-
-
 def call_llm_with_schema(
     *,
     response_model: Type[T],
@@ -281,16 +245,15 @@ def call_llm_with_schema(
     retry_factor: Optional[float] = None,
     reserve_tokens: Optional[int] = None,
     max_tokens: Optional[int] = None,
-    expected_qids: Optional[List[str]] = None,  # strict qid set/order for answers[]
+    expected_qids: Optional[List[str]] = None,
 ) -> T:
     """call backend, extract first json, validate with response_model.
 
-    importance semantics in the contract:
-      - importance is the question's CONTRIBUTION WEIGHT to the overall assessment,
-        not a second score. allocate integer points across questions so the TOTAL=100.
+    importance semantics:
+      - importance is the per-question CONTRIBUTION WEIGHT to the overall assessment
+        (not a score). Sum of all importance values MUST equal 100.
     """
 
-    # resolve policy
     ctx = int(
         ctx_window if ctx_window is not None else _discover_context_window(backend)
     )
@@ -323,13 +286,11 @@ def call_llm_with_schema(
             },
         )
 
-    # optional dumping setup (env only; no api change)
     dump_root_env = os.getenv("DELPHEA_OUT_DIR")
     base: Optional[Path] = Path(dump_root_env) if dump_root_env else None
     case_id, expert_id = _ids_from_prompt(prompt_text)
     round_key = _round_key_from_model(response_model)
 
-    # write a one-time meta file per call (best-effort)
     _dump_json(
         base,
         f"{case_id}/experts/{expert_id}/{round_key}/meta.json",
@@ -353,27 +314,23 @@ def call_llm_with_schema(
             return backend.get_completions(prompt, temperature=temperature, max_tokens=tokens)  # type: ignore[attr-defined]
         raise RuntimeError("llm backend does not expose a known generation method")
 
-    # build a helpful, strict contract snippet for the model
     try:
-        model_keys = list(response_model.model_fields.keys())  # pydantic v2
+        model_keys = list(response_model.model_fields.keys())
     except Exception:
         model_keys = []
 
-    # hide audit fields that have defaults so we don't force the model to emit them
-    hidden_keys = {"importance_total", "importance_normalized"}
-    visible_keys = [k for k in model_keys if k not in hidden_keys]
-
     contract = (
         "\n\nOUTPUT CONTRACT — return ONLY one JSON object matching the schema.\n"
-        + (f"- top-level keys should be: {visible_keys}\n" if visible_keys else "")
+        + (f"- top-level keys should be: {model_keys}\n" if model_keys else "")
         + "- no prose, no markdown fences.\n"
         + "- include exact case_id and expert_id fields if present in the schema.\n"
         + "- 'ci_iraki' must be [lower, upper] floats if present.\n"
-        + "- if 'answers' is required: it MUST be an array of objects with keys "
-        "qid, score (1..9), reason, confidence (0..1), importance (integer).\n"
-        + "- importance is the question's CONTRIBUTION WEIGHT to the overall assessment "
-        "(not the same as the score). allocate integer points so the TOTAL across ALL "
-        "questions is EXACTLY 100 (constant-sum). zeros are allowed.\n"
+        + "- per-question fields MUST be five parallel dicts keyed by the question IDs, with IDENTICAL keys and order:\n"
+        + "  * 'scores': integer 1..9\n"
+        + "  * 'rationale': non-empty string (your argument)\n"
+        + "  * 'evidence': non-empty string (supporting snippet/paragraph)\n"
+        + "  * 'q_confidence': float in [0,1]\n"
+        + "  * 'importance': non-negative integer; TOTAL across ALL questions MUST equal 100 (contribution weights; zeros allowed)\n"
     )
 
     last_err: Optional[ValidationError] = None
@@ -383,30 +340,9 @@ def call_llm_with_schema(
         target_out = int(out_init * (rfactor**attempt))
         tokens_for_attempt = max(min(target_out, available_out), minimal_out)
 
-        if attempt == 0:
-            prompt = f"{prompt_text}{contract}"
-        else:
-            err_types = {e["type"] for e in (last_err.errors() if last_err else [])}
-            if {"json_unbalanced", "json_missing_object"} & err_types and last_raw:
-                partial = (
-                    last_raw.strip() if isinstance(last_raw, str) else str(last_raw)
-                )
-                if len(partial) > 6000:
-                    partial = partial[-6000:]
-                prompt = (
-                    f"{prompt_text}{contract}\n"
-                    "the previous output was a PARTIAL json object. "
-                    "complete it to a SINGLE valid json object that matches the contract exactly.\n\n"
-                    "partial_json:\n```json\n"
-                    f"{partial}\n```"
-                )
-            else:
-                prompt = f"{prompt_text}{contract}"
-
-        raw = _gen_once(prompt, tokens_for_attempt)
+        raw = _gen_once(f"{prompt_text}{contract}", tokens_for_attempt)
         last_raw = raw
 
-        # dump raw attempt (optional)
         _dump_write(
             base,
             f"{case_id}/experts/{expert_id}/{round_key}/attempt-{attempt}.raw.txt",
@@ -417,20 +353,16 @@ def call_llm_with_schema(
             json_text = _extract_first_json_object(raw)
             data = json.loads(json_text)
 
-            # minimal numeric/text coercions
             if isinstance(data, dict):
                 data = _coerce_for_model_like_r1_r3(data)
 
-            # pydantic v2 context so models can enforce expected qids and order
             if hasattr(response_model, "model_validate"):
                 model = response_model.model_validate(
-                    data,
-                    context={"expected_qids": expected_qids or []},
+                    data, context={"expected_qids": expected_qids or []}
                 )
             else:
-                model = response_model(**data)  # fallback
+                model = response_model(**data)
 
-            # dump final validated json (optional)
             try:
                 payload = model.model_dump() if hasattr(model, "model_dump") else dict(model)  # type: ignore[arg-type]
             except Exception:
@@ -477,12 +409,6 @@ def call_llm_with_schema(
     raise last_err
 
 
-# ------------------------- public: payload validators -------------------------
-# these helpers validate dict payloads that purport to implement the new answers[] contract.
-# they are useful for non-LLM paths (e.g., loading saved json); the LLM path should rely on
-# pydantic model validation via call_llm_with_schema().
-
-
 def _require_keys(obj: Dict[str, Any], keys: Iterable[str], title: str) -> None:
     missing = [k for k in keys if k not in obj]
     if missing:
@@ -526,135 +452,120 @@ def _validate_prob_triplet(
         raise ValidationError.from_exception_data(title=title, line_errors=errs)
 
 
-def _validate_answers_array(
-    answers: Any, *, expected_qids: Optional[List[str]], title: str
+def _validate_parallel_qdicts(
+    payload: Dict[str, Any], expected_qids: Optional[List[str]], title: str
 ) -> None:
-    # structural checks for answers[]
-    if not isinstance(answers, list) or not answers:
-        _raise_ve(
-            title,
-            etype="type_error",
-            msg="answers must be a non-empty array",
-            loc=("answers",),
-            inp=answers,
-        )
-
-    qids: List[str] = []
-    importances: List[int] = []
-
-    for idx, item in enumerate(answers):
-        if not isinstance(item, dict):
+    """Validate five parallel per-question dicts and importance constant-sum=100."""
+    for k in ("scores", "rationale", "evidence", "q_confidence", "importance"):
+        v = payload.get(k)
+        if not isinstance(v, dict) or not v:
             _raise_ve(
                 title,
                 etype="type_error",
-                msg=f"answers[{idx}] must be an object",
-                loc=("answers", idx),
-                inp=item,
+                msg=f"{k} must be a non-empty dict keyed by qid",
+                loc=(k,),
+                inp=v,
             )
-        # required keys
-        for k in ("qid", "score", "reason", "confidence", "importance"):
-            if k not in item:
+
+    scores = payload["scores"]
+    rationale = payload["rationale"]
+    evidence = payload["evidence"]
+    q_conf = payload["q_confidence"]
+    imp = payload["importance"]
+
+    def _keys(d: Dict[str, Any]) -> List[str]:
+        try:
+            return list(d.keys())
+        except Exception:
+            return sorted(list(d.keys()))
+
+    ks_scores = _keys(scores)
+    ks_rationale = _keys(rationale)
+    ks_evidence = _keys(evidence)
+    ks_qc = _keys(q_conf)
+    ks_imp = _keys(imp)
+
+    if not (ks_scores == ks_rationale == ks_evidence == ks_qc == ks_imp):
+        _raise_ve(
+            title,
+            etype="qid_mismatch",
+            msg="scores/rationale/evidence/q_confidence/importance must have IDENTICAL qid lists and order",
+            loc=("scores", "rationale", "evidence", "q_confidence", "importance"),
+            inp={
+                "scores": ks_scores,
+                "rationale": ks_rationale,
+                "evidence": ks_evidence,
+                "q_confidence": ks_qc,
+                "importance": ks_imp,
+            },
+        )
+
+    if expected_qids:
+        if ks_scores != expected_qids:
+            missing = sorted(set(expected_qids) - set(ks_scores))
+            extra = sorted(set(ks_scores) - set(expected_qids))
+            _raise_ve(
+                title,
+                etype="qid_order_error",
+                msg=f"qid order must match questionnaire. missing={missing} extra={extra}",
+                loc=("scores",),
+                inp=ks_scores,
+            )
+
+    for qid, s in scores.items():
+        if not isinstance(s, int) or not (1 <= s <= 9):
+            _raise_ve(
+                title,
+                etype="range_error",
+                msg=f"scores[{qid}] must be integer 1..9",
+                loc=("scores", qid),
+                inp=s,
+            )
+
+    for name, dct in (("rationale", rationale), ("evidence", evidence)):
+        for qid, txt in dct.items():
+            if not isinstance(txt, str) or not txt.strip():
                 _raise_ve(
                     title,
-                    etype="missing_keys",
-                    msg=f"answers[{idx}] missing required key '{k}'",
-                    loc=("answers", idx, k),
-                    inp=item,
+                    etype="type_error",
+                    msg=f"{name}[{qid}] must be a non-empty string",
+                    loc=(name, qid),
+                    inp=txt,
                 )
 
-        # qid
-        qid = item["qid"]
-        if not isinstance(qid, str) or not qid.strip():
-            _raise_ve(
-                title,
-                etype="type_error",
-                msg="qid must be a non-empty string",
-                loc=("answers", idx, "qid"),
-                inp=qid,
-            )
-        qids.append(qid)
-
-        # score 1..9
-        sc = item["score"]
-        if not isinstance(sc, int) or not (1 <= sc <= 9):
-            _raise_ve(
-                title,
-                etype="range_error",
-                msg="score must be integer in 1..9",
-                loc=("answers", idx, "score"),
-                inp=sc,
-            )
-
-        # reason non-empty
-        rs = item["reason"]
-        if not isinstance(rs, str) or not rs.strip():
-            _raise_ve(
-                title,
-                etype="type_error",
-                msg="reason must be a non-empty string",
-                loc=("answers", idx, "reason"),
-                inp=rs,
-            )
-
-        # confidence 0..1
-        cf = item["confidence"]
+    for qid, c in q_conf.items():
         try:
-            cf_val = float(cf)
+            c_val = float(c)
         except Exception:
-            cf_val = -1.0
-        if not (0.0 <= cf_val <= 1.0):
+            c_val = -1.0
+        if not (0.0 <= c_val <= 1.0):
             _raise_ve(
                 title,
                 etype="range_error",
-                msg="confidence must be in [0,1]",
-                loc=("answers", idx, "confidence"),
-                inp=cf,
+                msg=f"q_confidence[{qid}] must be in [0,1]",
+                loc=("q_confidence", qid),
+                inp=c,
             )
 
-        # importance int >=0 (constant-sum checked below)
-        imp = item["importance"]
-        if not isinstance(imp, int) or imp < 0:
+    total = 0
+    for qid, w in imp.items():
+        if not isinstance(w, int) or w < 0:
             _raise_ve(
                 title,
                 etype="range_error",
-                msg="importance must be a non-negative integer",
-                loc=("answers", idx, "importance"),
-                inp=imp,
+                msg=f"importance[{qid}] must be a non-negative integer",
+                loc=("importance", qid),
+                inp=w,
             )
-        importances.append(imp)
+        total += w
 
-    # duplicates
-    if len(set(qids)) != len(qids):
-        _raise_ve(
-            title,
-            etype="duplicate_qids",
-            msg="duplicate qids found in answers",
-            loc=("answers",),
-            inp=qids,
-        )
-
-    # expected qids and order
-    if expected_qids is not None and len(expected_qids) > 0:
-        if qids != expected_qids:
-            missing = sorted(set(expected_qids) - set(qids))
-            extra = sorted(set(qids) - set(expected_qids))
-            _raise_ve(
-                title,
-                etype="qid_mismatch",
-                msg=f"answers qids must match questionnaire order. missing={missing} extra={extra}",
-                loc=("answers",),
-                inp=qids,
-            )
-
-    # constant-sum 100
-    total = sum(importances)
     if total != 100:
         _raise_ve(
             title,
             etype="importance_sum_error",
             msg=f"importance must sum to 100 (got {total})",
-            loc=("answers",),
-            inp=importances,
+            loc=("importance",),
+            inp=list(imp.values()),
         )
 
 
@@ -665,7 +576,13 @@ def validate_round1_payload(
     _require_keys(
         payload,
         (
-            "answers",
+            "case_id",
+            "expert_id",
+            "scores",
+            "rationale",
+            "evidence",
+            "q_confidence",
+            "importance",
             "p_iraki",
             "ci_iraki",
             "confidence",
@@ -675,17 +592,12 @@ def validate_round1_payload(
         title,
     )
 
-    # answers[] contract
-    _validate_answers_array(
-        payload["answers"], expected_qids=expected_qids, title=title
-    )
+    _validate_parallel_qdicts(payload, expected_qids, title)
 
-    # probability triplet
     _validate_prob_triplet(
         payload["p_iraki"], payload["ci_iraki"], payload["confidence"], title=title
     )
 
-    # ddx: ≥2 strings
     ddx = payload.get("differential_diagnosis")
     if (
         not isinstance(ddx, list)
@@ -699,13 +611,12 @@ def validate_round1_payload(
             inp=ddx,
         )
 
-    # clinical_reasoning: non-empty string
     cr = payload.get("clinical_reasoning")
     if not isinstance(cr, str) or not cr.strip():
         _raise_ve(
             title,
             etype="type_error",
-            msg="clinical_reasoning must be a non-empty string",
+            msg="clinical_reasoning must be a non-empty string (≥200 chars recommended)",
             loc=("clinical_reasoning",),
             inp=cr,
         )
@@ -718,7 +629,13 @@ def validate_round3_payload(
     _require_keys(
         payload,
         (
-            "answers",
+            "case_id",
+            "expert_id",
+            "scores",
+            "rationale",
+            "evidence",
+            "q_confidence",
+            "importance",
             "p_iraki",
             "ci_iraki",
             "confidence",
@@ -731,17 +648,12 @@ def validate_round3_payload(
         title,
     )
 
-    # answers[] contract
-    _validate_answers_array(
-        payload["answers"], expected_qids=expected_qids, title=title
-    )
+    _validate_parallel_qdicts(payload, expected_qids, title)
 
-    # probability triplet
     _validate_prob_triplet(
         payload["p_iraki"], payload["ci_iraki"], payload["confidence"], title=title
     )
 
-    # changes_from_round1: dict
     ch = payload.get("changes_from_round1")
     if not isinstance(ch, dict):
         _raise_ve(
@@ -752,7 +664,6 @@ def validate_round3_payload(
             inp=ch,
         )
 
-    # final diagnosis: non-empty str
     fd = payload.get("final_diagnosis")
     if not isinstance(fd, str) or not fd.strip():
         _raise_ve(
@@ -763,7 +674,6 @@ def validate_round3_payload(
             inp=fd,
         )
 
-    # confidence_in_verdict: [0,1]
     civ = payload.get("confidence_in_verdict")
     if not isinstance(civ, (int, float)) or not (0.0 <= float(civ) <= 1.0):
         _raise_ve(
@@ -774,7 +684,6 @@ def validate_round3_payload(
             inp=civ,
         )
 
-    # recommendations: non-empty list[str]
     recs = payload.get("recommendations")
     if (
         not isinstance(recs, list)
@@ -790,11 +699,7 @@ def validate_round3_payload(
         )
 
 
-# --------------------- public: structured debate logging ----------------------
-
-
 def log_debate_status(*args, **kwargs) -> None:
-    """structured logger for debate lifecycle events (compat shim)."""
     logger = kwargs.pop("logger", args[0] if args else None)
     if not isinstance(logger, logging.Logger):
         raise TypeError(

@@ -99,8 +99,12 @@ class QuestionnaireMsg(BaseModel):
 class ExpertRound1Reply(BaseModel):
     """Expert's initial independent assessment of irAKI likelihood.
 
-    Captures complete clinical reasoning including scored responses,
-    evidence citations, probability estimates, and differential diagnosis.
+    Four parallel per-question dicts keyed by qid:
+      - scores: 1..9 Likert signal for THIS question
+      - rationale: concise argument/explanation for THIS question
+      - evidence: supporting snippet/paragraph (verbatim or note-anchored)
+      - q_confidence: 0..1 certainty for THIS question
+      - importance: non-negative int; TOTAL importance across qids = 100 (contribution weight)
     """
 
     model_config = ConfigDict(strict=True, extra="forbid")
@@ -109,33 +113,29 @@ class ExpertRound1Reply(BaseModel):
     case_id: str
     expert_id: str
 
-    # scored assessments (1-10 scale per question)
+    # per-question assessments
     scores: Dict[str, int]
+    rationale: Dict[str, str]
+    evidence: Dict[str, str]
+    q_confidence: Dict[str, float]
+    importance: Dict[str, int]
 
-    # evidence and reasoning
-    evidence: Dict[str, str]  # question_id -> evidence text
-    clinical_reasoning: str  # overall reasoning narrative
+    # overall probability assessment
+    p_iraki: float = Field(ge=0.0, le=1.0)
+    ci_iraki: Tuple[float, float]
+    confidence: float = Field(ge=0.0, le=1.0)
 
-    # probability assessment
-    p_iraki: float = Field(ge=0.0, le=1.0)  # P(irAKI)
-    ci_iraki: Tuple[float, float]  # 95% CI
-    confidence: float = Field(ge=0.0, le=1.0)  # self-assessed confidence
-
-    # differential diagnosis
-    differential_diagnosis: List[str]  # alternative diagnoses considered
-    primary_diagnosis: Optional[str] = None  # most likely diagnosis
-
-    # optional specialty-specific insights
-    specialty_notes: Optional[str] = None
-    literature_citations: List[str] = Field(default_factory=list)
+    # narrative & differential
+    clinical_reasoning: str
+    differential_diagnosis: List[str]
+    primary_diagnosis: Optional[str] = None
 
     @field_validator("scores")
     @classmethod
     def validate_scores(cls, v: Dict[str, int]) -> Dict[str, int]:
-        """Ensure scores are in valid range."""
         for q_id, score in v.items():
-            if not 1 <= score <= 10:
-                raise ValueError(f"Score for {q_id} must be 1-10, got {score}")
+            if not 1 <= score <= 9:
+                raise ValueError(f"Score for {q_id} must be 1-9, got {score}")
         return v
 
     @field_validator("ci_iraki", mode="before")
@@ -145,12 +145,51 @@ class ExpertRound1Reply(BaseModel):
             return (float(v[0]), float(v[1]))
         return v
 
-    @field_validator("differential_diagnosis")
+
+class ExpertRound3Reply(BaseModel):
+    """Expert's final consensus assessment after debate."""
+
+    model_config = ConfigDict(strict=True, extra="forbid")
+
+    # identification
+    case_id: str
+    expert_id: str
+
+    # per-question assessments
+    scores: Dict[str, int]
+    rationale: Dict[str, str]
+    evidence: Dict[str, str]
+    q_confidence: Dict[str, float]
+    importance: Dict[str, int]
+
+    # probability assessment
+    p_iraki: float = Field(ge=0.0, le=1.0)
+    ci_iraki: Tuple[float, float]
+    confidence: float = Field(ge=0.0, le=1.0)
+
+    # deltas & verdict
+    changes_from_round1: Dict[str, str]
+    verdict: bool
+    final_diagnosis: str
+    confidence_in_verdict: float = Field(ge=0.0, le=1.0)
+
+    # recommendations
+    recommendations: List[str]
+
+    @field_validator("scores")
     @classmethod
-    def validate_differential(cls, v: List[str]) -> List[str]:
-        """Ensure differential diagnosis is provided."""
-        if not v or len([x for x in v if isinstance(x, str) and x.strip()]) < 2:
-            raise ValueError("Provide ≥2 differential diagnoses")
+    def validate_scores(cls, v: Dict[str, int]) -> Dict[str, int]:
+        for q_id, score in v.items():
+            if not 1 <= score <= 9:
+                raise ValueError(f"Score for {q_id} must be 1-9, got {score}")
+        return v
+
+    @field_validator("ci_iraki", mode="before")
+    @classmethod
+    def _coerce_ci_r3(cls, v: Any) -> Tuple[float, float]:
+        if isinstance(v, (list, tuple)) and len(v) == 2:
+            return (float(v[0]), float(v[1]))
+        return v
 
 
 class DebatePrompt(BaseModel):
@@ -210,68 +249,6 @@ class DebateComment(BaseModel):
         """Ensure comment has content."""
         if not v or len(v.strip()) < 10:
             raise ValueError("Debate comment must be substantive (>10 chars)")
-        return v
-
-
-class ExpertRound3Reply(BaseModel):
-    """Expert's final consensus assessment after debate.
-
-    Incorporates learnings from debate with updated reasoning and
-    final irAKI classification verdict.
-    """
-
-    model_config = ConfigDict(strict=True, extra="forbid")
-
-    # identification
-    case_id: str
-    expert_id: str
-
-    # updated assessments
-    scores: Dict[str, int]
-    evidence: Dict[str, str]
-
-    # final probability assessment
-    p_iraki: float = Field(ge=0.0, le=1.0)
-    ci_iraki: Tuple[float, float]
-    confidence: float = Field(ge=0.0, le=1.0)
-
-    # changes from round 1
-    changes_from_round1: Dict[str, str]  # what changed and why
-    debate_influence: Optional[str] = None  # how debate affected assessment
-
-    # final clinical judgment
-    verdict: bool  # True = irAKI, False = other cause
-    final_diagnosis: str  # specific diagnosis
-    confidence_in_verdict: float = Field(ge=0.0, le=1.0)
-
-    # clinical recommendations
-    recommendations: List[str]  # treatment/monitoring recommendations
-    biopsy_recommendation: Optional[str] = None  # if biopsy indicated
-    steroid_recommendation: Optional[str] = None  # steroid treatment guidance
-    ici_rechallenge_risk: Optional[str] = None  # risk assessment for ICI restart
-
-    @field_validator("scores")
-    @classmethod
-    def validate_scores(cls, v: Dict[str, int]) -> Dict[str, int]:
-        """Ensure scores are in valid range."""
-        for q_id, score in v.items():
-            if not 1 <= score <= 9:  # was <= 10
-                raise ValueError(f"Score for {q_id} must be 1-9, got {score}")
-        return v
-
-    @field_validator("ci_iraki", mode="before")
-    @classmethod
-    def _coerce_ci_r3(cls, v: Any) -> Tuple[float, float]:
-        if isinstance(v, (list, tuple)) and len(v) == 2:
-            return (float(v[0]), float(v[1]))
-        return v
-
-    @field_validator("recommendations")
-    @classmethod
-    def validate_recommendations(cls, v: List[str]) -> List[str]:
-        """Ensure clinical recommendations are provided."""
-        if not v:
-            raise ValueError("Must provide at least one clinical recommendation")
         return v
 
 

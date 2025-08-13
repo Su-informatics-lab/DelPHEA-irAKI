@@ -68,25 +68,25 @@ class Expert:
         repair_hint: Optional[str] = None,  # reserved for future use
     ) -> AssessmentR1:
         """produce a round-1 assessment using strict pydantic validation at the boundary."""
-        # validate questionnaire early (fail loud if malformed/missing)
-        load_qids(questionnaire_path)
+        # validate questionnaire and capture expected qids (fail loud if malformed/missing)
+        expected_qids: List[str] = load_qids(questionnaire_path)
 
         info = self._extract_case_strings(case)
         prompt_text = format_round1_prompt(
             expert_name=self._expert_name(),
-            expert_id=self.expert_id,
+            expert_id=self.expert_id,  # accepted by formatter via **_ sink
             specialty=self.specialty,
             case_id=info["case_id"],
             demographics=info["demographics"],
             clinical_notes=info["clinical_notes"],
             qpath=questionnaire_path,
         )
-        # belt-and-suspenders: require identifiers in the JSON output (fixed quoting)
+        # require identifiers; per-question dicts contract is enforced by validators
         prompt_text += (
-            "\n\nIMPORTANT: In your JSON output, you MUST include precisely these keys:\n"
+            "\n\nIMPORTANT: in your JSON output, include these exact keys for identification:\n"
             '- "case_id": "{case_id}"\n'
             '- "expert_id": "{expert_id}"\n'
-            "Return ONLY valid JSON."
+            "return ONLY valid JSON."
         ).format(case_id=info["case_id"], expert_id=self.expert_id)
 
         # dump prompt (optional)
@@ -101,6 +101,7 @@ class Expert:
             prompt_text=prompt_text,
             backend=self.backend,
             temperature=self.temperature_r1,
+            expected_qids=expected_qids,
         )
 
         # harden: inject identifiers if the model omitted them
@@ -128,25 +129,25 @@ class Expert:
         repair_hint: Optional[str] = None,  # reserved for future use
     ) -> AssessmentR3:
         """produce a round-3 reassessment using strict pydantic validation at the boundary."""
-        load_qids(questionnaire_path)
+        expected_qids: List[str] = load_qids(questionnaire_path)
 
         info = self._extract_case_strings(case)
         prompt_text = format_round3_prompt(
             expert_name=self._expert_name(),
-            expert_id=self.expert_id,
+            expert_id=self.expert_id,  # accepted by formatter via **_ sink
             specialty=self.specialty,
             case_id=info["case_id"],
             demographics=info["demographics"],
             clinical_notes=info["clinical_notes"],
             qpath=questionnaire_path,
-            debate_ctx=debate_context,  # tolerated by format_round3_prompt (**_ sink)
+            debate_ctx=debate_context,  # tolerated by formatter (**_ sink)
         )
-        # require identifiers again for consistency (fixed quoting)
+        # require identifiers again for consistency
         prompt_text += (
-            "\n\nIMPORTANT: In your JSON output, you MUST include precisely these keys:\n"
+            "\n\nIMPORTANT: in your JSON output, include these exact keys for identification:\n"
             '- "case_id": "{case_id}"\n'
             '- "expert_id": "{expert_id}"\n'
-            "Return ONLY valid JSON."
+            "return ONLY valid JSON."
         ).format(case_id=info["case_id"], expert_id=self.expert_id)
 
         # dump prompt & r3 context (optional)
@@ -166,6 +167,7 @@ class Expert:
             prompt_text=prompt_text,
             backend=self.backend,
             temperature=self.temperature_r3,
+            expected_qids=expected_qids,  # strict enforcement of qid set and order
         )
 
         # harden: inject identifiers if the model omitted them
@@ -244,7 +246,7 @@ class Expert:
     def _coerce_debate_turn(self, raw: Any, *, qid: str, round_no: int) -> DebateTurn:
         """best-effort coercion of backend reply into DebateTurn fields.
 
-        Guarantees:
+        guarantees:
           - expert_id, qid, round_no
           - text: uses raw['text'] or raw['content'] or raw['argument'] or raw_string
           - satisfied: bool (default heuristic based on presence of substantive text)

@@ -6,11 +6,12 @@
   "checklist": [
     "output is a single valid JSON object; no markdown fences or commentary.",
     "echo case_id and expert_id exactly as provided.",
-    "scores are integers 1-10 for the provided question IDs only.",
+    "per-question dicts exist and share identical qids & order: scores, rationale, evidence, q_confidence, importance.",
+    "score is an integer in 1-9 for each question id listed.",
+    "rationale[qid] is a concise argument; evidence[qid] is a supporting snippet/paragraph.",
+    "importance is an integer CONTRIBUTION WEIGHT (not a score) and the sum across ALL questions is EXACTLY 100 (zeros allowed).",
     "0 <= ci_iraki[0] <= p_iraki <= ci_iraki[1] <= 1.",
     "confidence and confidence_in_verdict are floats in [0,1].",
-    "clinical_reasoning length >= 200 characters.",
-    "evidence[qid] is a non-empty sentence per question.",
     "differential_diagnosis contains at least 2 items.",
     "primary_diagnosis is non-empty (Round 1); final_diagnosis is non-empty (Round 3)."
   ],
@@ -18,8 +19,11 @@
   "json_schema": {
     "case_id": "string (echo exactly: {case_id})",
     "expert_id": "string (echo exactly: {expert_id})",
-    "scores": "object {qid: int in [1,10]}",
-    "evidence": "object {qid: string}",
+    "scores": "object {qid: int in [1,9]}",
+    "rationale": "object {qid: string (concise argument)}",
+    "evidence": "object {qid: string (supporting snippet/paragraph)}",
+    "q_confidence": "object {qid: float in [0,1]}",
+    "importance": "object {qid: non-negative int}; TOTAL across all qids MUST equal 100 (contribution weights; zeros allowed)",
     "p_iraki": "float in [0,1]",
     "ci_iraki": "array [lower, upper] where lower and upper are floats in [0,1]",
     "confidence": "float in [0,1]",
@@ -30,14 +34,14 @@
 
   "rounds": {
     "r1": {
-      "preamble": "Round 1: independent assessment. STRICT JSON only.",
-      "instructions": "Score each question (1-10) and provide one-sentence evidence per question. Provide p_iraki with a realistic 95% CI and overall confidence. Provide clinical_reasoning (>=200 chars), a >=2-item differential_diagnosis, and a primary_diagnosis. Do not include any fields beyond the schema.",
-      "base_prompt": "You are {expert_name}, a {specialty} specialist.\n\nCASE {case_id}\n\nDEMOGRAPHICS\n{demographics}\n\nAGGREGATED CLINICAL NOTES\n{clinical_notes}\n\nASSESSMENT QUESTIONS (IDs with text)\n{questions}\n\nTask: Provide your Round-1 assessment as STRICT JSON per the schema.",
       "json_schema": {
         "case_id": "string (echo exactly: {case_id})",
         "expert_id": "string (echo exactly: {expert_id})",
-        "scores": "object {qid: int in [1,10]}",
-        "evidence": "object {qid: string}",
+        "scores": "object {qid: int in [1,9]}",
+        "rationale": "object {qid: string (concise argument)}",
+        "evidence": "object {qid: string (supporting snippet/paragraph)}",
+        "q_confidence": "object {qid: float in [0,1]}",
+        "importance": "object {qid: non-negative int}; TOTAL across all qids MUST equal 100 (contribution weights; zeros allowed)",
         "p_iraki": "float in [0,1]",
         "ci_iraki": "array [lower, upper] where lower and upper are floats in [0,1]",
         "confidence": "float in [0,1]",
@@ -46,28 +50,23 @@
         "primary_diagnosis": "string"
       }
     },
-
     "r3": {
-      "preamble": "Round 3: final assessment after debate. STRICT JSON only.",
-      "instructions": "Integrate debate insights and moderator highlights. Update scores and evidence as warranted. Provide p_iraki, 95% CI, and confidence consistent with your final judgment. Fill changes_from_round1 with brief justifications; set verdict (true=irAKI, false=other) and final_diagnosis; provide at least one recommendation.",
-      "base_prompt": "You are {expert_name}, a {specialty} specialist.\n\nFINAL ASSESSMENT — CASE {case_id}\n\nDEMOGRAPHICS\n{demographics}\n\nAGGREGATED CLINICAL NOTES\n{clinical_notes}\n\nASSESSMENT QUESTIONS (IDs with text)\n{questions}\n\nContext (may include your Round-1 summary, peer feedback, debate status/plan) will appear above. Provide your Round-3 assessment as STRICT JSON per the schema.",
       "json_schema": {
         "case_id": "string (echo exactly: {case_id})",
         "expert_id": "string (echo exactly: {expert_id})",
-        "scores": "object {qid: int in [1,10]}",
-        "evidence": "object {qid: string}",
+        "scores": "object {qid: int in [1,9]}",
+        "rationale": "object {qid: string (concise argument)}",
+        "evidence": "object {qid: string (supporting snippet/paragraph)}",
+        "q_confidence": "object {qid: float in [0,1]}",
+        "importance": "object {qid: non-negative int}; TOTAL across all qids MUST equal 100 (contribution weights; zeros allowed)",
         "p_iraki": "float in [0,1]",
         "ci_iraki": "array [lower, upper] where lower and upper are floats in [0,1]",
         "confidence": "float in [0,1]",
-        "changes_from_round1": "object {field_or_topic: string justification}",
-        "debate_influence": "string (optional)",
+        "changes_from_round1": "object {qid or 'overall': brief justification of changes}",
         "verdict": "boolean (true means irAKI, false means other)",
         "final_diagnosis": "string",
         "confidence_in_verdict": "float in [0,1]",
-        "recommendations": "array of string (>=1 item)",
-        "biopsy_recommendation": "string (optional)",
-        "steroid_recommendation": "string (optional)",
-        "ici_rechallenge_risk": "string (optional)"
+        "recommendations": "array of string (>=1 item)"
       }
     }
   }
