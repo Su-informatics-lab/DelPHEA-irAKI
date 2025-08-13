@@ -134,6 +134,8 @@ class DebateTurn(BaseModel):
     text: str
     citations: List[str] = Field(default_factory=list)
     satisfied: bool
+    revised_score: Optional[int] = None
+    handoff_to: Optional[str] = None
 
 
 class Consensus(BaseModel):

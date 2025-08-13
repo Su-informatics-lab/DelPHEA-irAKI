@@ -234,15 +234,7 @@ class LLMBackend:
           - minority_view: str
           - temperature: float
 
-        Returns:
-          dict suitable for models.DebateTurn(**dict), i.e.
-          {
-            "expert_id": "...",
-            "qid": "...",
-            "round_no": 2,
-            "text": "<plain argument>",
-            "satisfied": true
-          }
+        Returns: dict for models.DebateTurn(**dict)
         """
         expert_id = str(payload.get("expert_id") or "unknown_expert")
         specialty = str(payload.get("specialty") or "expert")
@@ -252,20 +244,20 @@ class LLMBackend:
         clinical_context = payload.get("clinical_context") or {}
         temperature = float(payload.get("temperature") or self.temperature_r2 or 0.3)
 
-        role_hint = ""
+        # role hint
         try:
-            r = (
-                clinical_context.get("role")
-                if isinstance(clinical_context, dict)
-                else None
+            role_hint = str(
+                (
+                    clinical_context.get("role")
+                    if isinstance(clinical_context, dict)
+                    else ""
+                )
+                or ""
             )
-            if r:
-                role_hint = str(r)
         except Exception:
             role_hint = ""
 
-        # peer history
-        peer_snippet = ""
+        # peer history snippet
         try:
             peer_turns = (
                 clinical_context.get("peer_turns")
@@ -312,9 +304,13 @@ class LLMBackend:
             f"{header}\n{role}\n{stage}\n{cid}\n\n"
             f"{mv}{hist}\n\n"
             "Write a concise, evidence-grounded argument (≈120–180 words) that advances the discussion.\n"
-            "- If you are majority: directly rebut the minority’s strongest claims with specific evidence.\n"
-            "- If you are minority (closing): address key rebuttals succinctly and clarify residual uncertainty.\n"
-            "Avoid repetition. No lists, no markdown, no JSON. Return PLAIN TEXT only."
+            "- If majority: directly rebut the minority’s strongest claims with specific evidence.\n"
+            "- If minority (closing/followup): address rebuttals succinctly and clarify residual uncertainty.\n"
+            "Avoid repetition. No lists, no markdown, no JSON. Return PLAIN TEXT only.\n\n"
+            "At the VERY END, append EXACTLY these 3 control lines (no extra words):\n"
+            "SATISFIED: yes|no\n"
+            "REVISED_SCORE: 1-9|same\n"
+            "HANDOFF: <expert_id>|none\n"
         )
 
         # optional dump root
@@ -352,38 +348,81 @@ class LLMBackend:
                 max_tokens=512,
                 temperature=temperature,
                 system="You are a clinical expert generating short, plain-text debate arguments. No markdown, no JSON.",
-                prefer_json=False,  # critical: force plain completion
+                prefer_json=False,  # force plain completion
             )
         except Exception:
             text = "Unable to generate debate content."
 
-        # normalize & guard against None, and salvage if JSON slipped through
+        # normalize & salvage if JSON slipped through
         try:
-            s = (text or "").strip()
+            raw = (text or "").strip()
         except Exception:
-            s = "Unable to generate debate content."
-        if s.startswith("{") and s.endswith("}"):
+            raw = "Unable to generate debate content."
+        if raw.startswith("{") and raw.endswith("}"):
             try:
-                obj = json.loads(s)
+                obj = json.loads(raw)
                 for key in ("text", "content", "argument", "message"):
                     if isinstance(obj.get(key), str) and obj.get(key).strip():
-                        s = obj[key].strip()
+                        raw = obj[key].strip()
                         break
                 else:
-                    s = json.dumps(obj, ensure_ascii=False)
+                    raw = json.dumps(obj, ensure_ascii=False)
             except Exception:
                 pass
 
-        if not s:
-            s = "No argument produced."
+        # parse control lines
+        import re
 
-        result = {
+        satisfied_flag: Optional[bool] = None
+        revised_score: Optional[int] = None
+        handoff_to: Optional[str] = None
+
+        try:
+            sat_m = re.search(r"(?mi)^\s*SATISFIED\s*:\s*(yes|no)\b", raw)
+            if sat_m:
+                satisfied_flag = sat_m.group(1).lower() == "yes"
+            rs_m = re.search(r"(?mi)^\s*REVISED_SCORE\s*:\s*(\d+|same)\b", raw)
+            if rs_m:
+                token = rs_m.group(1).lower()
+                if token.isdigit():
+                    v = int(token)
+                    if 1 <= v <= 9:
+                        revised_score = v
+            ho_m = re.search(r"(?mi)^\s*HANDOFF\s*:\s*([A-Za-z0-9_.-]+|none)\b", raw)
+            if ho_m:
+                hv = ho_m.group(1)
+                if hv.lower() != "none":
+                    handoff_to = hv
+        except Exception:
+            pass
+
+        # strip control lines from visible text
+        def _strip_ctrl(s: str) -> str:
+            def _is_ctrl(ln: str) -> bool:
+                u = ln.strip().upper()
+                return (
+                    u.startswith("SATISFIED:")
+                    or u.startswith("REVISED_SCORE:")
+                    or u.startswith("HANDOFF:")
+                )
+
+            return "\n".join(ln for ln in s.splitlines() if not _is_ctrl(ln)).strip()
+
+        visible_text = _strip_ctrl(raw) if raw else "No argument produced."
+
+        result: Dict[str, Any] = {
             "expert_id": expert_id,
             "qid": qid,
             "round_no": round_no,
-            "text": s,
-            "satisfied": True,
+            "text": visible_text,
         }
+        # only set satisfied if explicitly parsed; Expert._coerce_debate_turn will infer otherwise
+        if satisfied_flag is not None:
+            result["satisfied"] = bool(satisfied_flag)
+        if revised_score is not None:
+            result["revised_score"] = revised_score
+        if handoff_to:
+            result["handoff_to"] = handoff_to
 
         # dump turn (best-effort)
         self._dump_json(dump_base, f"{subdir}/turn.json", result)

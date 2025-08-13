@@ -11,8 +11,11 @@ multi-turn debate (this version)
 --------------------------------
 For each QID with disagreement:
   1) Minority opening (all experts selected by router for that QID)
-  2) Majority rebuttals (all other experts)
-  3) Minority closing (first minority expert)
+  2) Majority rebuttals (all other experts speak once)
+  3) Handoff-aware loop:
+       - speakers may append control lines: SATISFIED / REVISED_SCORE / HANDOFF
+       - moderator prioritizes requested HANDOFF targets if eligible
+       - experts exit when SATISFIED; loop ends when all satisfied, quiet, or capped
 Each turn receives the prior turns for that QID via clinical_context["peer_turns"].
 
 contracts
@@ -64,8 +67,11 @@ class Moderator:
         logger: logging.Logger | None = None,
         max_retries: int = 1,
         *,
-        debate_rounds: int = 3,  # 1: minority only; 2: +majority; 3: +minority closing
-        max_history_turns: int = 6,  # how many prior turns to pass into peer_turns
+        debate_rounds: int = 3,  # kept for metadata/back-compat
+        max_history_turns: int = 6,
+        max_turns_per_expert: int = 2,
+        max_total_turns_per_qid: int = 12,
+        quiet_turn_limit: int = 3,
     ):
         if not experts:
             raise ValueError("experts cannot be empty")
@@ -77,8 +83,13 @@ class Moderator:
         self.aggregator = aggregator
         self.logger = logger or logging.getLogger("moderator")
         self.max_retries = max_retries
-        self.debate_rounds = max(1, int(debate_rounds))
+
+        # debate controls
+        self.debate_rounds = max(1, int(debate_rounds))  # metadata only now
         self.max_history_turns = max(0, int(max_history_turns))
+        self.max_turns_per_expert = max(1, int(max_turns_per_expert))
+        self.max_total_turns_per_qid = max(1, int(max_total_turns_per_qid))
+        self.quiet_turn_limit = max(1, int(quiet_turn_limit))
 
         # basic expert id sanity
         ids = [getattr(e, "expert_id", None) for e in self.experts]
@@ -197,23 +208,18 @@ class Moderator:
         all_ids = [eid for eid, _ in r1]
         r1_by_id = {eid: a for eid, a in r1}
 
-        def _append_turn(qid: str, turn_dict: Dict[str, Any]) -> None:
-            transcripts.setdefault(qid, []).append(turn_dict)
-
         def _peer_history(qid: str) -> List[Dict[str, Any]]:
             hist = transcripts.get(qid, [])
             if self.max_history_turns <= 0:
                 return []
             return hist[-self.max_history_turns :]
 
-        # derive a simple minority_view summary per qid from r1 spread
+        # per-qid scheduling with handoffs
         for qid, minority_ids in plan.by_qid.items():
             if not minority_ids:
                 continue
-
             majority_ids = [eid for eid in all_ids if eid not in minority_ids]
 
-            # structured status: per-question "turn" (before collecting turns)
             log_debate_status(
                 logger=self.logger,
                 case_id=cid,
@@ -224,7 +230,7 @@ class Moderator:
                 meta={
                     "asked_experts": minority_ids,
                     "majority_candidates": majority_ids,
-                    "pattern": "minority→majority→minority",
+                    "pattern": "minority→majority→handoff-loop",
                 },
             )
 
@@ -238,84 +244,166 @@ class Moderator:
                 score = a.scores.get(qid, None)
                 minority_text.append(f"{eid}: score={score} evidence={ev}")
             mv = "\n".join(minority_text) or "minority perspective not available"
-            minority_views[qid] = mv  # expose the exact input to debate turns
+            minority_views[qid] = mv
 
-            # ---- Round A: Minority opening (all minority experts) ----
-            for eid in minority_ids:
-                e = self._expert_by_id(eid)
-                ctx = {
-                    "case": case,
-                    "peer_turns": _peer_history(qid),
-                    "role": "minority_open",
-                }
-                turn = e.debate(
-                    qid=qid,
-                    round_no=2,  # debate stage
-                    clinical_context=ctx,
-                    minority_view=mv,
+            # local state
+            state: Dict[str, Dict[str, Any]] = {
+                eid: {"satisfied": False, "turns": 0}
+                for eid in (minority_ids + majority_ids)
+            }
+            total_turns = 0
+            consecutive_satisfied = 0
+            pending_handoffs: List[str] = []
+
+            def _eligible(eid: str) -> bool:
+                st = state.get(eid)
+                return (
+                    bool(st)
+                    and (not st["satisfied"])
+                    and (st["turns"] < self.max_turns_per_expert)
                 )
-                td = turn.model_dump()
+
+            def _append_turn(eid: str, role: str, turn_obj: Any) -> None:
+                td = (
+                    turn_obj.model_dump()
+                    if hasattr(turn_obj, "model_dump")
+                    else dict(turn_obj or {})
+                )
                 td.update(
                     {
                         "expert_id": eid,
                         "qid": qid,
                         "turn_index": len(transcripts.get(qid, [])),
-                        "speaker_role": "minority",
+                        "speaker_role": role,
                     }
                 )
-                _append_turn(qid, td)
+                transcripts.setdefault(qid, []).append(td)
 
-            # ---- Round B: Majority rebuttals (all others) ----
-            if self.debate_rounds >= 2:
-                for eid in majority_ids:
-                    e = self._expert_by_id(eid)
-                    ctx = {
-                        "case": case,
-                        "peer_turns": _peer_history(qid),
-                        "role": "majority_rebuttal",
-                    }
-                    turn = e.debate(
-                        qid=qid,
-                        round_no=2,
-                        clinical_context=ctx,
-                        minority_view=mv,
-                    )
-                    td = turn.model_dump()
-                    td.update(
-                        {
-                            "expert_id": eid,
-                            "qid": qid,
-                            "turn_index": len(transcripts.get(qid, [])),
-                            "speaker_role": "majority",
-                        }
-                    )
-                    _append_turn(qid, td)
+                # satisfaction / revised score / handoff bookkeeping
+                if isinstance(td.get("handoff_to"), str):
+                    target = str(td["handoff_to"]).strip()
+                    if (
+                        target
+                        and target != eid
+                        and target in state
+                        and _eligible(target)
+                    ):
+                        pending_handoffs.insert(0, target)
 
-            # ---- Round C: Minority closing (first minority only) ----
-            if self.debate_rounds >= 3 and minority_ids:
-                closing_eid = minority_ids[0]
-                e = self._expert_by_id(closing_eid)
-                ctx = {
-                    "case": case,
-                    "peer_turns": _peer_history(qid),
-                    "role": "minority_closing",
-                }
-                turn = e.debate(
+                sat = bool(td.get("satisfied", False))
+                if sat:
+                    state[eid]["satisfied"] = True
+                state[eid]["turns"] += 1
+
+            # everyone speaks once: minority then majority
+            for eid in minority_ids:
+                if not _eligible(eid):
+                    continue
+                e = self._expert_by_id(eid)
+                t = e.debate(
                     qid=qid,
                     round_no=2,
-                    clinical_context=ctx,
+                    clinical_context={
+                        "case": case,
+                        "peer_turns": _peer_history(qid),
+                        "role": "minority_open",
+                    },
                     minority_view=mv,
                 )
-                td = turn.model_dump()
-                td.update(
-                    {
-                        "expert_id": closing_eid,
-                        "qid": qid,
-                        "turn_index": len(transcripts.get(qid, [])),
-                        "speaker_role": "minority",
-                    }
+                _append_turn(eid, "minority", t)
+                total_turns += 1
+                consecutive_satisfied = consecutive_satisfied + 1 if t.satisfied else 0
+                if total_turns >= self.max_total_turns_per_qid:
+                    break
+
+            if total_turns < self.max_total_turns_per_qid:
+                for eid in majority_ids:
+                    if not _eligible(eid):
+                        continue
+                    e = self._expert_by_id(eid)
+                    t = e.debate(
+                        qid=qid,
+                        round_no=2,
+                        clinical_context={
+                            "case": case,
+                            "peer_turns": _peer_history(qid),
+                            "role": "majority_rebuttal",
+                        },
+                        minority_view=mv,
+                    )
+                    _append_turn(eid, "majority", t)
+                    total_turns += 1
+                    consecutive_satisfied = (
+                        consecutive_satisfied + 1 if t.satisfied else 0
+                    )
+                    if total_turns >= self.max_total_turns_per_qid:
+                        break
+
+            # handoff-aware alternating loop
+            min_queue = [eid for eid in minority_ids if _eligible(eid)]
+            maj_queue = [eid for eid in majority_ids if _eligible(eid)]
+            i_min = i_maj = 0
+
+            while total_turns < self.max_total_turns_per_qid:
+                active = [eid for eid in state if _eligible(eid)]
+                if not active:
+                    break
+                if consecutive_satisfied >= self.quiet_turn_limit:
+                    break
+
+                # prioritize pending handoffs
+                next_eid = None
+                role = "handoff"
+                while pending_handoffs:
+                    cand = pending_handoffs.pop(0)
+                    if _eligible(cand):
+                        next_eid = cand
+                        break
+
+                # otherwise alternate minority→majority among active
+                if next_eid is None:
+                    role = None
+                    if i_min < len(min_queue):
+                        next_eid, role = min_queue[i_min], "minority_followup"
+                        i_min += 1
+                    elif i_maj < len(maj_queue):
+                        next_eid, role = maj_queue[i_maj], "majority_followup"
+                        i_maj += 1
+                    else:
+                        # recycle queues with still-eligible speakers
+                        min_queue = [eid for eid in minority_ids if _eligible(eid)]
+                        maj_queue = [eid for eid in majority_ids if _eligible(eid)]
+                        i_min = i_maj = 0
+                        if not min_queue and not maj_queue:
+                            break
+                        continue
+
+                e = self._expert_by_id(next_eid)
+                t = e.debate(
+                    qid=qid,
+                    round_no=2,
+                    clinical_context={
+                        "case": case,
+                        "peer_turns": _peer_history(qid),
+                        "role": role or "participant",
+                    },
+                    minority_view=mv,
                 )
-                _append_turn(qid, td)
+                _append_turn(
+                    next_eid,
+                    (
+                        "minority"
+                        if role and role.startswith("minority")
+                        else (
+                            "majority"
+                            if role and role.startswith("majority")
+                            else "participant"
+                        )
+                    ),
+                    t,
+                )
+                total_turns += 1
+                consecutive_satisfied = consecutive_satisfied + 1 if t.satisfied else 0
 
         # structured status: summary "end"
         log_debate_status(

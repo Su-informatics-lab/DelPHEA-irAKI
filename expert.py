@@ -249,8 +249,10 @@ class Expert:
         guarantees:
           - expert_id, qid, round_no
           - text: uses raw['text'] or raw['content'] or raw['argument'] or raw_string
-          - satisfied: bool (default heuristic based on presence of substantive text)
+          - satisfied: prefer explicit boolean; else heuristic based on text length
           - citations: list[str] if present else []
+          - revised_score: optional int
+          - handoff_to: optional str
         """
         # accept dict, pydantic-like, or json string
         if hasattr(raw, "model_dump"):
@@ -259,7 +261,6 @@ class Expert:
             try:
                 raw = json.loads(raw)
             except Exception:
-                # treat raw string as the debate text
                 raw = {"text": raw}
 
         if not isinstance(raw, dict):
@@ -278,11 +279,22 @@ class Expert:
         if not isinstance(sat, bool):
             sat = bool(len(text) >= 20)
 
+        # citations (optional)
         citations = raw.get("citations")
         if not isinstance(citations, list):
             citations = []
         else:
             citations = [str(x) for x in citations]
+
+        # optional revised_score
+        revised_score = raw.get("revised_score")
+        if not isinstance(revised_score, int):
+            revised_score = None
+
+        # optional handoff_to
+        handoff_to = raw.get("handoff_to")
+        if not isinstance(handoff_to, str) or not handoff_to.strip():
+            handoff_to = None
 
         base = {
             "expert_id": self.expert_id,
@@ -291,8 +303,9 @@ class Expert:
             "text": text if text else "[auto-repair] debate content missing.",
             "satisfied": sat,
             "citations": citations,
+            "revised_score": revised_score,
+            "handoff_to": handoff_to,
         }
-
         return DebateTurn(**base)
 
     def _expert_name(self) -> str:
