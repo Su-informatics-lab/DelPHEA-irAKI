@@ -26,6 +26,10 @@ class AssessmentBase(BaseModel):
       - importance: non-negative integers; TOTAL across qids = 100 (contribution weight)
     """
 
+    # identification (explicit to align with messages schema and dumping)
+    case_id: str = Field(..., min_length=1)
+    expert_id: str = Field(..., min_length=1)
+
     # per-question dicts
     scores: Dict[str, int] = Field(...)
     rationale: Dict[str, str] = Field(...)
