@@ -38,7 +38,9 @@ from models import AssessmentR1, AssessmentR3, Consensus
 from router import DebatePlan, Router
 from schema import load_consensus_rules, load_qids
 from validators import (
-    ValidationError,
+    ValidationError,  # NOTE: tests may monkeypatch this to a duck-typed error.
+)
+from validators import (
     log_debate_status,
     validate_round1_payload,
     validate_round3_payload,
@@ -67,7 +69,7 @@ class Moderator:
         logger: logging.Logger | None = None,
         max_retries: int = 1,
         *,
-        debate_rounds: int = 3,  # keep this
+        debate_rounds: int = 3,
         max_history_turns: int = 6,
         max_turns_per_expert: int = 2,
         max_total_turns_per_qid: int = 12,
@@ -442,7 +444,6 @@ class Moderator:
         )
         d["expert_id"] = (
             d.get("expert_id")
-            or getattr(expert, "expert_id", None)
             or getattr(self, "current_expert_id", None)
             or "unknown_expert"
         )
@@ -467,7 +468,7 @@ class Moderator:
                         expert.expert_id,
                     )
                 return a1
-            except ValidationError as ve:
+            except ValidationError as ve:  # duck-typed in tests
                 last_err = ve
                 self.logger.error(
                     "round1 validation failed for %s: %s", expert.expert_id, ve
@@ -510,7 +511,7 @@ class Moderator:
                         expert.expert_id,
                     )
                 return a3
-            except ValidationError as ve:
+            except ValidationError as ve:  # duck-typed in tests
                 last_err = ve
                 self.logger.error(
                     "round3 validation failed for %s: %s", expert.expert_id, ve
@@ -561,12 +562,21 @@ class Moderator:
         return expert.assess_round3(case, self.qpath, ctx, **kwargs)
 
     def _build_repair_hint(self, ve: ValidationError, round_no: int) -> str:
-        """compact, model-friendly hint listing what failed and how to fix."""
-        msgs = []
-        for err in ve.errors():
+        """compact, model-friendly hint listing what failed and how to fix.
+        Works with pydantic.ValidationError or any duck-typed object exposing .errors().
+        """
+        # Collect msg/loc from any error-like payload.
+        msgs: List[str] = []
+        try:
+            items = list(getattr(ve, "errors")() or [])
+        except Exception:
+            items = []
+        for err in items:
             loc = " → ".join(str(x) for x in err.get("loc", ()))
             msg = err.get("msg", "invalid value")
             msgs.append(f"{loc}: {msg}")
+
+        # Friendly, round-specific prefix.
         if round_no == 1:
             prefix = (
                 "please fix: provide ≥200-char clinical_reasoning; non-empty primary_diagnosis; "
@@ -577,7 +587,21 @@ class Moderator:
                 "please fix: non-empty changes_from_round1.summary and .debate_influence; "
                 "non-empty final_diagnosis; at least 1 recommendation.\n"
             )
-        return prefix + "violations:\n- " + "\n- ".join(msgs)
+
+        # If we detect the common 'importance must sum to 100' case, add a very explicit instruction.
+        extra = ""
+        if any("importance must sum to 100" in m for m in msgs):
+            extra = (
+                "Ensure per-QID 'importance' are integers that sum to exactly 100 "
+                "(no rounding; adjust values, then regenerate).\n"
+            )
+
+        core = (
+            "violations:\n- " + "\n- ".join(msgs)
+            if msgs
+            else "violations: none provided"
+        )
+        return prefix + extra + core
 
     def _autopatch_round1(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         """make a minimal, explicit placeholder fix so downstream code can proceed."""
@@ -619,10 +643,7 @@ class Moderator:
                 parts.append(f"{q}: score={s}, ev={ev.get(q)}")
             cr = " ".join(parts)
             if len(cr) < 200:
-                cr = (
-                    cr
-                    + " this placeholder meets minimum length for validation and flags the need for human review."
-                )
+                cr += " this placeholder meets minimum length for validation and flags the need for human review."
         patched["clinical_reasoning"] = cr
 
         # primary_diagnosis
@@ -634,9 +655,9 @@ class Moderator:
 
         # differential_diagnosis
         ddx = patched.get("differential_diagnosis")
-        if (
-            not isinstance(ddx, list)
-            or len([x for x in ddx if isinstance(x, str) and x.strip()]) < 2
+        if not (
+            isinstance(ddx, list)
+            and len([x for x in ddx if isinstance(x, str) and x.strip()]) >= 2
         ):
             patched["differential_diagnosis"] = [
                 "prerenal azotemia [placeholder]",
@@ -685,12 +706,14 @@ class Moderator:
             ] = "final diagnosis not specified [auto-repair placeholder]"
 
         recs = patched.get("recommendations")
-        if not isinstance(recs, list) or not any(
-            isinstance(x, str) and x.strip() for x in recs
+        if not (
+            isinstance(recs, list)
+            and any(isinstance(x, str) and x.strip() for x in recs)
         ):
             patched["recommendations"] = [
                 "review case with nephrology; validate placeholder content."
             ]
+
         return patched
 
     # --------- validators (fail fast on id mismatches) ---------
