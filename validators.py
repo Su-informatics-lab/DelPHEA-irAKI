@@ -3,11 +3,10 @@
 # validation & llm→schema glue for delphea-iraki (pydantic v2 idioms).
 # contract: five parallel per-question dicts keyed by qid
 #   - scores:       {qid: int in [1,9]}
-#   - rationale:    {qid: non-empty str}  ← argument/explanation
-#   - evidence:     {qid: non-empty str}  ← supporting snippet/paragraph
+#   - rationale:    {qid: non-empty str}
+#   - evidence:     {qid: non-empty str}
 #   - q_confidence: {qid: float in [0,1]}
-#   - importance:   {qid: nonnegative int}, with TOTAL across all qids = 100
-# 'importance' is a CONTRIBUTION WEIGHT to the overall assessment (not a score).
+#   - importance:   {qid: nonnegative int}, TOTAL across all qids = 100
 
 from __future__ import annotations
 
@@ -233,18 +232,11 @@ def _dump_json(base: Optional[Path], rel: str, obj: Any) -> None:
         pass
 
 
-# ---------- small helper to auto-rebalance 'importance' to sum exactly 100 ----------
+# ---------- helpers for auto-repair ----------
 
 
 def _rebalance_importance(imp: Dict[str, Any]) -> Dict[str, int]:
-    """Proportionally rescale nonnegative ints so the total is exactly 100.
-
-    - Coerces values to nonnegative ints.
-    - If total == 0, distributes evenly.
-    - Otherwise scales by 100/total, floors, and assigns the remainder to the
-      entries with the largest fractional parts to preserve ordering stability.
-    """
-    # Coerce and sanitize
+    """Proportionally rescale nonnegative ints so the total is exactly 100."""
     items: List[Tuple[str, int]] = []
     for k, v in (imp or {}).items():
         try:
@@ -254,39 +246,110 @@ def _rebalance_importance(imp: Dict[str, Any]) -> Dict[str, int]:
         if iv < 0:
             iv = 0
         items.append((k, iv))
-
     if not items:
         return {}
-
     total = sum(iv for _, iv in items)
     n = len(items)
-
     if total == 100:
         return {k: iv for k, iv in items}
-
     if total <= 0:
         base = [100 // n] * n
-        remainder = 100 - sum(base)
-        for i in range(remainder):
+        for i in range(100 - sum(base)):
             base[i % n] += 1
         return {k: base[i] for i, (k, _) in enumerate(items)}
-
-    # Proportional scaling with remainder distribution
     scaled: List[Tuple[str, int, float]] = []
     for k, iv in items:
         exact = iv * 100.0 / float(total)
-        flo = int(exact)  # floor
+        flo = int(exact)
         frac = exact - flo
         scaled.append((k, flo, frac))
     floor_sum = sum(flo for _, flo, _ in scaled)
     remainder = 100 - floor_sum
-
-    # Distribute remainder by largest fractional parts, stable by original order
     scaled.sort(key=lambda t: t[2], reverse=True)
     out = {k: flo for k, flo, _ in scaled}
     for i in range(max(0, remainder)):
-        k, flo, _ = scaled[i % n]
+        k, _, _ = scaled[i % n]
         out[k] = out.get(k, 0) + 1
+    return out
+
+
+def _normalize_qdicts_to_expected(
+    data: Dict[str, Any], expected_qids: List[str]
+) -> Dict[str, Any]:
+    """Align the five per-QID dicts to the exact expected_qids (order & membership)."""
+    if not isinstance(data, dict):
+        return data
+    out = dict(data)
+
+    # Pull existing dicts (may be missing/malformed)
+    scores = data.get("scores") or {}
+    rationale = data.get("rationale") or {}
+    evidence = data.get("evidence") or {}
+    q_conf = data.get("q_confidence") or {}
+    imp = data.get("importance") or {}
+
+    def _norm_score(v: Any) -> int:
+        try:
+            iv = int(v)
+        except Exception:
+            iv = 5
+        if iv < 1 or iv > 9:
+            iv = 5
+        return iv
+
+    def _norm_text(v: Any, placeholder: str) -> str:
+        s = str(v).strip() if isinstance(v, str) else ""
+        return s if s else placeholder
+
+    def _norm_conf(v: Any) -> float:
+        try:
+            f = float(v)
+        except Exception:
+            f = 0.5
+        if f < 0.0 or f > 1.0:
+            f = 0.5
+        return f
+
+    def _norm_imp(v: Any) -> int:
+        try:
+            iv = int(v)
+        except Exception:
+            iv = 0
+        return iv if iv >= 0 else 0
+
+    # Build fresh dicts strictly in expected order; drop extras, fill missing.
+    new_scores: Dict[str, int] = {}
+    new_rationale: Dict[str, str] = {}
+    new_evidence: Dict[str, str] = {}
+    new_qc: Dict[str, float] = {}
+    new_imp: Dict[str, int] = {}
+
+    for q in expected_qids:
+        new_scores[q] = _norm_score(scores.get(q))
+        new_rationale[q] = _norm_text(
+            rationale.get(q),
+            "[auto-repair] rationale missing for this question; please review.",
+        )
+        new_evidence[q] = _norm_text(
+            evidence.get(q),
+            "[auto-repair] evidence snippet missing; review source notes.",
+        )
+        new_qc[q] = _norm_conf(q_conf.get(q))
+        new_imp[q] = _norm_imp(imp.get(q))
+
+    # If all importance zeros, distribute evenly; otherwise we'll rebalance later.
+    if sum(new_imp.values()) <= 0:
+        n = len(expected_qids) or 1
+        base = [100 // n] * n
+        for i in range(100 - sum(base)):
+            base[i % n] += 1
+        new_imp = {q: base[i] for i, q in enumerate(expected_qids)}
+
+    out["scores"] = new_scores
+    out["rationale"] = new_rationale
+    out["evidence"] = new_evidence
+    out["q_confidence"] = new_qc
+    out["importance"] = new_imp
     return out
 
 
@@ -304,13 +367,7 @@ def call_llm_with_schema(
     max_tokens: Optional[int] = None,
     expected_qids: Optional[List[str]] = None,
 ) -> T:
-    """call backend, extract first json, validate with response_model.
-
-    importance semantics:
-      - importance is the per-question CONTRIBUTION WEIGHT to the overall assessment
-        (not a score). Sum of all importance values MUST equal 100.
-    """
-
+    """Call backend, extract first JSON, normalize & validate with response_model."""
     ctx = int(
         ctx_window if ctx_window is not None else _discover_context_window(backend)
     )
@@ -391,14 +448,12 @@ def call_llm_with_schema(
     )
 
     last_err: Optional[ValidationError] = None
-    last_raw: Optional[str] = None
 
     for attempt in range(retries + 1):
         target_out = int(out_init * (rfactor**attempt))
         tokens_for_attempt = max(min(target_out, available_out), minimal_out)
 
         raw = _gen_once(f"{prompt_text}{contract}", tokens_for_attempt)
-        last_raw = raw
 
         _dump_write(
             base,
@@ -409,18 +464,19 @@ def call_llm_with_schema(
         try:
             json_text = _extract_first_json_object(raw)
             data = json.loads(json_text)
-
             if isinstance(data, dict):
                 data = _coerce_for_model_like_r1_r3(data)
 
-            # First-pass validation against the response model
-            try:
+            def _try_validate(d: Dict[str, Any]) -> T:
                 if hasattr(response_model, "model_validate"):
-                    model = response_model.model_validate(
-                        data, context={"expected_qids": expected_qids or []}
+                    return response_model.model_validate(
+                        d, context={"expected_qids": expected_qids or []}
                     )
-                else:
-                    model = response_model(**data)  # type: ignore[call-arg]
+                return response_model(**d)  # type: ignore[call-arg]
+
+            # First-pass validate
+            try:
+                model = _try_validate(data)
                 payload = model.model_dump() if hasattr(model, "model_dump") else dict(model)  # type: ignore[arg-type]
                 _dump_json(
                     base,
@@ -429,11 +485,11 @@ def call_llm_with_schema(
                 )
                 return model
             except ValidationError as ve_first:
-                # If the only blocker is "importance must sum to 100", auto-rebalance and re-validate once
                 err_text = str(ve_first)
-                has_importance_sum_issue = "importance must sum to 100" in err_text
+
+                # Case A: importance sum != 100 → auto-rebalance, revalidate once
                 if (
-                    has_importance_sum_issue
+                    "importance must sum to 100" in err_text
                     and isinstance(data, dict)
                     and isinstance(data.get("importance"), dict)
                 ):
@@ -442,23 +498,13 @@ def call_llm_with_schema(
                         patched.get("importance", {})
                     )
                     try:
-                        if hasattr(response_model, "model_validate"):
-                            model = response_model.model_validate(
-                                patched, context={"expected_qids": expected_qids or []}
-                            )
-                        else:
-                            model = response_model(**patched)  # type: ignore[call-arg]
-                        payload = (
-                            model.model_dump()
-                            if hasattr(model, "model_dump")
-                            else dict(model)  # type: ignore[arg-type]
-                        )
+                        model = _try_validate(patched)
+                        payload = model.model_dump() if hasattr(model, "model_dump") else dict(model)  # type: ignore[arg-type]
                         _dump_json(
                             base,
                             f"{case_id}/experts/{expert_id}/{round_key}/validated.json",
                             payload,
                         )
-                        # also persist a small note indicating auto-fix
                         _dump_json(
                             base,
                             f"{case_id}/experts/{expert_id}/{round_key}/autopatch.json",
@@ -469,17 +515,49 @@ def call_llm_with_schema(
                         )
                         return model
                     except ValidationError as ve_second:
-                        # fall through to outer handler with the second error
                         last_err = ve_second
-                        continue
-                # Not an importance sum issue (or rebalance failed) → let outer loop retry
+                        # fall through to other auto-fixes below
+
+                # Case B: qid mismatch/order issues → normalize to expected_qids and revalidate
+                has_qid_mismatch = (
+                    "qid lists and order" in err_text
+                    or "qid_mismatch" in err_text
+                    or "qid order must match questionnaire" in err_text
+                )
+                if has_qid_mismatch and expected_qids and isinstance(data, dict):
+                    patched2 = _normalize_qdicts_to_expected(data, expected_qids)
+                    # After normalization, ensure importance sums to 100
+                    if isinstance(patched2.get("importance"), dict):
+                        patched2["importance"] = _rebalance_importance(
+                            patched2["importance"]
+                        )
+                    try:
+                        model = _try_validate(patched2)
+                        payload = model.model_dump() if hasattr(model, "model_dump") else dict(model)  # type: ignore[arg-type]
+                        _dump_json(
+                            base,
+                            f"{case_id}/experts/{expert_id}/{round_key}/validated.json",
+                            payload,
+                        )
+                        _dump_json(
+                            base,
+                            f"{case_id}/experts/{expert_id}/{round_key}/autopatch.json",
+                            {
+                                "note": "qid dicts normalized to expected order and importance rebalanced",
+                                "attempt": attempt,
+                            },
+                        )
+                        return model
+                    except ValidationError as ve_third:
+                        last_err = ve_third
+                        # fall through to retry
+
                 last_err = ve_first
                 continue
 
         except ValidationError as ve:
             last_err = ve
             continue
-
         except json.JSONDecodeError as jde:
             line_err = InitErrorDetails(
                 type=PydanticCustomError(
@@ -493,7 +571,6 @@ def call_llm_with_schema(
             )
             last_err = ValidationError.from_exception_data("llm_response", [line_err])
             continue
-
         except Exception as e:
             line_err = InitErrorDetails(
                 type=PydanticCustomError(
@@ -692,13 +769,10 @@ def validate_round1_payload(
         ),
         title,
     )
-
     _validate_parallel_qdicts(payload, expected_qids, title)
-
     _validate_prob_triplet(
         payload["p_iraki"], payload["ci_iraki"], payload["confidence"], title=title
     )
-
     ddx = payload.get("differential_diagnosis")
     if (
         not isinstance(ddx, list)
@@ -711,7 +785,6 @@ def validate_round1_payload(
             loc=("differential_diagnosis",),
             inp=ddx,
         )
-
     cr = payload.get("clinical_reasoning")
     if not isinstance(cr, str) or not cr.strip():
         _raise_ve(
@@ -748,13 +821,10 @@ def validate_round3_payload(
         ),
         title,
     )
-
     _validate_parallel_qdicts(payload, expected_qids, title)
-
     _validate_prob_triplet(
         payload["p_iraki"], payload["ci_iraki"], payload["confidence"], title=title
     )
-
     ch = payload.get("changes_from_round1")
     if not isinstance(ch, dict):
         _raise_ve(
@@ -764,7 +834,6 @@ def validate_round3_payload(
             loc=("changes_from_round1",),
             inp=ch,
         )
-
     fd = payload.get("final_diagnosis")
     if not isinstance(fd, str) or not fd.strip():
         _raise_ve(
@@ -774,7 +843,6 @@ def validate_round3_payload(
             loc=("final_diagnosis",),
             inp=fd,
         )
-
     civ = payload.get("confidence_in_verdict")
     if not isinstance(civ, (int, float)) or not (0.0 <= float(civ) <= 1.0):
         _raise_ve(
@@ -784,7 +852,6 @@ def validate_round3_payload(
             loc=("confidence_in_verdict",),
             inp=civ,
         )
-
     recs = payload.get("recommendations")
     if (
         not isinstance(recs, list)
@@ -826,7 +893,6 @@ def log_debate_status(*args, **kwargs) -> None:
         reason = kwargs.pop("reason", None)
         meta = kwargs.pop("meta", None)
 
-    # allow 'early_stop' to match moderator usage
     allowed_status = {
         "start",
         "turn",
@@ -835,7 +901,7 @@ def log_debate_status(*args, **kwargs) -> None:
         "timeout",
         "error",
         "end",
-        "early_stop",
+        "early_stop",  # used by moderator
     }
     allowed_stage = {"r1", "debate", "r3"}
 
