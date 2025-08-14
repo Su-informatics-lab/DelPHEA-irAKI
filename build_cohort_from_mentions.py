@@ -26,10 +26,12 @@ Notes:
     but windowing by days will be skipped for those cases.
 """
 
+from __future__ import annotations
+
 import argparse
 import json
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict
 
 import pandas as pd
 
@@ -47,9 +49,7 @@ def load_mentions(path: str) -> pd.DataFrame:
     df["match_type"] = df["match_type"].astype(str)
     df["term"] = df["term"].astype(str).str.strip()
     # negated might be bool, str "True/False", or 0/1
-    if df["negated"].dtype == bool:
-        pass
-    else:
+    if df["negated"].dtype != bool:
         df["negated"] = (
             df["negated"].astype(str).str.lower().isin(["true", "1", "yes", "y"])
         )
@@ -58,7 +58,7 @@ def load_mentions(path: str) -> pd.DataFrame:
 
 def summarize_patient(
     df: pd.DataFrame,
-    window_days: Optional[int],
+    window_days: int | None,
     aki_mode: str,
     require_nonnegated: bool,
 ) -> pd.DataFrame:
@@ -69,17 +69,18 @@ def summarize_patient(
       - 'any'                : allow AKI_broad if strict absent
       - 'strict_preferred'   : prefer strict for dating; fallback to broad for dates/flags
     """
-    # derive convenience flags
+    # convenience flags
+    df = df.copy()
     df["is_ici"] = df["match_type"].eq("ICI")
     df["is_aki_strict"] = df["match_type"].eq("AKI_strict")
     df["is_aki_broad"] = df["match_type"].eq("AKI_broad")
     df["is_nonneg"] = ~df["negated"].astype(bool)
 
-    # counts
+    # counts (group-aware nonnegation)
     grp = df.groupby("case_id", as_index=False)
     counts = grp.agg(
         person_id=("person_id", "first"),
-        n_notes=("timestamp", "count"),
+        n_mentions=("timestamp", "count"),
         ici_hits=("is_ici", "sum"),
         ici_hits_nonneg=(
             "is_ici",
@@ -97,27 +98,15 @@ def summarize_patient(
         ),
     )
 
-    # earliest dates (non-negated by default if require_nonnegated else any)
-    def _first_time(mask: pd.Series) -> pd.Timestamp | pd.NaT:
-        idx = df.index[mask]
-        if len(idx) == 0:
-            return pd.NaT
-        return df.loc[idx, "timestamp"].min()
-
+    # earliest timestamps per case (respecting nonnegation if requested)
     earliest_by_case: Dict[str, Dict[str, pd.Timestamp]] = {}
     for case_id, sub in df.groupby("case_id"):
-        if require_nonnegated:
-            ici_time = sub.loc[sub["is_ici"] & sub["is_nonneg"], "timestamp"].min()
-            aki_strict_time = sub.loc[
-                sub["is_aki_strict"] & sub["is_nonneg"], "timestamp"
-            ].min()
-            aki_broad_time = sub.loc[
-                sub["is_aki_broad"] & sub["is_nonneg"], "timestamp"
-            ].min()
-        else:
-            ici_time = sub.loc[sub["is_ici"], "timestamp"].min()
-            aki_strict_time = sub.loc[sub["is_aki_strict"], "timestamp"].min()
-            aki_broad_time = sub.loc[sub["is_aki_broad"], "timestamp"].min()
+        sub_nn = sub.loc[sub["is_nonneg"]] if require_nonnegated else sub
+
+        ici_time = sub_nn.loc[sub_nn["is_ici"], "timestamp"].min()
+        aki_strict_time = sub_nn.loc[sub_nn["is_aki_strict"], "timestamp"].min()
+        aki_broad_time = sub_nn.loc[sub_nn["is_aki_broad"], "timestamp"].min()
+
         earliest_by_case[case_id] = {
             "first_ici_time": ici_time,
             "first_aki_strict_time": aki_strict_time,
@@ -127,11 +116,10 @@ def summarize_patient(
     earliest_df = pd.DataFrame.from_dict(earliest_by_case, orient="index").reset_index(
         names="case_id"
     )
-
     out = counts.merge(earliest_df, on="case_id", how="left")
 
-    # decide final AKI flag/time based on mode
-    def pick_aki_time(row) -> pd.Timestamp | pd.NaT:
+    # pick AKI time based on mode
+    def pick_aki_time(row):
         s, b = row["first_aki_strict_time"], row["first_aki_broad_time"]
         if aki_mode == "strict_only":
             return s
@@ -141,13 +129,14 @@ def summarize_patient(
         return s if pd.notna(s) else b
 
     out["first_aki_time"] = out.apply(pick_aki_time, axis=1)
+
+    # has_ici / has_aki flags
     out["has_ici"] = (
         out["ici_hits_nonneg"] if require_nonnegated else out["ici_hits"]
     ) > 0
     if aki_mode == "strict_only":
         base_hits = "aki_strict_nonneg" if require_nonnegated else "aki_strict_hits"
     elif aki_mode == "any":
-        # any (nonnegated if required) across strict or broad
         if require_nonnegated:
             out["aki_any_nonneg"] = (
                 out["aki_strict_nonneg"] + out["aki_broad_nonneg"]
@@ -165,10 +154,9 @@ def summarize_patient(
         else:
             out["aki_any_hits"] = (out["aki_strict_hits"] + out["aki_broad_hits"]) > 0
             base_hits = "aki_any_hits"
-
     out["has_aki"] = out[base_hits]
 
-    # window filter (AKI within N days after ICI)
+    # window: AKI within N days after ICI
     if window_days is not None:
 
         def _days_after(row):
@@ -183,9 +171,9 @@ def summarize_patient(
         )
     else:
         out["aki_after_ici_days"] = pd.NA
-        out["within_window"] = True  # no windowing applied
+        out["within_window"] = True
 
-    # evidence score (for sorting): strict nonneg*2 + broad nonneg + ici nonneg
+    # simple evidence score (for sorting)
     out["evidence_score"] = (
         2 * out.get("aki_strict_nonneg", 0)
         + 1 * out.get("aki_broad_nonneg", 0)
@@ -195,7 +183,7 @@ def summarize_patient(
     # final candidate flag
     out["candidate"] = out["has_ici"] & out["has_aki"] & out["within_window"]
 
-    # stable ordering for readability
+    # order columns
     cols = [
         "case_id",
         "person_id",
@@ -215,9 +203,8 @@ def summarize_patient(
         "aki_after_ici_days",
         "within_window",
         "evidence_score",
-        "n_notes",
+        "n_mentions",
     ]
-    # keep only existing columns (some conditional temp cols may not exist)
     cols = [c for c in cols if c in out.columns]
     out = out[cols].sort_values(
         ["candidate", "evidence_score", "case_id"], ascending=[False, False, True]
@@ -225,7 +212,7 @@ def summarize_patient(
     return out
 
 
-def main():
+def main() -> None:
     ap = argparse.ArgumentParser(
         description="Build a starter irAKI cohort from mention index."
     )
