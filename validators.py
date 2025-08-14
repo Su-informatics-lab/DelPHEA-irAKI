@@ -7,7 +7,7 @@
 #   - evidence:     {qid: non-empty str}  ← supporting snippet/paragraph
 #   - q_confidence: {qid: float in [0,1]}
 #   - importance:   {qid: nonnegative int}, with TOTAL across all qids = 100
-# 'importance' is a CONTRIBUTION WEIGHT to the overall assessment (not a second score).
+# 'importance' is a CONTRIBUTION WEIGHT to the overall assessment (not a score).
 
 from __future__ import annotations
 
@@ -233,6 +233,63 @@ def _dump_json(base: Optional[Path], rel: str, obj: Any) -> None:
         pass
 
 
+# ---------- small helper to auto-rebalance 'importance' to sum exactly 100 ----------
+
+
+def _rebalance_importance(imp: Dict[str, Any]) -> Dict[str, int]:
+    """Proportionally rescale nonnegative ints so the total is exactly 100.
+
+    - Coerces values to nonnegative ints.
+    - If total == 0, distributes evenly.
+    - Otherwise scales by 100/total, floors, and assigns the remainder to the
+      entries with the largest fractional parts to preserve ordering stability.
+    """
+    # Coerce and sanitize
+    items: List[Tuple[str, int]] = []
+    for k, v in (imp or {}).items():
+        try:
+            iv = int(v)
+        except Exception:
+            iv = 0
+        if iv < 0:
+            iv = 0
+        items.append((k, iv))
+
+    if not items:
+        return {}
+
+    total = sum(iv for _, iv in items)
+    n = len(items)
+
+    if total == 100:
+        return {k: iv for k, iv in items}
+
+    if total <= 0:
+        base = [100 // n] * n
+        remainder = 100 - sum(base)
+        for i in range(remainder):
+            base[i % n] += 1
+        return {k: base[i] for i, (k, _) in enumerate(items)}
+
+    # Proportional scaling with remainder distribution
+    scaled: List[Tuple[str, int, float]] = []
+    for k, iv in items:
+        exact = iv * 100.0 / float(total)
+        flo = int(exact)  # floor
+        frac = exact - flo
+        scaled.append((k, flo, frac))
+    floor_sum = sum(flo for _, flo, _ in scaled)
+    remainder = 100 - floor_sum
+
+    # Distribute remainder by largest fractional parts, stable by original order
+    scaled.sort(key=lambda t: t[2], reverse=True)
+    out = {k: flo for k, flo, _ in scaled}
+    for i in range(max(0, remainder)):
+        k, flo, _ = scaled[i % n]
+        out[k] = out.get(k, 0) + 1
+    return out
+
+
 def call_llm_with_schema(
     *,
     response_model: Type[T],
@@ -356,24 +413,68 @@ def call_llm_with_schema(
             if isinstance(data, dict):
                 data = _coerce_for_model_like_r1_r3(data)
 
-            if hasattr(response_model, "model_validate"):
-                model = response_model.model_validate(
-                    data, context={"expected_qids": expected_qids or []}
-                )
-            else:
-                model = response_model(**data)
-
+            # First-pass validation against the response model
             try:
+                if hasattr(response_model, "model_validate"):
+                    model = response_model.model_validate(
+                        data, context={"expected_qids": expected_qids or []}
+                    )
+                else:
+                    model = response_model(**data)  # type: ignore[call-arg]
                 payload = model.model_dump() if hasattr(model, "model_dump") else dict(model)  # type: ignore[arg-type]
-            except Exception:
-                payload = data
-            _dump_json(
-                base,
-                f"{case_id}/experts/{expert_id}/{round_key}/validated.json",
-                payload,
-            )
-
-            return model
+                _dump_json(
+                    base,
+                    f"{case_id}/experts/{expert_id}/{round_key}/validated.json",
+                    payload,
+                )
+                return model
+            except ValidationError as ve_first:
+                # If the only blocker is "importance must sum to 100", auto-rebalance and re-validate once
+                err_text = str(ve_first)
+                has_importance_sum_issue = "importance must sum to 100" in err_text
+                if (
+                    has_importance_sum_issue
+                    and isinstance(data, dict)
+                    and isinstance(data.get("importance"), dict)
+                ):
+                    patched = dict(data)
+                    patched["importance"] = _rebalance_importance(
+                        patched.get("importance", {})
+                    )
+                    try:
+                        if hasattr(response_model, "model_validate"):
+                            model = response_model.model_validate(
+                                patched, context={"expected_qids": expected_qids or []}
+                            )
+                        else:
+                            model = response_model(**patched)  # type: ignore[call-arg]
+                        payload = (
+                            model.model_dump()
+                            if hasattr(model, "model_dump")
+                            else dict(model)  # type: ignore[arg-type]
+                        )
+                        _dump_json(
+                            base,
+                            f"{case_id}/experts/{expert_id}/{round_key}/validated.json",
+                            payload,
+                        )
+                        # also persist a small note indicating auto-fix
+                        _dump_json(
+                            base,
+                            f"{case_id}/experts/{expert_id}/{round_key}/autopatch.json",
+                            {
+                                "note": "importance rebalanced to 100",
+                                "attempt": attempt,
+                            },
+                        )
+                        return model
+                    except ValidationError as ve_second:
+                        # fall through to outer handler with the second error
+                        last_err = ve_second
+                        continue
+                # Not an importance sum issue (or rebalance failed) → let outer loop retry
+                last_err = ve_first
+                continue
 
         except ValidationError as ve:
             last_err = ve
@@ -725,7 +826,7 @@ def log_debate_status(*args, **kwargs) -> None:
         reason = kwargs.pop("reason", None)
         meta = kwargs.pop("meta", None)
 
-    # ALLOW early_stop to match moderator usage
+    # allow 'early_stop' to match moderator usage
     allowed_status = {
         "start",
         "turn",
