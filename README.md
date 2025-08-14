@@ -236,6 +236,32 @@ pytest tests/test_importance_retry.py -q
 
 ---
 
+## How to get start
+Get first few cases:
+
+```bash
+python -c "from dataloader import DataLoader; dl=DataLoader(data_dir='irAKI_data'); print('\n'.join(dl.get_available_patients(limit=20)))"
+```
+
+Get a likely-AKI cohort
+```bash
+python scan_mentions.py \
+  --data-dir irAKI_data \
+  --ici-csv ici_vocab.csv \
+  --out out/mention_index.csv
+
+python build_cohort_from_mentions.py \ 
+--mentions out/mention_index.csv \ 
+--out-csv out/cohort_from_mentions.csv \ 
+--out-list out/cohort_case_ids.txt \ 
+--window-days 180 \ 
+--aki-mode strict_preferred \ 
+--require-nonnegated
+
+```
+
+---
+
 ## Developer notes
 
 * `_build_repair_hint` is **duck‑typed**: any object with `.errors() -> list[{loc,msg}]` works (enables unit tests to inject fakes).
