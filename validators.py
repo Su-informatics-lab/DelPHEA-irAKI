@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import re
+import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Type, TypeVar
@@ -21,6 +22,8 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple, Type, TypeVar
 from pydantic import BaseModel, ValidationError
 from pydantic_core import InitErrorDetails, PydanticCustomError
 
+_WORD_RE = re.compile(r"\b\w+\b")
+_QID_LINE_RE = re.compile(r"^\s*(Q[0-9A-Za-z_]+)\s*:", re.MULTILINE)
 T = TypeVar("T", bound=BaseModel)
 
 DEFAULT_CTX_WINDOW = 102400
@@ -31,7 +34,98 @@ DEFAULT_RESERVE_TOKENS = 512
 
 # --- QID/order & importance normalization helpers ---
 
-_QID_LINE_RE = re.compile(r"^\s*(Q[0-9A-Za-z_]+)\s*:", re.MULTILINE)
+
+def _norm_text(s: str) -> str:
+    s = unicodedata.normalize("NFKD", s)
+    s = s.encode("ascii", "ignore").decode("ascii", "ignore")
+    s = s.lower()
+    s = s.replace("—", "-").replace("–", "-")
+    s = re.sub(r"[^a-z0-9\s\-]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def _parse_boolish(v: Any) -> Optional[bool]:
+    """Robust bool parser for LLM outputs; handles bare labels like 'irAKI'."""
+    if isinstance(v, bool):
+        return v
+    if not isinstance(v, str):
+        return None
+    s = _norm_text(v)
+
+    # simple truthy/falsy lexicon
+    truthy = {
+        "true",
+        "yes",
+        "y",
+        "present",
+        "positive",
+        "likely",
+        "probable",
+        "confirmed",
+        "consistent with",
+        "supports",
+        "diagnosed",
+        "dx iraki",
+        "dx ain",
+        "iraki confirmed",
+    }
+    falsy = {
+        "false",
+        "no",
+        "n",
+        "absent",
+        "negative",
+        "unlikely",
+        "improbable",
+        "ruled out",
+        "rule out",
+        "against",
+        "not supported",
+        "does not support",
+    }
+    if s in truthy:
+        return True
+    if s in falsy:
+        return False
+
+    # handle phrases with 'iraki' / 'immune-related' / 'AIN' etc., with negation checks
+    pos_markers = [
+        "iraki",
+        "immune related acute kidney injury",
+        "immune-related acute kidney injury",
+        "immune related nephritis",
+        "immune-related nephritis",
+        "acute interstitial nephritis",
+    ]
+    neg_markers = [
+        "no",
+        "not",
+        "without",
+        "unlikely",
+        "ruled out",
+        "rule out",
+        "against",
+        "does not",
+        "absent",
+    ]
+
+    contains_pos = any(pm in s for pm in pos_markers)
+    contains_neg = any(nm in s for nm in neg_markers)
+
+    # If we see both, lean negative (e.g., "rule out irAKI")
+    if contains_pos and not contains_neg:
+        return True
+    if contains_pos and contains_neg:
+        return False
+
+    # last resort: directional cues
+    if any(t in s for t in truthy):
+        return True
+    if any(f in s for f in falsy):
+        return False
+
+    return None
 
 
 def _extract_qids_from_prompt(prompt: str) -> List[str]:
@@ -343,55 +437,41 @@ def _coerce_bool_from_freeform(v: Any) -> Optional[bool]:
 
 
 def _coerce_for_model_like_r1_r3(data: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Coerce loose LLM outputs into types that match our R1/R3 schemas.
+    d = dict(data)
 
-    - p_iraki / confidence / confidence_in_verdict → floats
-    - ci_iraki → [float, float]
-    - verdict → bool (handles "probable", "likely", etc.)
-    - recommendations → list[str] (from semicolon/line separated string)
-    - changes_from_round1 → dict (wrap string/list as {"summary": ...} / {"items": [...]})
-    """
-    d = dict(data) if isinstance(data, dict) else {}
-
-    # numeric coercions
     for key in ("p_iraki", "confidence", "confidence_in_verdict"):
         if key in d and not isinstance(d[key], (int, float)):
             f = _to_float(d[key])
             if f is not None:
                 d[key] = f
 
-    # ci_iraki -> [lo, hi] floats
-    ci = d.get("ci_iraki")
-    if isinstance(ci, (list, tuple)) and len(ci) == 2:
-        lo = _to_float(ci[0])
-        hi = _to_float(ci[1])
+    if (
+        "ci_iraki" in d
+        and isinstance(d["ci_iraki"], (list, tuple))
+        and len(d["ci_iraki"]) == 2
+    ):
+        lo = _to_float(d["ci_iraki"][0])
+        hi = _to_float(d["ci_iraki"][1])
         if lo is not None and hi is not None:
             d["ci_iraki"] = [lo, hi]
 
-    # verdict: coerce freeform → bool
-    if "verdict" in d and not isinstance(d.get("verdict"), bool):
-        vb = _coerce_bool_from_freeform(d.get("verdict"))
-        if vb is not None:
-            d["verdict"] = vb
+    # verdict: map strings like "Likely irAKI" or bare "irAKI" → bool
+    if "verdict" in d and not isinstance(d["verdict"], bool):
+        parsed = _parse_boolish(d["verdict"])
+        if parsed is not None:
+            d["verdict"] = parsed
 
-    # recommendations: split a single string into a list of strings
     recs = d.get("recommendations")
     if isinstance(recs, str):
         items = _split_lines_semicolons(recs)
-        d["recommendations"] = items if items else []
+        d["recommendations"] = items if items else ([])
 
-    # changes_from_round1 must be a dict; convert common non-dict forms.
+    # Allow dict or string for changes_from_round1; coerce string→dict
     ch = d.get("changes_from_round1")
     if isinstance(ch, str):
-        ch = ch.strip()
-        if ch:
-            d["changes_from_round1"] = {"summary": ch}
-        else:
-            d["changes_from_round1"] = {"summary": ""}
-    elif isinstance(ch, list):
-        items = [x for x in ch if isinstance(x, str) and x.strip()]
-        d["changes_from_round1"] = {"items": items} if items else {"items": []}
+        d["changes_from_round1"] = {"summary": ch}
+    elif ch is None:
+        d["changes_from_round1"] = {"summary": ""}
 
     return d
 
