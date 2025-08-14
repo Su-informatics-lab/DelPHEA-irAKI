@@ -272,38 +272,86 @@ def _split_lines_semicolons(s: str) -> List[str]:
 
 
 def _coerce_for_model_like_r1_r3(data: Dict[str, Any]) -> Dict[str, Any]:
-    d = dict(data)
+    """
+    Coerce loose LLM outputs into types that match our R1/R3 schemas.
 
+    - p_iraki / confidence / confidence_in_verdict → floats
+    - ci_iraki → [float, float]
+    - verdict → bool (accepts truthy/falsey words/phrases like "likely ...")
+    - recommendations → list[str] (from semicolon/line separated string)
+    - changes_from_round1 → dict (wrap string as {"summary": ...} or list[str] as {"items": [...]})
+    """
+    d = dict(data) if isinstance(data, dict) else {}
+
+    # numeric coercions
     for key in ("p_iraki", "confidence", "confidence_in_verdict"):
         if key in d and not isinstance(d[key], (int, float)):
             f = _to_float(d[key])
             if f is not None:
                 d[key] = f
 
-    if (
-        "ci_iraki" in d
-        and isinstance(d["ci_iraki"], (list, tuple))
-        and len(d["ci_iraki"]) == 2
-    ):
-        lo = _to_float(d["ci_iraki"][0])
-        hi = _to_float(d["ci_iraki"][1])
+    # ci_iraki -> [lo, hi] floats
+    ci = d.get("ci_iraki")
+    if isinstance(ci, (list, tuple)) and len(ci) == 2:
+        lo = _to_float(ci[0])
+        hi = _to_float(ci[1])
         if lo is not None and hi is not None:
             d["ci_iraki"] = [lo, hi]
 
-    if "verdict" in d and not isinstance(d["verdict"], bool):
-        if isinstance(d["verdict"], str):
-            val = d["verdict"].strip().lower()
-            truey = {"true", "yes", "y", "present", "positive", "likely"}
-            falsey = {"false", "no", "n", "absent", "negative", "unlikely"}
-            if val in truey:
-                d["verdict"] = True
-            elif val in falsey:
-                d["verdict"] = False
+    # verdict often comes back as prose (e.g., "Likely immune-related...").
+    if "verdict" in d and not isinstance(d.get("verdict"), bool):
+        v = d.get("verdict")
+        norm_bool = None
+        if isinstance(v, (int, float)):
+            # treat nonzero as True
+            norm_bool = bool(int(round(float(v))))
+        elif isinstance(v, str):
+            t = v.strip().lower()
+            # token sets + substring "likely"
+            truey = {
+                "true",
+                "yes",
+                "y",
+                "present",
+                "positive",
+                "likely",
+                "supportive",
+                "consistent",
+                "compatible",
+            }
+            falsey = {
+                "false",
+                "no",
+                "n",
+                "absent",
+                "negative",
+                "unlikely",
+                "unsupportive",
+                "inconsistent",
+                "incompatible",
+            }
+            tokens = set(re.findall(r"[a-z]+", t))
+            if t in truey or (tokens & truey) or re.search(r"\blikely\b", t):
+                norm_bool = True
+            elif t in falsey or (tokens & falsey):
+                norm_bool = False
+        if norm_bool is not None:
+            d["verdict"] = norm_bool
 
+    # recommendations: split a single string into a list of strings
     recs = d.get("recommendations")
     if isinstance(recs, str):
         items = _split_lines_semicolons(recs)
-        d["recommendations"] = items if items else ([])
+        d["recommendations"] = items if items else []
+
+    # changes_from_round1 must be a dict; convert common non-dict forms.
+    ch = d.get("changes_from_round1")
+    if isinstance(ch, str):
+        d["changes_from_round1"] = {"summary": ch.strip()}
+    elif isinstance(ch, list):
+        items = [x for x in ch if isinstance(x, str) and x.strip()]
+        if items:
+            d["changes_from_round1"] = {"items": items}
 
     return d
 
