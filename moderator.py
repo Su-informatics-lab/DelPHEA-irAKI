@@ -516,7 +516,8 @@ class Moderator:
             a1 = expert.assess_round1(case, self.qpath)
             vd = self._validation_payload_with_ids(a1, expert, case)
             try:
-                validate_round1_payload(vd, required_evidence=12)
+                # FIX: validators.validate_round1_payload no longer accepts 'required_evidence'
+                validate_round1_payload(vd, expected_qids=self.qids)
                 if attempt > 0:
                     self.logger.info(
                         "round1 validation succeeded after retry for %s",
@@ -559,7 +560,7 @@ class Moderator:
             a3 = expert.assess_round3(case, self.qpath, ctx)
             vd = self._validation_payload_with_ids(a3, expert, case)
             try:
-                validate_round3_payload(vd)
+                validate_round3_payload(vd, expected_qids=self.qids)
                 if attempt > 0:
                     self.logger.info(
                         "round3 validation succeeded after retry for %s",

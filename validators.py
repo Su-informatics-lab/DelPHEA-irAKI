@@ -725,7 +725,17 @@ def log_debate_status(*args, **kwargs) -> None:
         reason = kwargs.pop("reason", None)
         meta = kwargs.pop("meta", None)
 
-    allowed_status = {"start", "turn", "repair", "skip", "timeout", "error", "end"}
+    # ALLOW early_stop to match moderator usage
+    allowed_status = {
+        "start",
+        "turn",
+        "repair",
+        "skip",
+        "timeout",
+        "error",
+        "end",
+        "early_stop",
+    }
     allowed_stage = {"r1", "debate", "r3"}
 
     if stage not in allowed_stage:
