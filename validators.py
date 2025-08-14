@@ -485,75 +485,41 @@ def call_llm_with_schema(
                 )
                 return model
             except ValidationError as ve_first:
-                err_text = str(ve_first)
-
-                # Case A: importance sum != 100 → auto-rebalance, revalidate once
-                if (
-                    "importance must sum to 100" in err_text
-                    and isinstance(data, dict)
-                    and isinstance(data.get("importance"), dict)
-                ):
-                    patched = dict(data)
-                    patched["importance"] = _rebalance_importance(
-                        patched.get("importance", {})
+                # --- unconditional auto-repair path ---
+                patched = data if isinstance(data, dict) else {}
+                # normalize five per-qid dicts to expected order (if we know it)
+                if isinstance(patched, dict):
+                    target_qids = expected_qids or list(
+                        (patched.get("scores") or {}).keys()
                     )
-                    try:
-                        model = _try_validate(patched)
-                        payload = model.model_dump() if hasattr(model, "model_dump") else dict(model)  # type: ignore[arg-type]
-                        _dump_json(
-                            base,
-                            f"{case_id}/experts/{expert_id}/{round_key}/validated.json",
-                            payload,
+                    if target_qids:
+                        patched = _normalize_qdicts_to_expected(patched, target_qids)
+                    # always rebalance importance to EXACT 100
+                    if isinstance(patched.get("importance"), dict):
+                        patched["importance"] = _rebalance_importance(
+                            patched["importance"]
                         )
-                        _dump_json(
-                            base,
-                            f"{case_id}/experts/{expert_id}/{round_key}/autopatch.json",
-                            {
-                                "note": "importance rebalanced to 100",
-                                "attempt": attempt,
-                            },
-                        )
-                        return model
-                    except ValidationError as ve_second:
-                        last_err = ve_second
-                        # fall through to other auto-fixes below
-
-                # Case B: qid mismatch/order issues → normalize to expected_qids and revalidate
-                has_qid_mismatch = (
-                    "qid lists and order" in err_text
-                    or "qid_mismatch" in err_text
-                    or "qid order must match questionnaire" in err_text
-                )
-                if has_qid_mismatch and expected_qids and isinstance(data, dict):
-                    patched2 = _normalize_qdicts_to_expected(data, expected_qids)
-                    # After normalization, ensure importance sums to 100
-                    if isinstance(patched2.get("importance"), dict):
-                        patched2["importance"] = _rebalance_importance(
-                            patched2["importance"]
-                        )
-                    try:
-                        model = _try_validate(patched2)
-                        payload = model.model_dump() if hasattr(model, "model_dump") else dict(model)  # type: ignore[arg-type]
-                        _dump_json(
-                            base,
-                            f"{case_id}/experts/{expert_id}/{round_key}/validated.json",
-                            payload,
-                        )
-                        _dump_json(
-                            base,
-                            f"{case_id}/experts/{expert_id}/{round_key}/autopatch.json",
-                            {
-                                "note": "qid dicts normalized to expected order and importance rebalanced",
-                                "attempt": attempt,
-                            },
-                        )
-                        return model
-                    except ValidationError as ve_third:
-                        last_err = ve_third
-                        # fall through to retry
-
-                last_err = ve_first
-                continue
+                # try again after normalization + rebalance
+                try:
+                    model = _try_validate(patched)
+                    payload = model.model_dump() if hasattr(model, "model_dump") else dict(model)  # type: ignore[arg-type]
+                    _dump_json(
+                        base,
+                        f"{case_id}/experts/{expert_id}/{round_key}/validated.json",
+                        payload,
+                    )
+                    _dump_json(
+                        base,
+                        f"{case_id}/experts/{expert_id}/{round_key}/autopatch.json",
+                        {
+                            "note": "qid dicts normalized and importance rebalanced",
+                            "attempt": attempt,
+                        },
+                    )
+                    return model
+                except ValidationError as ve_second:
+                    last_err = ve_second
+                    continue
 
         except ValidationError as ve:
             last_err = ve
