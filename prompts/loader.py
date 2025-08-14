@@ -17,7 +17,7 @@ _FILE = "assessment_prompts.json"
 _cache_single: Optional[Dict[str, Any]] = None
 
 
-def set_prompts_dir(path: Path) -> None:
+def set_prompts_dir(path: Path | str) -> None:
     """override the prompts directory (clears cache)."""
     global _BASE_DIR, _cache_single
     p = Path(path).expanduser().resolve()
@@ -84,7 +84,6 @@ def _render_schema_block(
         part_rest = f"  {rest_joined}\n"
         header = "Required JSON schema (keys abbreviated):\n{\n"
         footer = "}"
-        # no backslashes inside f-string expressions (precomputed above)
         return f"{header}{part_scores}{part_evid}{part_rest}{footer}"
 
     if isinstance(fallback, str) and fallback.strip():
@@ -95,6 +94,32 @@ def _render_schema_block(
         "p_iraki, ci_iraki[2], confidence, clinical_reasoning, "
         "differential_diagnosis[], primary_diagnosis"
     )
+
+
+def _round_synonyms(round_key: str) -> list[str]:
+    """allow 'r1'/'round1' and 'r3'/'round3'."""
+    rk = round_key.lower().strip()
+    if rk in {"r1", "round1"}:
+        return ["r1", "round1"]
+    if rk in {"r3", "round3"}:
+        return ["r3", "round3"]
+    return [rk]
+
+
+def _round_node(single: Dict[str, Any], round_key: str) -> Dict[str, Any]:
+    """return the per-round dict if present; else empty dict."""
+    rounds = single.get("rounds")
+    if isinstance(rounds, dict):
+        for k in _round_synonyms(round_key):
+            node = rounds.get(k)
+            if isinstance(node, dict):
+                return node
+    # some configs put the round blocks at top-level (rare); tolerate it
+    for k in _round_synonyms(round_key):
+        node = single.get(k)
+        if isinstance(node, dict):
+            return node
+    return {}  # fall back to top-level keys entirely
 
 
 def load_unified_round(
@@ -114,47 +139,62 @@ def load_unified_round(
       - ci_instructions
     """
     single = _load_single()
+    r = _round_node(single, round_key)
 
-    rounds = single.get("rounds") or single
-    want = (
-        round_key
-        if round_key in rounds
-        else {"r1": "round1", "r3": "round3"}.get(round_key, round_key)
+    def _want_text(key: str, *, required: bool, default: str = "") -> str:
+        val = r.get(key)
+        if isinstance(val, str) and val.strip():
+            return val
+        val = single.get(key)
+        if isinstance(val, str) and val.strip():
+            return val
+        if required and not default:
+            raise KeyError(
+                f"{_FILE}['{round_key}'] missing '{key}' and no top-level fallback"
+            )
+        return default
+
+    # textual sections with fallback to top-level
+    preamble = _want_text("preamble", required=False, default="")
+    base_prompt = _want_text("base_prompt", required=True)  # formatters expect this
+    instructions = _want_text("instructions", required=True)
+    ci = _want_text("ci_instructions", required=True)
+    repair = _want_text(
+        "repair_heading", required=False, default="Repair instructions:"
     )
-    if want not in rounds or not isinstance(rounds[want], dict):
-        raise KeyError(f"{_FILE} missing rounds['{want}']")
 
-    r = rounds[want]
-    for k in ("preamble", "base_prompt", "instructions"):
-        if k not in r:
-            raise KeyError(f"{_FILE}['{want}'] missing '{k}'")
+    # checklist may be in round node or top-level
+    checklist_node = r.get("checklist", single.get("checklist", []))
+    if not (isinstance(checklist_node, list) and checklist_node):
+        raise KeyError(
+            f"{_FILE} missing 'checklist' (list) for '{round_key}' and top-level"
+        )
 
-    checklist = single.get("checklist") or r.get("checklist")
-    if not isinstance(checklist, list) or not checklist:
-        raise KeyError(f"{_FILE} missing 'checklist' (list)")
-
-    ci = single.get("ci_instructions")
-    if ci is None:
-        raise KeyError(f"{_FILE} missing 'ci_instructions'")
-
-    repair = (
-        single.get("repair_heading")
-        or r.get("repair_heading")
-        or "Repair instructions:"
-    )
+    # json_schema precedence:
+    # 1) rounds.<rk>.json_schema
+    # 2) top-level json_schema as a per-round map: json_schema[rk]
+    # 3) top-level json_schema (flat object)
+    js = r.get("json_schema")
+    if js is None:
+        top = single.get("json_schema")
+        if isinstance(top, dict) and any(k in top for k in _round_synonyms(round_key)):
+            for k in _round_synonyms(round_key):
+                if isinstance(top.get(k), dict):
+                    js = top[k]
+                    break
+        if js is None:
+            js = top if isinstance(top, dict) else None
 
     schema_block = _render_schema_block(
-        single.get("json_schema") or r.get("json_schema"),
-        qids,
-        single.get("schema_block") or r.get("schema_block"),
+        js, qids, single.get("schema_block") or r.get("schema_block")
     )
 
     return {
-        "preamble": str(r["preamble"]),
-        "base_prompt": str(r["base_prompt"]),
-        "instructions": str(r["instructions"]),
+        "preamble": str(preamble),
+        "base_prompt": str(base_prompt),
+        "instructions": str(instructions),
         "schema_block": schema_block,
-        "checklist": "\n".join(f"- {item}" for item in checklist),
+        "checklist": "\n".join(f"- {item}" for item in checklist_node),
         "repair_heading": str(repair),
         "ci_instructions": str(ci),
     }
