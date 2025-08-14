@@ -1,5 +1,11 @@
 """
 expert agent: specialty-conditioned assessor that emits strictly validated json.
+
+- Round 1: independent assessment (strict schema)
+- Debate (Round 2): single-turn producer with optional control lines parsed upstream
+- Round 3: independent re-assessment WITH a compact recap of ONLY THIS EXPERT'S prior
+  debate turns (not the whole transcript), so the agent "remembers" what they said
+  without leaking other panelists' content.
 """
 
 from __future__ import annotations
@@ -19,6 +25,11 @@ from validators import call_llm_with_schema
 
 class Expert:
     """specialty-conditioned assessor with strict schema validation."""
+
+    # recap display knobs for R3 prompts (kept small to avoid context bloat)
+    _RECAP_MAX_QIDS = 6
+    _RECAP_MAX_TURNS_PER_QID = 3
+    _RECAP_MAX_CHARS = 240
 
     def __init__(
         self,
@@ -128,10 +139,23 @@ class Expert:
         debate_context: Dict[str, Any],
         repair_hint: Optional[str] = None,  # reserved for future use
     ) -> AssessmentR3:
-        """produce a round-3 reassessment using strict pydantic validation at the boundary."""
+        """produce a round-3 reassessment using strict pydantic validation at the boundary.
+
+        The prompt includes a compact recap of ONLY THIS EXPERT'S prior debate turns
+        (last few per QID), not the full transcript. This respects the "experienced-only"
+        recall requirement without leaking other panelists' content.
+        """
         expected_qids: List[str] = load_qids(questionnaire_path)
 
         info = self._extract_case_strings(case)
+        recap_text = self._my_debate_recap(
+            self.expert_id,
+            debate_context or {},
+            max_qids=self._RECAP_MAX_QIDS,
+            max_turns=self._RECAP_MAX_TURNS_PER_QID,
+            max_chars=self._RECAP_MAX_CHARS,
+        )
+
         prompt_text = format_round3_prompt(
             expert_name=self._expert_name(),
             expert_id=self.expert_id,  # accepted by formatter via **_ sink
@@ -140,7 +164,7 @@ class Expert:
             demographics=info["demographics"],
             clinical_notes=info["clinical_notes"],
             qpath=questionnaire_path,
-            debate_ctx=debate_context,  # tolerated by formatter (**_ sink)
+            peer_feedback_summary=recap_text,  # ← per-expert recap only
         )
         # require identifiers again for consistency
         prompt_text += (
@@ -156,11 +180,13 @@ class Expert:
             relpath=f"experts/{self.expert_id}/r3.prompt.txt",
             text=prompt_text,
         )
-        self._dump_json(
-            case_id=info["case_id"],
-            relpath=f"experts/{self.expert_id}/r3.debate_ctx.json",
-            obj=debate_context,
-        )
+        # we also dump the personal recap to make audits easy
+        if recap_text:
+            self._dump_text(
+                case_id=info["case_id"],
+                relpath=f"experts/{self.expert_id}/r3.recap.txt",
+                text=recap_text,
+            )
 
         reply = call_llm_with_schema(
             response_model=AssessmentR3,
@@ -242,6 +268,51 @@ class Expert:
         return turn
 
     # --------- helpers ---------
+
+    def _my_debate_recap(
+        self,
+        expert_id: str,
+        debate_ctx: Dict[str, Any],
+        *,
+        max_qids: int,
+        max_turns: int,
+        max_chars: int,
+    ) -> Optional[str]:
+        """Return a compact recap of ONLY this expert's own debate turns.
+
+        Format example:
+          Q5:
+          - minority turn 0: <snippet> (revised_score=7)
+          - participant turn 3: <snippet> (revised_score=same)
+        """
+        tx = (debate_ctx or {}).get("transcripts", {}) or {}
+        if not isinstance(tx, dict) or not tx:
+            return None
+
+        # stable traversal by QID name
+        qids = sorted(tx.keys())
+        lines: List[str] = []
+        shown_qids = 0
+        for qid in qids:
+            if shown_qids >= max_qids:
+                break
+            turns = tx.get(qid) or []
+            mine = [t for t in turns if str(t.get("expert_id")) == expert_id]
+            if not mine:
+                continue
+            lines.append(f"{qid}:")
+            for t in mine[-max_turns:]:
+                role = (t.get("speaker_role") or "participant").strip()
+                idx = t.get("turn_index", 0)
+                rs = t.get("revised_score", "same")
+                txt = (t.get("text") or t.get("raw") or "").strip().replace("\n", " ")
+                if len(txt) > max_chars:
+                    txt = txt[: max_chars - 1].rstrip() + "…"
+                lines.append(f"- {role} turn {idx}: {txt} (revised_score={rs})")
+            shown_qids += 1
+
+        rec = "\n".join(lines).strip()
+        return rec or None
 
     def _coerce_debate_turn(self, raw: Any, *, qid: str, round_no: int) -> DebateTurn:
         """Coerce backend reply into DebateTurn fields.
