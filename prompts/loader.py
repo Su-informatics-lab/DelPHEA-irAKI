@@ -122,6 +122,17 @@ def _round_node(single: Dict[str, Any], round_key: str) -> Dict[str, Any]:
     return {}  # fall back to top-level keys entirely
 
 
+def _synth_base_prompt() -> str:
+    """fallback template when base_prompt is not provided in JSON."""
+    return (
+        "You are {expert_name} ({specialty}).\n"
+        "Case: {case_id}\n\n"
+        "Demographics:\n{demographics}\n\n"
+        "Clinical notes (subset for context):\n{clinical_notes}\n\n"
+        "Questions (QID → text):\n{questions}\n"
+    )
+
+
 def load_unified_round(
     *,
     round_key: str,  # 'r1' or 'r3'
@@ -156,12 +167,16 @@ def load_unified_round(
 
     # textual sections with fallback to top-level
     preamble = _want_text("preamble", required=False, default="")
-    base_prompt = _want_text("base_prompt", required=True)  # formatters expect this
     instructions = _want_text("instructions", required=True)
     ci = _want_text("ci_instructions", required=True)
     repair = _want_text(
         "repair_heading", required=False, default="Repair instructions:"
     )
+
+    # base_prompt: prefer round, then top-level; else synthesize
+    base_prompt = _want_text("base_prompt", required=False, default="")
+    if not base_prompt.strip():
+        base_prompt = _synth_base_prompt()
 
     # checklist may be in round node or top-level
     checklist_node = r.get("checklist", single.get("checklist", []))
