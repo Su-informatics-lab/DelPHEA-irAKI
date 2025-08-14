@@ -16,6 +16,7 @@ For each QID with disagreement:
        - speakers may append control lines: SATISFIED / REVISED_SCORE / HANDOFF
        - moderator prioritizes requested HANDOFF targets if eligible
        - experts exit when SATISFIED; loop ends when all satisfied, quiet, or capped
+       - early-stop guard: if agreement ≥ minimum_agreement after any turn, stop QID
 Each turn receives the prior turns for that QID via clinical_context["peer_turns"].
 
 contracts
@@ -31,6 +32,7 @@ import inspect
 import json
 import logging
 from dataclasses import dataclass
+from statistics import median
 from typing import Any, Dict, List, Sequence, Tuple
 
 from aggregator import Aggregator
@@ -151,12 +153,38 @@ class Moderator:
                 return e
         raise KeyError(f"expert not found: {expert_id}")
 
+    # --------- tiny helpers: agreement rule ---------
+
+    def _min_agreement(self) -> float:
+        """pull minimum_agreement from rules with a sensible default."""
+        # accept attribute, dict, or nested dict
+        val = getattr(self.rules, "minimum_agreement", None)
+        if val is None and isinstance(self.rules, dict):
+            val = self.rules.get("minimum_agreement", None)
+        try:
+            v = float(val)
+            if 0.0 < v <= 1.0:
+                return v
+        except Exception:
+            pass
+        return 0.70  # default if not specified
+
+    @staticmethod
+    def _agreement_fraction(scores: Dict[str, int]) -> Tuple[float, int]:
+        """compute fraction of experts within ±1 of the median (Delphi-style)."""
+        vals = [int(v) for v in scores.values() if isinstance(v, (int, float))]
+        if not vals:
+            return 0.0, 0
+        med = int(round(median(vals)))
+        agree = sum(1 for v in vals if abs(int(v) - med) <= 1) / len(vals)
+        return agree, med
+
     # --------- debate orchestration ---------
 
     def detect_and_run_debates(
         self, r1: Sequence[Tuple[str, AssessmentR1]], case: Dict[str, Any]
     ) -> Dict[str, Any]:
-        """Plan debates via router and run a small, handoff-aware turn loop per QID."""
+        """plan debates via router and run a small, handoff-aware turn loop per QID."""
         plan: DebatePlan = self.router.plan(r1, self.rules)
         solicitations = sum(len(v) for v in plan.by_qid.values())
         disagreement_present = solicitations > 0
@@ -237,7 +265,7 @@ class Moderator:
                 },
             )
 
-            # build a compact minority view text from R1
+            # build a compact minority view text from r1
             mv_lines = []
             for eid in minority_ids:
                 a = r1_by_id.get(eid)
@@ -262,8 +290,18 @@ class Moderator:
             turns_by_expert: Dict[str, int] = {eid: 0 for eid in all_ids}
             satisfied: set[str] = set()
 
+            # maintain current scores for this qid (seeded from r1; updated on revised_score)
+            current_scores: Dict[str, int] = {}
+            for eid in all_ids:
+                try:
+                    s = int(r1_by_id[eid].scores[qid])
+                except Exception:
+                    s = None
+                if isinstance(s, int) and 1 <= s <= 9:
+                    current_scores[eid] = s
+
             def _bubble_minority_followup(front_offset: int = 0) -> None:
-                """Move the opener's follow-up near the front (after any new handoff)."""
+                """move the opener's follow-up near the front (after any new handoff)."""
                 try:
                     idx = next(
                         i
@@ -313,16 +351,17 @@ class Moderator:
                 )
                 _append_turn(qid, td)
 
-                # update counters
+                # update counters / satisfaction
                 turns_by_expert[eid] = turns_by_expert.get(eid, 0) + 1
                 if bool(td.get("satisfied", False)):
                     satisfied.add(eid)
 
-                # HONOR HANDOFF: prioritize requested target.
-                # If target is already queued, bubble it to the front.
-                # - If this handoff comes from a minority_open and the target is
-                #   literally the next scheduled speaker, keep their planned role.
-                # - Otherwise, convert to 'participant' to indicate a directed handoff.
+                # apply revised score (if provided) to current scores for agreement checks
+                rs = td.get("revised_score", None)
+                if isinstance(rs, int) and 1 <= rs <= 9:
+                    current_scores[eid] = rs
+
+                # honor handoff: prioritize requested target if eligible
                 inserted_handoff = False
                 target = td.get("handoff_to")
                 if isinstance(target, str):
@@ -340,8 +379,6 @@ class Moderator:
                     )
                     if idx_in_queue is not None:
                         planned_role, _ = queue.pop(idx_in_queue)
-                        # Keep planned role only for the first minority→majority handoff case
-                        # (i.e., during a minority_open when the target is already next).
                         if role == "minority_open" and idx_in_queue == 0:
                             new_role = planned_role
                         else:
@@ -351,14 +388,32 @@ class Moderator:
                             role == "minority_open" and idx_in_queue == 0
                         )
                     else:
-                        # Not queued yet: insert fresh as a participant
                         queue.insert(0, ("participant", target))
                         inserted_handoff = True
 
-                # After any majority or participant, ensure opener's follow-up comes next
-                # (but *after* any just-inserted handoff).
+                # after any majority or participant, ensure opener's follow-up comes next
                 if role in ("majority_rebuttal", "participant"):
                     _bubble_minority_followup(front_offset=1 if inserted_handoff else 0)
+
+                # early-stop guard: stop once agreement reaches the questionnaire threshold
+                agree_frac, med = self._agreement_fraction(current_scores)
+                min_agree = self._min_agreement()
+                if agree_frac >= min_agree:
+                    log_debate_status(
+                        logger=self.logger,
+                        case_id=cid,
+                        question_id=qid,
+                        expert_id="moderator",
+                        stage="debate",
+                        status="early_stop",
+                        meta={
+                            "agreement": round(agree_frac, 3),
+                            "minimum_agreement": min_agree,
+                            "median_score": med,
+                            "turns_so_far": len(transcripts.get(qid, [])),
+                        },
+                    )
+                    break
 
                 # stop if everyone is done or capped
                 if all(
@@ -425,7 +480,7 @@ class Moderator:
     def _validation_payload_with_ids(
         self, assessed: AssessmentR1 | AssessmentR3, expert, case: Dict[str, Any]
     ) -> Dict[str, Any]:
-        """Return a dict suitable for validators, guaranteeing case_id/expert_id fields."""
+        """return a dict suitable for validators, guaranteeing case_id/expert_id fields."""
         d = assessed.model_dump() if hasattr(assessed, "model_dump") else dict(assessed)
         # derive case_id deterministically from the case payload or transient context
         cid = None
@@ -563,9 +618,9 @@ class Moderator:
 
     def _build_repair_hint(self, ve: ValidationError, round_no: int) -> str:
         """compact, model-friendly hint listing what failed and how to fix.
-        Works with pydantic.ValidationError or any duck-typed object exposing .errors().
+        works with pydantic.ValidationError or any duck-typed object exposing .errors().
         """
-        # Collect msg/loc from any error-like payload.
+        # collect msg/loc from any error-like payload.
         msgs: List[str] = []
         try:
             items = list(getattr(ve, "errors")() or [])
@@ -576,7 +631,7 @@ class Moderator:
             msg = err.get("msg", "invalid value")
             msgs.append(f"{loc}: {msg}")
 
-        # Friendly, round-specific prefix.
+        # friendly, round-specific prefix.
         if round_no == 1:
             prefix = (
                 "please fix: provide ≥200-char clinical_reasoning; non-empty primary_diagnosis; "
@@ -588,11 +643,11 @@ class Moderator:
                 "non-empty final_diagnosis; at least 1 recommendation.\n"
             )
 
-        # If we detect the common 'importance must sum to 100' case, add a very explicit instruction.
+        # if we detect the common 'importance must sum to 100' case, add a very explicit instruction.
         extra = ""
         if any("importance must sum to 100" in m for m in msgs):
             extra = (
-                "Ensure per-QID 'importance' are integers that sum to exactly 100 "
+                "ensure per-QID 'importance' are integers that sum to exactly 100 "
                 "(no rounding; adjust values, then regenerate).\n"
             )
 
@@ -607,7 +662,7 @@ class Moderator:
         """make a minimal, explicit placeholder fix so downstream code can proceed."""
         patched = dict(payload)
 
-        # identifiers (deterministic, not LLM-dependent)
+        # identifiers (deterministic, not llm-dependent)
         if not isinstance(patched.get("case_id"), str) or not patched["case_id"]:
             patched["case_id"] = (
                 getattr(self, "current_case_id", None)
@@ -670,7 +725,7 @@ class Moderator:
         """minimal placeholder fixes for round 3 structure."""
         patched = dict(payload)
 
-        # identifiers, same rationale as R1
+        # identifiers, same rationale as r1
         if not isinstance(patched.get("case_id"), str) or not patched["case_id"]:
             patched["case_id"] = (
                 getattr(self, "current_case_id", None)
