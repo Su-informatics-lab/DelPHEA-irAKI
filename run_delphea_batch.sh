@@ -1,11 +1,8 @@
 #!/usr/bin/env bash
 # run_delphea_batch.sh
-# Batch-run DelPHEA-irAKI over a list of case_ids (one per line).
-# Minimal deps: bash, python. Optional: bash≥4.3 for wait -n (for -j >1).
-
 set -euo pipefail
 
-# defaults (can be overridden by flags)
+# defaults
 CASES_FILE=""
 QUESTIONNAIRE="questionnaire_full.json"
 PANEL="panel.json"
@@ -17,7 +14,7 @@ JOBS=1
 SKIP_EXISTING=0
 VERBOSE=1
 
-# prompt budget & temps (mirror delphea_iraki.py)
+# prompt budget & temps
 CTX_WINDOW=102400
 MAX_NOTES=1024
 NOTE_CHAR_CAP=10240
@@ -29,35 +26,26 @@ T3=0.3
 usage() {
   cat <<USAGE
 Usage: $0 -f CASES_FILE [options]
-
-Required:
-  -f FILE                Text file with one case_id per line (e.g., iraki_case_123...)
-
-Options:
-  -q FILE                Questionnaire path (default: ${QUESTIONNAIRE})
-  -p FILE                Panel path (default: ${PANEL})
+  -f FILE                Case IDs file (one per line)
+  -q FILE                Questionnaire (default: ${QUESTIONNAIRE})
+  -p FILE                Panel (default: ${PANEL})
   -r sparse|full         Router (default: ${ROUTER})
   -e URL                 Endpoint URL (default: ${ENDPOINT_URL})
   -m MODEL               Model name (default: ${MODEL_NAME})
   -o DIR                 Output base dir (default: ${OUT_DIR})
   -j N                   Parallel jobs (default: ${JOBS})
-  -s                     Skip cases that already have summary/report (default: off)
-  -v                     Verbose (-v)  (use -vv by setting -v twice)
-  --ctx-window N         Context window tokens (default: ${CTX_WINDOW})
-  --max-notes N          Max notes passed to prompts (default: ${MAX_NOTES})
-  --note-char-cap N      Per-note char cap (default: ${NOTE_CHAR_CAP})
+  -s                     Skip already processed cases
+  -v                     Verbose (-v / -vv)
+  --ctx-window N         Context window (default: ${CTX_WINDOW})
+  --max-notes N          Max notes (default: ${MAX_NOTES})
+  --note-char-cap N      Per-note cap (default: ${NOTE_CHAR_CAP})
   --total-chars-cap N    Total chars cap (default: ${TOTAL_CHARS_CAP})
-  --t1 F                 Temperature round1 (default: ${T1})
-  --t2 F                 Temperature debate  (default: ${T2})
-  --t3 F                 Temperature round3 (default: ${T3})
-
-Example:
-  $0 -f cohort_case_ids.txt -j 2 -s -e "\$ENDPOINT_URL" -m "\$MODEL_NAME"
+  --t1 F --t2 F --t3 F   Temperatures (default: ${T1} ${T2} ${T3})
 USAGE
   exit 1
 }
 
-# parse flags (supports a few long options)
+# parse flags
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -f) CASES_FILE="$2"; shift 2 ;;
@@ -86,11 +74,14 @@ done
 [[ ! -f "$CASES_FILE" ]] && { echo "ERROR: cases file not found: $CASES_FILE"; exit 2; }
 
 mkdir -p "$OUT_DIR"
+export OUT_DIR  # so the Python summary sees the chosen dir
 
 run_one() {
   local cid="$1"
 
-  # skip if requested and already exists
+  # make per-case dir BEFORE redirecting logs
+  mkdir -p "$OUT_DIR/$cid"
+
   if [[ "$SKIP_EXISTING" -eq 1 ]]; then
     if [[ -f "$OUT_DIR/$cid/summary.json" || -f "$OUT_DIR/$cid/report.json" ]]; then
       echo "[skip] $cid"
@@ -100,7 +91,6 @@ run_one() {
 
   echo "[run ] $cid"
 
-  # build args for delphea_iraki.py
   python delphea_iraki.py \
     --case "$cid" \
     --q "$QUESTIONNAIRE" \
@@ -125,12 +115,11 @@ run_one() {
   echo "[done] $cid"
 }
 
-# semaphore for parallelism
+# parallel loop
 pids=()
 active=0
 max_jobs="${JOBS}"
 
-# read case IDs (ignore blank lines / comments)
 while IFS= read -r line || [[ -n "$line" ]]; do
   cid="$(echo "$line" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
   [[ -z "$cid" ]] && continue
@@ -140,13 +129,10 @@ while IFS= read -r line || [[ -n "$line" ]]; do
     run_one "$cid" &
     pids+=("$!")
     active=$((active+1))
-    # throttle if too many active jobs
     if (( active >= max_jobs )); then
-      # requires bash >= 4.3
-      if command -v bash >/dev/null 2>&1 && [[ "${BASH_VERSINFO[0]:-0}" -ge 4 ]]; then
+      if [[ "${BASH_VERSINFO[0]:-0}" -ge 4 ]]; then
         wait -n
       else
-        # fallback: wait for all then reset
         wait
         active=0
         pids=()
@@ -156,17 +142,14 @@ while IFS= read -r line || [[ -n "$line" ]]; do
   else
     run_one "$cid"
   fi
-
 done < "$CASES_FILE"
 
-# wait for remaining background jobs
 wait || true
 
-# optional: write a tiny batch summary CSV (case_id, verdict, p_iraki, status)
+# tiny batch summary
 python - <<'PY'
-import json, csv, sys, os
+import json, csv, os
 from pathlib import Path
-
 out_dir = os.environ.get("OUT_DIR", "out")
 rows = []
 for case_path in Path(out_dir).iterdir():
@@ -185,11 +168,11 @@ for case_path in Path(out_dir).iterdir():
             "decision_threshold": cons.get("decision_threshold"),
             "debate_skipped": data.get("debate_skipped"),
         })
-    except Exception as e:
+    except Exception:
         row["status"] = "error"
     rows.append(row)
-
 rows.sort(key=lambda r: r["case_id"])
+Path(out_dir).mkdir(parents=True, exist_ok=True)
 with open(os.path.join(out_dir, "batch_summary.csv"), "w", newline="", encoding="utf-8") as f:
     w = csv.DictWriter(f, fieldnames=["case_id","status","verdict","p_iraki","decision_threshold","debate_skipped"])
     w.writeheader()
