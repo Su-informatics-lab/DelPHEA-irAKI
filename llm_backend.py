@@ -80,8 +80,8 @@ class LLMBackend:
 
     def capabilities(self) -> Dict[str, Any]:
         """Advertise backend limits so validators can size prompts correctly."""
-        ctx = int(self._context_window) if self._context_window else 32768
-        return {"context_window": ctx, "json_mode": bool(self.supports_json_mode)}
+        ctx = int(self._context_window) if self._context_window else 102400
+        return {"context_window": ctx, "json_mode": self.supports_json_mode}
 
     def count_tokens(self, text: str) -> int:
         """approx token count used by validators; server-independent heuristic."""
