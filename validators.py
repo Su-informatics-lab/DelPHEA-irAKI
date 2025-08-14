@@ -29,17 +29,21 @@ DEFAULT_RETRIES = 3
 DEFAULT_RETRY_FACTOR = 1.5
 DEFAULT_RESERVE_TOKENS = 512
 
-# --- qid normalization & importance rebalance helpers ---
+# --- QID/order & importance normalization helpers ---
+
+_QID_LINE_RE = re.compile(r"^\s*(Q[0-9A-Za-z_]+)\s*:", re.MULTILINE)
 
 
-def _ordered_dict_from_keys(
-    src: Dict[str, Any], keys: List[str], *, default: Any
-) -> Dict[str, Any]:
-    out: Dict[str, Any] = {}
-    for q in keys:
-        v = src.get(q)
-        out[q] = v if v is not None else default
-    return out  # insertion order == keys order
+def _extract_qids_from_prompt(prompt: str) -> List[str]:
+    """Pull QIDs from lines like 'Q1: ...' in the prompt, preserving order."""
+    seen = set()
+    qids: List[str] = []
+    for m in _QID_LINE_RE.finditer(prompt or ""):
+        q = m.group(1)
+        if q not in seen:
+            seen.add(q)
+            qids.append(q)
+    return qids
 
 
 def _to_int_nonneg(x: Any, default: int = 0) -> int:
@@ -50,13 +54,51 @@ def _to_int_nonneg(x: Any, default: int = 0) -> int:
         return default
 
 
+def _to_float(x: Any, default: float | None = None) -> float | None:
+    try:
+        return float(x)
+    except Exception:
+        return default
+
+
+def _rebalance_importance(imp: Dict[str, Any]) -> Dict[str, int]:
+    """Return non-negative int weights summing to 100, preserving insertion order."""
+    keys = list(imp.keys())
+    n = len(keys)
+    if n == 0:
+        return {}
+
+    vals = [_to_int_nonneg(imp.get(k, 0), 0) for k in keys]
+    total = sum(vals)
+
+    if total <= 0:
+        base = 100 // n
+        rem = 100 % n
+        scaled = [base + (1 if i < rem else 0) for i in range(n)]
+    else:
+        scaled = [int(round(v * 100.0 / total)) for v in vals]
+        drift = 100 - sum(scaled)
+        if drift > 0:
+            for i in range(drift):
+                scaled[i % n] += 1
+        elif drift < 0:
+            order = sorted(range(n), key=lambda i: scaled[i], reverse=True)
+            j = 0
+            for _ in range(-drift):
+                while scaled[order[j % n]] == 0:
+                    j += 1
+                scaled[order[j % n]] -= 1
+                j += 1
+
+    return {k: scaled[i] for i, k in enumerate(keys)}
+
+
 def _normalize_qdicts_to_expected(
     payload: Dict[str, Any], expected_qids: List[str]
 ) -> Dict[str, Any]:
     """
-    Return a copy of payload where scores/rationale/evidence/q_confidence/importance
-    are dicts with EXACTLY expected_qids in that insertion order. Missing values get
-    benign defaults (they can be improved later by repair/autopatch).
+    Return a copy where scores/rationale/evidence/q_confidence/importance
+    contain EXACTLY expected_qids in that insertion order (extras dropped, missing filled).
     """
     d = dict(payload or {})
     five = {
@@ -71,30 +113,30 @@ def _normalize_qdicts_to_expected(
         else {},
     }
 
-    # Build normalized dicts in the exact questionnaire order
-    norm_scores = {}
-    norm_rat = {}
-    norm_evid = {}
-    norm_qc = {}
-    norm_imp = {}
+    norm_scores: Dict[str, int] = {}
+    norm_rat: Dict[str, str] = {}
+    norm_evid: Dict[str, str] = {}
+    norm_qc: Dict[str, float] = {}
+    norm_imp: Dict[str, int] = {}
+
     for q in expected_qids:
         # scores: safe neutral default = 5
         s = five["scores"].get(q)
-        s = int(s) if isinstance(s, int) and 1 <= s <= 9 else 5
-        norm_scores[q] = s
+        s_ok = int(s) if isinstance(s, int) and 1 <= s <= 9 else 5
+        norm_scores[q] = s_ok
 
-        # rationale/evidence: allow empty for now; moderator auto-repair will fill later
+        # rationale/evidence: allow empty (moderator auto-repair may fill later)
         rat = five["rationale"].get(q)
         norm_rat[q] = rat if isinstance(rat, str) else ""
 
         evid = five["evidence"].get(q)
         norm_evid[q] = evid if isinstance(evid, str) else ""
 
-        # q_confidence: default 0.5
+        # q_confidence: clamp to [0,1], default 0.5
         qc = _to_float(five["q_confidence"].get(q), 0.5)
         norm_qc[q] = 0.0 if qc is None else max(0.0, min(1.0, float(qc)))
 
-        # importance: gather raw; rebalance later
+        # importance: raw now; rebalance later
         w = five["importance"].get(q)
         norm_imp[q] = _to_int_nonneg(w, 0)
 
@@ -106,42 +148,7 @@ def _normalize_qdicts_to_expected(
     return d
 
 
-def _rebalance_importance(imp: Dict[str, Any]) -> Dict[str, int]:
-    """
-    Return a dict with same keys where values are non-negative ints that sum to 100.
-    Keeps insertion order.
-    """
-    keys = list(imp.keys())
-    vals = [_to_int_nonneg(imp.get(k, 0), 0) for k in keys]
-    total = sum(vals)
-    n = len(keys) if keys else 0
-
-    if n == 0:
-        return {}
-
-    if total <= 0:
-        base = 100 // n
-        rem = 100 % n
-        out_vals = [base + (1 if i < rem else 0) for i in range(n)]
-    else:
-        # scale with rounding, then fix any rounding drift
-        scaled = [int(round(v * 100.0 / total)) for v in vals]
-        drift = 100 - sum(scaled)
-        if drift > 0:
-            for i in range(drift):
-                scaled[i % n] += 1
-        elif drift < 0:
-            # subtract from the largest entries first (but never below 0)
-            order = sorted(range(n), key=lambda i: scaled[i], reverse=True)
-            j = 0
-            for _ in range(-drift):
-                while scaled[order[j % n]] == 0:
-                    j += 1
-                scaled[order[j % n]] -= 1
-                j += 1
-        out_vals = scaled
-
-    return {k: out_vals[i] for i, k in enumerate(keys)}
+# --- error helpers ---
 
 
 def _raise_ve(
@@ -160,6 +167,9 @@ def _raise_ve(
         ctx=(ctx or {}),
     )
     raise ValidationError.from_exception_data(title=title, line_errors=[err])
+
+
+# --- json extraction ---
 
 
 def _extract_first_json_object(text: str) -> str:
@@ -225,6 +235,9 @@ def _extract_first_json_object(text: str) -> str:
     )
 
 
+# --- counting / backend caps ---
+
+
 def _count_tokens(backend: Any, text: str) -> int:
     if hasattr(backend, "count_tokens") and callable(getattr(backend, "count_tokens")):
         try:
@@ -245,11 +258,7 @@ def _discover_context_window(backend: Any) -> int:
     return DEFAULT_CTX_WINDOW
 
 
-def _to_float(x: Any, default: float | None = None) -> float | None:
-    try:
-        return float(x)
-    except Exception:
-        return default
+# --- misc coercions ---
 
 
 def _split_lines_semicolons(s: str) -> List[str]:
@@ -299,6 +308,8 @@ def _coerce_for_model_like_r1_r3(data: Dict[str, Any]) -> Dict[str, Any]:
     return d
 
 
+# --- prompt scraping for ids ---
+
 _CASE_RE = re.compile(r'-\s*"case_id":\s*"([^"]+)"')
 _EXP_RE = re.compile(r'-\s*"expert_id":\s*"([^"]+)"')
 
@@ -324,6 +335,9 @@ def _round_key_from_model(response_model: Type[BaseModel]) -> str:
     return "gen"
 
 
+# --- dump helpers ---
+
+
 def _dump_write(base: Optional[Path], rel: str, content: str) -> None:
     if not base:
         return
@@ -346,125 +360,7 @@ def _dump_json(base: Optional[Path], rel: str, obj: Any) -> None:
         pass
 
 
-# ---------- helpers for auto-repair ----------
-
-
-def _rebalance_importance(imp: Dict[str, Any]) -> Dict[str, int]:
-    """Proportionally rescale nonnegative ints so the total is exactly 100."""
-    items: List[Tuple[str, int]] = []
-    for k, v in (imp or {}).items():
-        try:
-            iv = int(v)
-        except Exception:
-            iv = 0
-        if iv < 0:
-            iv = 0
-        items.append((k, iv))
-    if not items:
-        return {}
-    total = sum(iv for _, iv in items)
-    n = len(items)
-    if total == 100:
-        return {k: iv for k, iv in items}
-    if total <= 0:
-        base = [100 // n] * n
-        for i in range(100 - sum(base)):
-            base[i % n] += 1
-        return {k: base[i] for i, (k, _) in enumerate(items)}
-    scaled: List[Tuple[str, int, float]] = []
-    for k, iv in items:
-        exact = iv * 100.0 / float(total)
-        flo = int(exact)
-        frac = exact - flo
-        scaled.append((k, flo, frac))
-    floor_sum = sum(flo for _, flo, _ in scaled)
-    remainder = 100 - floor_sum
-    scaled.sort(key=lambda t: t[2], reverse=True)
-    out = {k: flo for k, flo, _ in scaled}
-    for i in range(max(0, remainder)):
-        k, _, _ = scaled[i % n]
-        out[k] = out.get(k, 0) + 1
-    return out
-
-
-def _normalize_qdicts_to_expected(
-    data: Dict[str, Any], expected_qids: List[str]
-) -> Dict[str, Any]:
-    """Align the five per-QID dicts to the exact expected_qids (order & membership)."""
-    if not isinstance(data, dict):
-        return data
-    out = dict(data)
-
-    # Pull existing dicts (may be missing/malformed)
-    scores = data.get("scores") or {}
-    rationale = data.get("rationale") or {}
-    evidence = data.get("evidence") or {}
-    q_conf = data.get("q_confidence") or {}
-    imp = data.get("importance") or {}
-
-    def _norm_score(v: Any) -> int:
-        try:
-            iv = int(v)
-        except Exception:
-            iv = 5
-        if iv < 1 or iv > 9:
-            iv = 5
-        return iv
-
-    def _norm_text(v: Any, placeholder: str) -> str:
-        s = str(v).strip() if isinstance(v, str) else ""
-        return s if s else placeholder
-
-    def _norm_conf(v: Any) -> float:
-        try:
-            f = float(v)
-        except Exception:
-            f = 0.5
-        if f < 0.0 or f > 1.0:
-            f = 0.5
-        return f
-
-    def _norm_imp(v: Any) -> int:
-        try:
-            iv = int(v)
-        except Exception:
-            iv = 0
-        return iv if iv >= 0 else 0
-
-    # Build fresh dicts strictly in expected order; drop extras, fill missing.
-    new_scores: Dict[str, int] = {}
-    new_rationale: Dict[str, str] = {}
-    new_evidence: Dict[str, str] = {}
-    new_qc: Dict[str, float] = {}
-    new_imp: Dict[str, int] = {}
-
-    for q in expected_qids:
-        new_scores[q] = _norm_score(scores.get(q))
-        new_rationale[q] = _norm_text(
-            rationale.get(q),
-            "[auto-repair] rationale missing for this question; please review.",
-        )
-        new_evidence[q] = _norm_text(
-            evidence.get(q),
-            "[auto-repair] evidence snippet missing; review source notes.",
-        )
-        new_qc[q] = _norm_conf(q_conf.get(q))
-        new_imp[q] = _norm_imp(imp.get(q))
-
-    # If all importance zeros, distribute evenly; otherwise we'll rebalance later.
-    if sum(new_imp.values()) <= 0:
-        n = len(expected_qids) or 1
-        base = [100 // n] * n
-        for i in range(100 - sum(base)):
-            base[i % n] += 1
-        new_imp = {q: base[i] for i, q in enumerate(expected_qids)}
-
-    out["scores"] = new_scores
-    out["rationale"] = new_rationale
-    out["evidence"] = new_evidence
-    out["q_confidence"] = new_qc
-    out["importance"] = new_imp
-    return out
+# --- main glue: call_llm_with_schema ---
 
 
 def call_llm_with_schema(
@@ -542,6 +438,18 @@ def call_llm_with_schema(
             return backend.get_completions(prompt, temperature=temperature, max_tokens=tokens)  # type: ignore[attr-defined]
         raise RuntimeError("llm backend does not expose a known generation method")
 
+    # expose the expected_qids (if any) to pydantic models
+    qids_context: List[str] = list(
+        expected_qids or _extract_qids_from_prompt(prompt_text)
+    )
+
+    def _try_validate(d: Dict[str, Any]) -> T:
+        if hasattr(response_model, "model_validate"):
+            return response_model.model_validate(
+                d, context={"expected_qids": qids_context}
+            )
+        return response_model(**d)  # type: ignore[call-arg]
+
     try:
         model_keys = list(response_model.model_fields.keys())
     except Exception:
@@ -581,14 +489,20 @@ def call_llm_with_schema(
             if isinstance(data, dict):
                 data = _coerce_for_model_like_r1_r3(data)
 
-            def _try_validate(d: Dict[str, Any]) -> T:
-                if hasattr(response_model, "model_validate"):
-                    return response_model.model_validate(
-                        d, context={"expected_qids": expected_qids or []}
+            # --- normalize & rebalance BEFORE validation, using canonical order ---
+            if isinstance(data, dict) and qids_context:
+                data = _normalize_qdicts_to_expected(data, qids_context)
+                data["importance"] = _rebalance_importance(data.get("importance", {}))
+            elif isinstance(data, dict) and not qids_context:
+                # fallback to whatever order the model used, then rebalance
+                fallback_qids = list((data.get("scores") or {}).keys())
+                if fallback_qids:
+                    data = _normalize_qdicts_to_expected(data, fallback_qids)
+                    data["importance"] = _rebalance_importance(
+                        data.get("importance", {})
                     )
-                return response_model(**d)  # type: ignore[call-arg]
 
-            # --- first pass ---
+            # First try
             try:
                 model = _try_validate(data)
                 payload = model.model_dump() if hasattr(model, "model_dump") else dict(model)  # type: ignore[arg-type]
@@ -598,37 +512,37 @@ def call_llm_with_schema(
                     payload,
                 )
                 return model
-            except ValidationError:
-                # --- unconditional normalize & rebalance, then retry ---
-                if not isinstance(data, dict):
-                    data = {}
-                qids = list(expected_qids or (list((data.get("scores") or {}).keys())))
-                if qids:
-                    data = _normalize_qdicts_to_expected(data, qids)
-                    data["importance"] = _rebalance_importance(
-                        data.get("importance", {})
-                    )
-                # second try
-                try:
-                    model = _try_validate(data)
-                    payload = model.model_dump() if hasattr(model, "model_dump") else dict(model)  # type: ignore[arg-type]
-                    _dump_json(
-                        base,
-                        f"{case_id}/experts/{expert_id}/{round_key}/validated.json",
-                        payload,
-                    )
-                    _dump_json(
-                        base,
-                        f"{case_id}/experts/{expert_id}/{round_key}/autopatch.json",
-                        {
-                            "note": "qid dicts normalized; importance rebalanced to 100",
-                            "attempt": attempt,
-                        },
-                    )
-                    return model
-                except ValidationError as ve2:
-                    last_err = ve2
-                    continue
+            except ValidationError as ve1:
+                last_err = ve1
+
+                # If we failed and we didn't have qids_context, try deriving from model keys
+                if isinstance(data, dict) and not qids_context:
+                    qids_context = list((data.get("scores") or {}).keys())
+                    if qids_context:
+                        patched = _normalize_qdicts_to_expected(data, qids_context)
+                        patched["importance"] = _rebalance_importance(
+                            patched.get("importance", {})
+                        )
+                        try:
+                            model = _try_validate(patched)
+                            payload = model.model_dump() if hasattr(model, "model_dump") else dict(model)  # type: ignore[arg-type]
+                            _dump_json(
+                                base,
+                                f"{case_id}/experts/{expert_id}/{round_key}/validated.json",
+                                payload,
+                            )
+                            _dump_json(
+                                base,
+                                f"{case_id}/experts/{expert_id}/{round_key}/autopatch.json",
+                                {
+                                    "note": "qid dicts normalized; importance rebalanced to 100",
+                                    "attempt": attempt,
+                                },
+                            )
+                            return model
+                        except ValidationError as ve2:
+                            last_err = ve2
+                continue  # retry loop
 
         except ValidationError as ve:
             last_err = ve
@@ -660,6 +574,9 @@ def call_llm_with_schema(
 
     assert last_err is not None
     raise last_err
+
+
+# --- downstream validators (unchanged) ---
 
 
 def _require_keys(obj: Dict[str, Any], keys: Iterable[str], title: str) -> None:
@@ -942,6 +859,9 @@ def validate_round3_payload(
         )
 
 
+# --- logging helper (with early_stop) ---
+
+
 def log_debate_status(*args, **kwargs) -> None:
     logger = kwargs.pop("logger", args[0] if args else None)
     if not isinstance(logger, logging.Logger):
@@ -976,7 +896,7 @@ def log_debate_status(*args, **kwargs) -> None:
         "timeout",
         "error",
         "end",
-        "early_stop",  # used by moderator
+        "early_stop",
     }
     allowed_stage = {"r1", "debate", "r3"}
 
