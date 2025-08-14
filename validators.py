@@ -29,6 +29,120 @@ DEFAULT_RETRIES = 3
 DEFAULT_RETRY_FACTOR = 1.5
 DEFAULT_RESERVE_TOKENS = 512
 
+# --- qid normalization & importance rebalance helpers ---
+
+
+def _ordered_dict_from_keys(
+    src: Dict[str, Any], keys: List[str], *, default: Any
+) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for q in keys:
+        v = src.get(q)
+        out[q] = v if v is not None else default
+    return out  # insertion order == keys order
+
+
+def _to_int_nonneg(x: Any, default: int = 0) -> int:
+    try:
+        v = int(float(x))
+        return v if v >= 0 else default
+    except Exception:
+        return default
+
+
+def _normalize_qdicts_to_expected(
+    payload: Dict[str, Any], expected_qids: List[str]
+) -> Dict[str, Any]:
+    """
+    Return a copy of payload where scores/rationale/evidence/q_confidence/importance
+    are dicts with EXACTLY expected_qids in that insertion order. Missing values get
+    benign defaults (they can be improved later by repair/autopatch).
+    """
+    d = dict(payload or {})
+    five = {
+        "scores": d.get("scores") if isinstance(d.get("scores"), dict) else {},
+        "rationale": d.get("rationale") if isinstance(d.get("rationale"), dict) else {},
+        "evidence": d.get("evidence") if isinstance(d.get("evidence"), dict) else {},
+        "q_confidence": d.get("q_confidence")
+        if isinstance(d.get("q_confidence"), dict)
+        else {},
+        "importance": d.get("importance")
+        if isinstance(d.get("importance"), dict)
+        else {},
+    }
+
+    # Build normalized dicts in the exact questionnaire order
+    norm_scores = {}
+    norm_rat = {}
+    norm_evid = {}
+    norm_qc = {}
+    norm_imp = {}
+    for q in expected_qids:
+        # scores: safe neutral default = 5
+        s = five["scores"].get(q)
+        s = int(s) if isinstance(s, int) and 1 <= s <= 9 else 5
+        norm_scores[q] = s
+
+        # rationale/evidence: allow empty for now; moderator auto-repair will fill later
+        rat = five["rationale"].get(q)
+        norm_rat[q] = rat if isinstance(rat, str) else ""
+
+        evid = five["evidence"].get(q)
+        norm_evid[q] = evid if isinstance(evid, str) else ""
+
+        # q_confidence: default 0.5
+        qc = _to_float(five["q_confidence"].get(q), 0.5)
+        norm_qc[q] = 0.0 if qc is None else max(0.0, min(1.0, float(qc)))
+
+        # importance: gather raw; rebalance later
+        w = five["importance"].get(q)
+        norm_imp[q] = _to_int_nonneg(w, 0)
+
+    d["scores"] = norm_scores
+    d["rationale"] = norm_rat
+    d["evidence"] = norm_evid
+    d["q_confidence"] = norm_qc
+    d["importance"] = norm_imp
+    return d
+
+
+def _rebalance_importance(imp: Dict[str, Any]) -> Dict[str, int]:
+    """
+    Return a dict with same keys where values are non-negative ints that sum to 100.
+    Keeps insertion order.
+    """
+    keys = list(imp.keys())
+    vals = [_to_int_nonneg(imp.get(k, 0), 0) for k in keys]
+    total = sum(vals)
+    n = len(keys) if keys else 0
+
+    if n == 0:
+        return {}
+
+    if total <= 0:
+        base = 100 // n
+        rem = 100 % n
+        out_vals = [base + (1 if i < rem else 0) for i in range(n)]
+    else:
+        # scale with rounding, then fix any rounding drift
+        scaled = [int(round(v * 100.0 / total)) for v in vals]
+        drift = 100 - sum(scaled)
+        if drift > 0:
+            for i in range(drift):
+                scaled[i % n] += 1
+        elif drift < 0:
+            # subtract from the largest entries first (but never below 0)
+            order = sorted(range(n), key=lambda i: scaled[i], reverse=True)
+            j = 0
+            for _ in range(-drift):
+                while scaled[order[j % n]] == 0:
+                    j += 1
+                scaled[order[j % n]] -= 1
+                j += 1
+        out_vals = scaled
+
+    return {k: out_vals[i] for i, k in enumerate(keys)}
+
 
 def _raise_ve(
     title: str,
@@ -367,7 +481,7 @@ def call_llm_with_schema(
     max_tokens: Optional[int] = None,
     expected_qids: Optional[List[str]] = None,
 ) -> T:
-    """Call backend, extract first JSON, normalize & validate with response_model."""
+    """Call backend, extract first JSON, normalize QID dicts & importance, validate."""
     ctx = int(
         ctx_window if ctx_window is not None else _discover_context_window(backend)
     )
@@ -474,7 +588,7 @@ def call_llm_with_schema(
                     )
                 return response_model(**d)  # type: ignore[call-arg]
 
-            # First-pass validate
+            # --- first pass ---
             try:
                 model = _try_validate(data)
                 payload = model.model_dump() if hasattr(model, "model_dump") else dict(model)  # type: ignore[arg-type]
@@ -484,24 +598,19 @@ def call_llm_with_schema(
                     payload,
                 )
                 return model
-            except ValidationError as ve_first:
-                # --- unconditional auto-repair path ---
-                patched = data if isinstance(data, dict) else {}
-                # normalize five per-qid dicts to expected order (if we know it)
-                if isinstance(patched, dict):
-                    target_qids = expected_qids or list(
-                        (patched.get("scores") or {}).keys()
+            except ValidationError:
+                # --- unconditional normalize & rebalance, then retry ---
+                if not isinstance(data, dict):
+                    data = {}
+                qids = list(expected_qids or (list((data.get("scores") or {}).keys())))
+                if qids:
+                    data = _normalize_qdicts_to_expected(data, qids)
+                    data["importance"] = _rebalance_importance(
+                        data.get("importance", {})
                     )
-                    if target_qids:
-                        patched = _normalize_qdicts_to_expected(patched, target_qids)
-                    # always rebalance importance to EXACT 100
-                    if isinstance(patched.get("importance"), dict):
-                        patched["importance"] = _rebalance_importance(
-                            patched["importance"]
-                        )
-                # try again after normalization + rebalance
+                # second try
                 try:
-                    model = _try_validate(patched)
+                    model = _try_validate(data)
                     payload = model.model_dump() if hasattr(model, "model_dump") else dict(model)  # type: ignore[arg-type]
                     _dump_json(
                         base,
@@ -512,13 +621,13 @@ def call_llm_with_schema(
                         base,
                         f"{case_id}/experts/{expert_id}/{round_key}/autopatch.json",
                         {
-                            "note": "qid dicts normalized and importance rebalanced",
+                            "note": "qid dicts normalized; importance rebalanced to 100",
                             "attempt": attempt,
                         },
                     )
                     return model
-                except ValidationError as ve_second:
-                    last_err = ve_second
+                except ValidationError as ve2:
+                    last_err = ve2
                     continue
 
         except ValidationError as ve:
