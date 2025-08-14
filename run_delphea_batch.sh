@@ -5,7 +5,7 @@ set -euo pipefail
 # defaults
 CASES_FILE=""
 QUESTIONNAIRE="questionnaire_full.json"
-PANEL="panel.json"
+PANEL="panel_full.json"
 ROUTER="sparse"
 ENDPOINT_URL="${ENDPOINT_URL:-http://localhost:8000}"
 MODEL_NAME="${MODEL_NAME:-openai/gpt-oss-120b}"
@@ -16,8 +16,8 @@ VERBOSE=1
 
 # prompt budget & temps
 CTX_WINDOW=102400
-MAX_NOTES=1024
-NOTE_CHAR_CAP=10240
+MAX_NOTES=100
+NOTE_CHAR_CAP=2048
 TOTAL_CHARS_CAP=600000
 T1=0.3
 T2=0.6
