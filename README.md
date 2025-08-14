@@ -1,351 +1,254 @@
-# DelPHEA for immune-related AKI (irAKI)
+# DelPHEA‑irAKI (Immune‑related AKI)
 
-**Del**phi **P**ersonalized **H**ealth **E**xplainable **A**gents for distinguishing immune-related AKI from AKI induced 
-by alternative reasons. DelPHEA simulates a diverse virtual panel of medical experts conducting a modified Delphi consensus process using 
-clinical notes and structured data. 
+DelPHEA simulates a small, diverse panel of virtual experts and runs a **modified Delphi** process over a fixed questionnaire to decide whether an AKI episode in an ICI‑treated patient is immune‑related. It ships with a **modular, testable pipeline** (Round‑1 → Debate → Round‑3 → Aggregate) and strict validation/repair logic.
 
-
-## Differential Diagnosis of AKI in Immune‑Checkpoint Inhibitor (ICI)–Treated Patients
-
-A meaningful fraction of kidney biopsies carried out in patients on ICIs reveal lesions **unrelated to immune 
-toxicity**. Misclassification exposes patients to unnecessary high‑dose steroids and interrupts life‑prolonging therapy. 
-Conversely, failure to recognise **true immune‑related AKI (irAKI)** risks permanent renal damage and relapse upon 
-rechallenge. The tables below summarise both sides of the ledger and map each diagnostic domain to members of our 
-updated Delphi panel.
+> If you only read one thing, read the big ASCII below — it’s the whole procedure with every knob and exit condition annotated.
 
 ---
 
-### 1. Alternative (Non‑immune) Causes of AKI
+## What’s new (short)
 
-| Aetiology                                                       | Key bedside / laboratory clues                                                 | Panel experts with primary insight                   |
-| --------------------------------------------------------------- |--------------------------------------------------------------------------------|------------------------------------------------------|
-| **Pre‑renal or haemodynamic AKI**                               | Hypotension, volume depletion, low FeNa < 1 %, creatinine improves with fluids | *Nephrologist*, *Intensivist*                        |
-| **Ischaemic / toxic ATN** (contrast, cisplatin, aminoglycoside) | Recent IV contrast / nephrotoxin; granular casts; bland sediment               | *Nephrologist*, *Pharmacist*, *Radiologist*          |
-| **Classic drug‑induced ATIN** (PPI, NSAID, β‑lactam)            | Eosinophiluria, rash, fever; recovery after culprit stopped                    | *Nephrologist*, *Pharmacist*                         |
-| **Glomerular disease & vasculitides**                           | Heavy proteinuria, dysmorphic haematuria; positive ANA/ANCA/complements        | *Pathologist*, *Rheumatologist*, *Nephrologist*      |
-| **Rhabdomyolysis / pigment nephropathy**                        | CK ≫ 5 000 U L‑¹, myalgia, dark urine                                          | *Intensivist*, *Emergency Physician*, *Nephrologist* |
-| **Obstructive (post‑renal) AKI**                                | Hydronephrosis or mass on imaging; relief after decompression                  | *Radiologist*, *Emergency Physician*                 |
-| **Sepsis‑associated / infection‑driven AKI**                    | Fever, positive cultures, rising creatinine despite adequate MAP               | *Infectious‑Disease Specialist*, *Intensivist*       |
-| **Age‑related vulnerability & polypharmacy**                    | eGFR < 45, ≥ 5 nephrotoxic meds, frailty indices, orthostatic BP drop          | *Geriatrician*, *Pharmacist*                         |
-
-*Key takeaway → Before declaring irAKI, the panel must document volume status, recent nephrotoxin exposure, imaging, infection screen, and urinalysis findings.*
+* **Modular rounds** with a single `Moderator` orchestrating experts.
+* **Deterministic debate loop** (minority → majority → handoff → minority follow‑up).
+* **Validators + one‑shot retry with hint** (e.g., *importance must sum to 100*).
+* **Autopatch fallback** (explicit placeholders) if retry still fails.
+* **Exact QID echo** enforcement (scores/evidence keys == questionnaire QIDs).
+* Simple **live backend smoke** path (OpenAI‑compatible / vLLM).
 
 ---
 
-### 2. Immune‑Related AKI (irAKI) Attributable to ICIs
+## Core contracts (data in/out)
 
-| Pathologic pattern                                                                                | Typical timing & clinical clues                                                                                                                                   | Panel experts with primary insight                    |
-|---------------------------------------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------|-------------------------------------------------------|
-| **Acute tubulo‑interstitial nephritis (ATIN)**<br>*(≈ 70 % of biopsy‑confirmed irAKI)*            | Appears ≥ 2–16 weeks after ICI start; sterile pyuria, mild proteinuria (< 1 g day‑¹), WBC casts, eosinophiluria; often co‑occurs with other irAEs (rash, colitis) | *Oncologist*, *Nephrologist*, *Pathologist*           |
-| **Glomerular lesions**<br>(MCD, membranous GN, IgA GN)                                            | Nephrotic‑range proteinuria or haematuria; biopsy shows podocytopathy or immune deposits; may lag behind other irAEs                                              | *Pathologist*, *Nephrologist*, *Rheumatologist*       |
-| **Thrombotic micro‑angiopathy (TMA)**                                                             | MAHA, thrombocytopenia, rising LDH; biopsy shows endothelial swelling, double contours                                                                            | *Pathologist*, *Intensivist*, *Oncologist*            |
-| **C4d‑negative antibody‑mediated rejection–like pattern** (in prior kidney‑transplant recipients) | Sudden creatinine spike in allograft, donor‑specific Ab negative; biopsy with peritubular capillaritis                                                            | *Transplant Nephrologist* (consulting), *Pathologist* |
-| **Granulomatous interstitial nephritis**                                                          | Non‑caseating granulomas on biopsy; consider sarcoid‑like irAE; imaging may show mediastinal nodes                                                                | *Pathologist*, *Radiologist*, *Rheumatologist*        |
-| **Immune complex tubulo‑interstitial nephritis**                                                  | Low complements, sub‑nephrotic proteinuria; biopsy with immune complex deposition                                                                                 | *Pathologist*, *Rheumatologist*                       |
+**Round 1** (`AssessmentR1`)
 
-**Diagnostic anchors for irAKI**
+* `scores: dict[qid, int]`
+* `evidence: dict[qid, str]`
+* `clinical_reasoning: str` (≥ 200 chars)
+* `primary_diagnosis: str`
+* `differential_diagnosis: list[str]` (≥ 2)
+* `rationale / q_confidence / importance` **per‑QID**
 
-* Biopsy confirmation whenever feasible (KDIGO stage ≥ 2 or unclear aetiology).
-* Association with other irAEs and ICI exposure timeline strengthens causality.
-* Prompt response to high‑dose corticosteroids (1 mg kg‑¹ prednisone equiv.) supports immune aetiology, but beware of confounders (e.g., ATIN from PPI also steroid‑responsive).
+  * `importance: dict[str, int]` and **sums to exactly 100**
+* `p_iraki: float`, `ci_iraki: tuple[float, float]`, `confidence: float`
+
+**Debate turn** (`DebateTurn`)
+
+* `text: str`, `satisfied: bool`, optional `handoff_to: str | None`
+
+**Round 3** (`AssessmentR3`)
+
+* Same per‑QID fields + `changes_from_round1`, `final_diagnosis`, `recommendations`
+* `verdict: bool`, `confidence_in_verdict: float`
+
+**Consensus** (aggregator output)
+
+* `iraki_probability: float`, `ci_iraki: tuple[float, float]`, `iraki_verdict: bool`, etc.
 
 ---
 
-### 3. Why the Panel Composition Matters
-
-| Diagnostic task                                      | Critical expertise                                   |
-| ---------------------------------------------------- |------------------------------------------------------|
-| Exclude haemodynamic, toxic, or obstructive causes   | *Nephrologist*, *Radiologist*, *Intensivist*         |
-| Interpret kidney biopsy patterns                     | *Pathologist*, *Nephrologist*                        |
-| Correlate ICI dosing & timing with creatinine rise   | *Oncologist*, *Pharmacist*, *Informatician*          |
-| Identify immune signatures & systemic irAEs          | *Oncologist*, *Rheumatologist*, *Nurse Practitioner* |
-| Balance cancer control with renal recovery & frailty | *Oncologist*, *Geriatrician*                         |
-| Rule out infection‑related AKI before steroids       | *Infectious‑Disease Specialist*, *Intensivist*       |
-
-This structured matrix ensures every plausible mechanism—immune or otherwise—is weighed, maximising diagnostic accuracy 
-and safeguarding both oncologic and renal outcomes.
-
-## Expert Panel Specialties
-
-1. Oncologist
-2. Nephrologist
-3. Pathologist
-4. Pharmacist
-5. Intensivist
-6. Rheumatologist
-7. Emergency Physician
-8. Radiologist
-9. Infectious Disease Specialist
-10. Geriatrician
-11. Nurse Practitioner
-
-
-## Clinical Assessment Questions
-
-The irAKI classification system uses 16 evidence-based questions (enhanced with peer review):
-
-1. **Temporal Relationship**: ICI exposure timing vs. AKI onset (combination vs monotherapy patterns)
-2. **Prerenal Exclusion**: Volume status, hypotension, medication effects  
-3. **Postrenal Exclusion**: Obstruction, structural abnormalities
-4. **Other Intrinsic Exclusion**: ATN, contrast nephropathy, other drugs
-5. **Urinalysis Pattern**: Proteinuria, hematuria, cellular casts (excluding ATN patterns)
-6. **Immune Activation**: Systemic inflammatory markers
-7. **Concomitant Medications**: PPI, NSAID, antibiotic assessment
-8. **Other irAE Correlation**: Multi-organ immune manifestations
-9. **Biopsy Indication**: Expected immune-mediated pathology
-10. **Treatment Response**: Clinical course and steroid response
-11. **Alternative Diagnosis Exclusion**: Systematic differential assessment  
-12. **Clinical Gestalt**: Overall irAKI likelihood
-13. **Infection Exclusion**: Sepsis, pyelonephritis, occult infections in immunocompromised
-14. **Imaging Evidence**: Radiologic patterns supporting immune vs structural causes
-15. **Baseline Risk Factors**: CKD, age-related changes, frailty considerations
-16. **Rechallenge Assessment**: Risk-benefit analysis for restarting ICI therapy
-
-
-## System Architecture
-
-### Modular Components
+## The whole flow (annotated ASCII)
 
 ```
-DelPHEA-irAKI/
-├── delphea.py                 # main
-├── config/
-│   ├── panel.json             # expert panel configuration
-│   └── questionnaire.json     # clinical assessment questions
-├── search.py                  # PubMed/bioRxiv integration
-├── output/                    # results and transcripts
-├── demo.py                    # examples
-└── requirements.txt           # dependencies
+                                  ┌────────────────────────────────────────────────┐
+                                  │                    Moderator                   │
+                                  │  inputs: case, experts[], questionnaire, rules │
+                                  └───────────────┬────────────────────────────────┘
+                                                  │
+                           (A) Round 1 fan-out    │  assess_round(1, case)
+                                                  ▼
+       ┌──────────────────────┐         ┌──────────────────────┐         ┌──────────────────────┐
+       │       Expert E1      │  ...    │       Expert Ek      │  ...    │       Expert EN      │
+       │ assess_round1(case)  │         │ assess_round1(case)  │         │ assess_round1(case)  │
+       └──────────┬───────────┘         └──────────┬───────────┘         └──────────┬───────────┘
+                  │                                │                                │
+                  │  (A1) Validate each payload:   │                                │
+                  │  - exact QID echo (scores/evidence keys == questionnaire QIDs)  │
+                  │  - schema + business rules (≥200 chars reasoning, etc.)         │
+                  │  - importance is INT and sums to exactly 100                    │
+                  │                                                                 │
+                  └─────────────────────────────────────────────────────────────────┘
+                                                  │
+                                                  │ if any ValidationError:
+                                                  │     → one-shot retry with repair_hint
+                                                  │     → else autopatch & continue
+                                                  ▼
+                              (B) Router: detect QIDs needing debate
+                               router.plan(r1, rules) → DebatePlan.by_qid = {qid: [minority_ids]}
+                                                  │
+                                                  ├───────────── if no_disagreement → debate_skipped=True
+                                                  │
+                                                  ▼
+                                   (C) Debate orchestration per QID
+   ┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+   │ INITIAL QUEUE (per QID):                                                                                             │
+   │   1) minority_open from each minority expert (order: as listed by router)                                            │
+   │   2) majority_rebuttal from all other experts                                                                        │
+   │   3) minority_followup from the first minority (the “opener”)                                                        │
+   │                                                                                                                      │
+   │ LOOP (bounded): while queue not empty and turns < max_total_turns_per_qid                                           │
+   │   • Pop next (role, eid). Skip if expert already satisfied or capped by max_turns_per_expert.                        │
+   │   • Build clinical_context = { case, peer_turns=last max_history_turns, role }.                                      │
+   │   • Call e.debate(qid, round_no=2, clinical_context, minority_view=text).                                            │
+   │   • Record turn: {expert_id, qid, turn_index, speaker_role=minority/majority/participant}.                           │
+   │   • If turn.satisfied==True → mark expert satisfied.                                                                 │
+   │   • HONOR HANDOFF: if turn.handoff_to == valid target and target not satisfied and not capped:                       │
+   │        - If target is already queued: pop it;                                                                        │
+   │             * if current role is 'minority_open' AND target was next: keep its planned role;                         │
+   │             * else reinsert at front as ('participant', target).                                                     │
+   │        - If target not queued: insert at front as ('participant', target).                                           │
+   │   • After any majority or participant, bubble opener’s 'minority_followup' to run next                               │
+   │     (after any just-inserted handoff).                                                                               │
+   │   • EXIT CONDITIONS (any):                                                                                           │
+   │        - All minority+majority experts satisfied OR capped                                                           │
+   │        - Queue exhausted                                                                                              │
+   │        - Reached max_total_turns_per_qid                                                                             │
+   └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+                                                  │
+                                                  ▼
+                                  (D) Round 3 fan-out  assess_round(3, case, debate_ctx)
+                                                  │
+                                same validate → retry → autopatch discipline as Round 1
+                                                  │
+                                                  ▼
+                                       (E) Aggregate to Consensus
+                                       aggregator.aggregate(r3[]) → Consensus
+                                                  │
+                                                  ▼
+                                     (F) Return full report (dict)
+                                     {case_id, round1[], debate, round3[], consensus}
 ```
 
-## Quick Start
+**Default knobs (tunable in `Moderator`):**
 
-### 1. **Installation**
-```bash
-# clone repository and install dependencies
-uv pip install --pre vllm==0.10.1+gptoss \
-    --extra-index-url https://wheels.vllm.ai/gpt-oss/ \
-    --extra-index-url https://download.pytorch.org/whl/nightly/cu128 \
-    --index-strategy unsafe-best-match
-pip install -r requirements.txt
+* `max_retries = 1` *(per expert, per round)*
+* `debate_rounds = 3` *(kept for parity; actual loop bounded by turn caps)*
+* `max_history_turns = 6` *(peer turns passed back to experts)*
+* `max_turns_per_expert = 2`
+* `max_total_turns_per_qid = 12`
+* `quiet_turn_limit = 3` *(placeholder knob; quiet-turn detection TBD)*
 
-# ensure AWS vLLM infrastructure is configured
-export VLLM_ENDPOINT="http://172.31.11.192:8000"
-```
+---
 
-### 2. **Basic Usage**
-```bash
-# health check
-python delphea.py --health-check
+## Debate specifics (who speaks, handoff, exit)
 
-# basic irAKI classification
-python delphea.py --case-id iraki_case_001 --verbose
+* **Kick‑start:** Every QID chosen by the router asks **all minority experts** to open.
+* **Who speaks next:** All **majority rebuttals**, then bubble the **opener’s** minority follow‑up.
+* **Handoff semantics:**
 
-# with literature search
-python delphea.py --case-id iraki_case_001 --enable-literature-search --verbose
-```
+  * If a speaker sets `handoff_to = X` and X is eligible (not satisfied/capped):
 
-### 3. **Example Runner**
-```bash
-# run basic example
-python demo.py --example basic
+    * If X is already queued **as next** and current role is `minority_open`, keep X’s planned role.
+    * Otherwise, put X **at the front** as `('participant', X)`.
+* **Exit conditions (any):**
 
-# run with literature search
-python demo.py --example with-literature
+  * Everyone (minority + majority sets) is **satisfied** or **capped**.
+  * **Queue exhausted**.
+  * **Max total turns per QID** reached.
+* **Context to experts on each turn:**
 
-# run with custom expert panel
-python demo.py --example custom-panel
+  * `clinical_context = { case, peer_turns=[last N turns], role }`
+  * `minority_view` is a compact string constructed from minority R1 scores+evidence.
 
-# check prerequisites
-python demo.py --check-prereqs
-```
+---
 
-### 4. **Custom Configuration**
-```bash
-# use custom expert panel and questionnaire
-python delphea.py \
-  --expert-panel-config my_experts.json \
-  --questionnaire-config my_questions.json \
-  --case-id my_case_001
-```
+## Validation, retry, autopatch
 
-## Literature Search Integration
+1. **Primary validation** (`validators.py`)
 
-When enabled (`--enable-literature-search`), the system:
+   * Schema + business rules for R1/R3.
+   * **Importance** is `dict[str,int]` and **sums to 100**.
+   * `ci_iraki` is a **tuple** `(low, high)`.
+   * Round‑specific checks: R1 (reasoning length, PDx/DDx); R3 (changes/final dx/recs, verdict fields).
 
-1. **Generates specialty-specific queries** for each expert
-2. **Searches PubMed** for peer-reviewed literature (last 5 years)
-3. **Searches bioRxiv** for recent preprints (last 2 years)  
-4. **Ranks results by relevance** using irAKI-specific keywords
-5. **Extracts key sentences** for clinical reasoning
-6. **Integrates citations** into expert assessments
+2. **On failure** the `Moderator` **retries once with a hint**
 
-### Literature Search Example
+   * `_build_repair_hint(err, round_no)` composes a concise, model‑friendly message from `err.errors()`.
+   * If message contains *“importance must sum to 100 (got X)”*, we append an explicit directive:
 
-```python
-# Expert: Nephrology
-Query: "immune checkpoint inhibitor acute kidney injury drug induced nephritis AKI"
+     * *“Ensure per‑QID 'importance' are integers that sum to exactly 100 (no rounding; adjust values, then regenerate).”*
+   * The retry passes `repair_hint` **iff** the expert method signature accepts it (duck‑typed via `inspect.signature`).
 
-# Expert: Oncology  
-Query: "immune checkpoint inhibitor acute kidney injury immunotherapy toxicity irAE"
+3. **If retry still fails**, the `Moderator` performs a **minimal autopatch** so the pipeline can continue
 
-# Results integrated into clinical reasoning with citations
-```
+   * Fill missing evidence with a visible placeholder.
+   * Synthesize ≥200‑char `clinical_reasoning` if empty.
+   * Fill missing PDx/DDx (R1) and R3 `changes_from_round1`/`recommendations` with explicit placeholders.
+   * **Note:** Autopatch does **not** invent an “importance=100” distribution; correctness is expected to come from the retry.
 
-## Output for Human Review
+4. **QID discipline** (after each R1/R3):
 
-### 1. **Consensus Results**
-```json
-{
-  "final_consensus": {
-    "iraki_probability": 0.73,
-    "iraki_verdict": true,
-    "consensus_confidence": 0.81,
-    "expert_count": 8
-  }
-}
-```
+   * `set(scores.keys()) == set(evidence.keys()) == set(questionnaire_qids)` → else error.
 
-### 2. **Expert Assessments**
-- Individual specialty perspectives with detailed reasoning
-- Round 1 vs. Round 3 changes and explanations
-- Literature citations (when enabled)
-- Specialty-specific differential diagnoses
+---
 
-### 3. **Debate Transcripts**
-- Question-specific disagreements and resolutions
-- Expert arguments with supporting evidence
-- Literature citations in debates
-- Satisfaction indicators and consensus building
+## Quick usage
 
-### 4. **Clinical Timeline**
-- Immunotherapy exposure history
-- AKI progression timeline
-- Key clinical events and temporal relationships
+### Live OpenAI‑compatible backend (vLLM, etc.)
 
-## Configuration Options
-
-### Expert Panel Customization
+Set one of:
 
 ```bash
-# full expert panel (10 experts)
---expert-panel-config config/expert_panel.json
-
-# custom focused panel (4 experts)  
---expert-panel-config config/expert_panel_custom.json
+export ENDPOINT_URL="http://host:8000"
+# or
+export OPENAI_BASE_URL="http://host:8000"
+# or
+export LIVE_BACKEND_URL="http://host:8000"
 ```
 
-### Literature Search Configuration
+Optional model name:
 
 ```bash
-# enable with default settings
---enable-literature-search
-
-# custom literature settings
---enable-literature-search \
---max-literature-results 3 \
---literature-recent-years 3 \
---literature-email "your@email.com"
+export MODEL_NAME="openai/gpt-oss-120b"
 ```
 
-### Assessment Configuration
+### Run tests
+
+* Smoke (debate only, live backend):
 
 ```bash
-# standard 12-question assessment
---questionnaire-config config/questionnaire_iraki.json
-
-# custom question set
---questionnaire-config config/questionnaire_custom.json
+pytest tests/test_round2_live_moderator_smoke.py -q
 ```
 
-## Development and Customization
+* Modular scripted rounds:
 
-### Adding New Expert Specialties
+```bash
+pytest tests/test_rounds_modular.py -q
+```
 
-1. Update `config/expert_panel.json` with new expert definitions
-2. Add specialty-specific keywords to `modules/literature_search.py` 
-3. Update questionnaire focus areas if needed
+* Importance retry behavior (sum must be 100):
 
-### Modifying Assessment Questions
+```bash
+pytest tests/test_importance_retry.py -q
+```
 
-1. Edit `config/questionnaire_iraki.json`
-2. Add clinical context and evidence criteria
-3. Update scoring guidelines and decision support thresholds
+---
 
-### Extending Literature Search
+## Configuration knobs (where they matter)
 
-1. Add new databases/APIs to `modules/literature_search.py`
-2. Implement custom relevance scoring algorithms
-3. Add specialty-specific query enhancement rules
+* **Moderator(...)**
 
-## Clinical Research Applications
+  * `max_retries=1` *(per expert, per round)*
+  * `debate_rounds=3` *(present; loop bounded by turn caps)*
+  * `max_history_turns=6`, `max_turns_per_expert=2`, `max_total_turns_per_qid=12`
+* **Router**: implements `plan(r1, rules) → DebatePlan(by_qid: dict[qid, list[minority_ids]])`.
+* **Validators**: pydantic/business checks + helpful messages.
+* **Aggregator**: reduces R3 payloads to a single `Consensus`.
 
-### 1. **Decision Support Development**
-- Prototype for irAKI clinical decision tools
-- Framework for other immune-related adverse events
-- Educational tool for immunotherapy toxicity training
+---
 
-### 2. **Knowledge Discovery**  
-- Analysis of expert reasoning patterns
-- Identification of clinical decision-making processes
-- Insights into specialty-specific perspectives on irAKI
+## Developer notes
 
-### 3. **Quality Improvement**
-- Standardization of irAKI assessment approaches
-- Consensus development for challenging cases
-- Training material for medical education
+* `_build_repair_hint` is **duck‑typed**: any object with `.errors() -> list[{loc,msg}]` works (enables unit tests to inject fakes).
+* `repair_hint` is only passed if the callee supports it (checked via `inspect.signature`).
+* `ci_iraki` is a **tuple** throughout, not a list.
+* `importance` is a **dict\[str,int]** that must sum to **exactly 100** (under‑ or over‑sum triggers retry; covered by tests).
+* Debate honors directed `handoff_to` with clear precedence rules (keep planned role only for minority→next; otherwise insert as participant at front).
 
-## Validation Approach
+---
 
-Since ground truth outcomes are not available for irAKI classification:
+## Roadmap / open questions
 
-### 1. **Human Expert Chart Review**
-- Real physicians review AI consensus decisions
-- Assessment of clinical reasoning quality  
-- Identification of missed considerations
-- Comparison with human expert judgment
-
-### 2. **Process Validation**
-- Consistency of expert reasoning across cases
-- Appropriate use of clinical evidence
-- Specialty-specific contribution analysis
-- Debate quality and resolution effectiveness
-
-### 3. **Clinical Utility Assessment**
-- Decision support value for clinicians
-- Educational benefit for training programs
-- Identification of knowledge gaps in irAKI assessment
-
-## Future Directions
-
-### 1. **Ground Truth Integration**
-- Biopsy result correlation (when available)
-- Response to immunosuppressive therapy outcomes
-- Long-term renal function follow-up
-
-### 2. **Expanded Clinical Scope**
-- Other immune-related adverse events (hepatitis, pneumonitis)
-- Multi-organ irAE assessment and correlation
-- Treatment response prediction models
-
-### 3. **Clinical Integration**
-- Electronic health record integration
-- Real-time clinical decision support
-- Automated case identification and triage
-
-### 4. **Enhanced Literature Integration**
-- Real-time literature monitoring
-- Guideline integration and updates
-- Clinical trial result incorporation
-
-## Contributing
-
-This system is designed for clinical research in immune-related adverse events. 
-
-### Research Collaboration 
-- **Code/Technical**: Haining Wang (hw56@iu.edu)
-- **General Questions**: Jing Su (su1@iu.edu)
-
-## License
-
-MIT for code. Clinical data requires appropriate institutional permissions.
+* Quiet‑turn detection (use `quiet_turn_limit`) to end low‑value debates early.
+* Structured handoff reasons and auto‑re‑routing when majority splinters.
+* Richer aggregation (uncertainty propagation, expert weighting).
+* Pluggable *explainers* to convert transcripts into clinician‑friendly synopses.
