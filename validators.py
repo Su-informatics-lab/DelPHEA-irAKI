@@ -271,15 +271,86 @@ def _split_lines_semicolons(s: str) -> List[str]:
     return parts
 
 
+def _coerce_bool_from_freeform(v: Any) -> Optional[bool]:
+    """
+    Try to coerce a free-form value into a boolean.
+
+    Accepts:
+      - real booleans
+      - numbers (nonzero => True)
+      - strings with common clinical phrasing:
+        * positive-ish:  "likely", "very likely", "highly likely", "probable",
+          "definite", "confirmed", "present", "positive", "consistent with",
+          "supports", "supported", "supportive", "favors/favours", "diagnosis made"
+        * negative-ish:  "unlikely", "improbable", "absent", "negative",
+          "ruled out", "excluded", "not present", "not supported",
+          "not consistent", "does not support/fit/favor"
+        * fallback: "possible", "suspected", "suspicion" → True (schema requires bool)
+    Returns None if it can’t decide.
+    """
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return bool(int(round(float(v))))
+    if not isinstance(v, str):
+        return None
+
+    t = v.strip().lower()
+    # normalize dashes to plain hyphen
+    t = re.sub(r"[\u2010-\u2015–—]", "-", t)
+
+    pos_patterns = [
+        r"\b(very|highly)\s*likely\b",
+        r"\blikely\b",
+        r"\bprobable\b",
+        r"\bdefinite\b",
+        r"\bconfirmed\b",
+        r"\bpresent\b",
+        r"\bpositive\b",
+        r"\bconsistent\s+(with|for)\b",
+        r"\bsupport(s|ed|ive)?\b",
+        r"\bfavou?rs?\b",
+        r"\bdiagnosis\b.*\b(made|confirmed|present)\b",
+        r"\b(iraki|immune[- ]related)[^\.]*\b(likely|probable|present|suspected)\b",
+        r"^\s*yes\b",
+        r"^\s*true\b",
+    ]
+    neg_patterns = [
+        r"\b(un|im)likely\b",  # unlikely, unlikelyhood, impossible won't match but okay
+        r"\bimprobable\b",
+        r"\babsent\b",
+        r"\bnegative\b",
+        r"\bruled?\s*out\b",
+        r"\b(excluded|exclude)\b",
+        r"\bnot\s+(present|evident|supported|supportive|consistent)\b",
+        r"\bdoes\s+not\s+(support|fit|favor|favour)\b",
+        r"^\s*no\b",
+        r"^\s*false\b",
+    ]
+
+    for pat in pos_patterns:
+        if re.search(pat, t):
+            return True
+    for pat in neg_patterns:
+        if re.search(pat, t):
+            return False
+
+    # Fallback: weakly positive phrases — schema demands a boolean.
+    if re.search(r"\b(possible|suspected|suspicion)\b", t):
+        return True
+
+    return None
+
+
 def _coerce_for_model_like_r1_r3(data: Dict[str, Any]) -> Dict[str, Any]:
     """
     Coerce loose LLM outputs into types that match our R1/R3 schemas.
 
     - p_iraki / confidence / confidence_in_verdict → floats
     - ci_iraki → [float, float]
-    - verdict → bool (accepts truthy/falsey words/phrases like "likely ...")
+    - verdict → bool (handles "probable", "likely", etc.)
     - recommendations → list[str] (from semicolon/line separated string)
-    - changes_from_round1 → dict (wrap string as {"summary": ...} or list[str] as {"items": [...]})
+    - changes_from_round1 → dict (wrap string/list as {"summary": ...} / {"items": [...]})
     """
     d = dict(data) if isinstance(data, dict) else {}
 
@@ -298,45 +369,11 @@ def _coerce_for_model_like_r1_r3(data: Dict[str, Any]) -> Dict[str, Any]:
         if lo is not None and hi is not None:
             d["ci_iraki"] = [lo, hi]
 
-    # verdict often comes back as prose (e.g., "Likely immune-related...").
+    # verdict: coerce freeform → bool
     if "verdict" in d and not isinstance(d.get("verdict"), bool):
-        v = d.get("verdict")
-        norm_bool = None
-        if isinstance(v, (int, float)):
-            # treat nonzero as True
-            norm_bool = bool(int(round(float(v))))
-        elif isinstance(v, str):
-            t = v.strip().lower()
-            # token sets + substring "likely"
-            truey = {
-                "true",
-                "yes",
-                "y",
-                "present",
-                "positive",
-                "likely",
-                "supportive",
-                "consistent",
-                "compatible",
-            }
-            falsey = {
-                "false",
-                "no",
-                "n",
-                "absent",
-                "negative",
-                "unlikely",
-                "unsupportive",
-                "inconsistent",
-                "incompatible",
-            }
-            tokens = set(re.findall(r"[a-z]+", t))
-            if t in truey or (tokens & truey) or re.search(r"\blikely\b", t):
-                norm_bool = True
-            elif t in falsey or (tokens & falsey):
-                norm_bool = False
-        if norm_bool is not None:
-            d["verdict"] = norm_bool
+        vb = _coerce_bool_from_freeform(d.get("verdict"))
+        if vb is not None:
+            d["verdict"] = vb
 
     # recommendations: split a single string into a list of strings
     recs = d.get("recommendations")
@@ -347,11 +384,14 @@ def _coerce_for_model_like_r1_r3(data: Dict[str, Any]) -> Dict[str, Any]:
     # changes_from_round1 must be a dict; convert common non-dict forms.
     ch = d.get("changes_from_round1")
     if isinstance(ch, str):
-        d["changes_from_round1"] = {"summary": ch.strip()}
+        ch = ch.strip()
+        if ch:
+            d["changes_from_round1"] = {"summary": ch}
+        else:
+            d["changes_from_round1"] = {"summary": ""}
     elif isinstance(ch, list):
         items = [x for x in ch if isinstance(x, str) and x.strip()]
-        if items:
-            d["changes_from_round1"] = {"items": items}
+        d["changes_from_round1"] = {"items": items} if items else {"items": []}
 
     return d
 
