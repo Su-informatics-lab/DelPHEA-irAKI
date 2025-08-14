@@ -11,6 +11,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 
 class LLMBackend:
@@ -53,6 +55,18 @@ class LLMBackend:
         self._extra: Dict[str, Any] = kwargs
 
         self.session = requests.Session()
+        pool = int(os.getenv("HTTP_POOL", "64"))
+        retries = Retry(
+            total=2,
+            backoff_factor=0.1,
+            status_forcelist=[429, 502, 503, 504],
+            allowed_methods=frozenset(["POST"]),
+        )
+        adapter = HTTPAdapter(
+            pool_connections=pool, pool_maxsize=pool, max_retries=retries
+        )
+        self.session.mount("http://", adapter)
+        self.session.mount("https://", adapter)
 
         # capability advertisement for validators
         env_ctx = os.getenv("CTX_WINDOW")

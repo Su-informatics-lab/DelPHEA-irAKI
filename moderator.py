@@ -31,6 +31,8 @@ from __future__ import annotations
 import inspect
 import json
 import logging
+import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from statistics import median
 from typing import Any, Dict, List, Sequence, Tuple
@@ -40,7 +42,7 @@ from models import AssessmentR1, AssessmentR3, Consensus
 from router import DebatePlan, Router
 from schema import load_consensus_rules, load_qids
 from validators import (
-    ValidationError,  # NOTE: tests may monkeypatch this to a duck-typed error.
+    ValidationError,  # note: tests may monkeypatch this to a duck-typed error.
 )
 from validators import (
     log_debate_status,
@@ -95,6 +97,14 @@ class Moderator:
         self.max_total_turns_per_qid = max(1, int(max_total_turns_per_qid))
         self.quiet_turn_limit = max(1, int(quiet_turn_limit))
 
+        # worker pools (env-driven, read once)
+        self.assess_round_max_workers = max(
+            1, int(os.getenv("ASSESS_ROUND_MAX_WORKERS", "8"))
+        )
+        self.debate_qid_max_workers = max(
+            1, int(os.getenv("DEBATE_QID_MAX_WORKERS", "8"))
+        )
+
         # basic expert id sanity
         ids = [getattr(e, "expert_id", None) for e in self.experts]
         if any(i is None for i in ids):
@@ -114,28 +124,46 @@ class Moderator:
         case: Dict[str, Any],
         debate_ctx: Dict[str, Any] | None = None,
     ) -> List[Tuple[str, AssessmentR1 | AssessmentR3]]:
-        """fan-out round requests to all experts; return structured pydantic models."""
+        """fan-out round requests to all experts; return structured pydantic models.
+
+        parallelizes calls so the backend can micro-batch dynamically.
+        preserves output order to match self.experts.
+        """
         if round_no not in (1, 3):
             raise ValueError(f"unsupported round: {round_no}")
         self.logger.info(
             "assessing round %d for %d experts", round_no, len(self.experts)
         )
 
-        outputs: List[Tuple[str, AssessmentR1 | AssessmentR3]] = []
+        # round 1
         if round_no == 1:
-            for e in self.experts:
-                a1 = self._call_round1_with_repair(e, case)
-                self._validate_qids_exact(a1)
-                outputs.append((e.expert_id, a1))
-            return outputs
+            results: Dict[str, AssessmentR1] = {}
+            with ThreadPoolExecutor(max_workers=self.assess_round_max_workers) as ex:
+                futs = {
+                    ex.submit(self._call_round1_with_repair, e, case): e.expert_id
+                    for e in self.experts
+                }
+                for fut in as_completed(futs):
+                    eid = futs[fut]
+                    a1 = fut.result()
+                    self._validate_qids_exact(a1)
+                    results[eid] = a1
+            return [(e.expert_id, results[e.expert_id]) for e in self.experts]
 
         # round 3
         ctx = debate_ctx or {}
-        for e in self.experts:
-            a3 = self._call_round3_with_repair(e, case, ctx)
-            self._validate_qids_exact(a3)
-            outputs.append((e.expert_id, a3))
-        return outputs
+        results3: Dict[str, AssessmentR3] = {}
+        with ThreadPoolExecutor(max_workers=self.assess_round_max_workers) as ex:
+            futs = {
+                ex.submit(self._call_round3_with_repair, e, case, ctx): e.expert_id
+                for e in self.experts
+            }
+            for fut in as_completed(futs):
+                eid = futs[fut]
+                a3 = fut.result()
+                self._validate_qids_exact(a3)
+                results3[eid] = a3
+        return [(e.expert_id, results3[e.expert_id]) for e in self.experts]
 
     # --------- helpers: ids & logging ---------
 
@@ -171,7 +199,7 @@ class Moderator:
 
     @staticmethod
     def _agreement_fraction(scores: Dict[str, int]) -> Tuple[float, int]:
-        """compute fraction of experts within ±1 of the median (Delphi-style)."""
+        """compute fraction of experts within ±1 of the median (delphi-style)."""
         vals = [int(v) for v in scores.values() if isinstance(v, (int, float))]
         if not vals:
             return 0.0, 0
@@ -184,7 +212,11 @@ class Moderator:
     def detect_and_run_debates(
         self, r1: Sequence[Tuple[str, AssessmentR1]], case: Dict[str, Any]
     ) -> Dict[str, Any]:
-        """plan debates via router and run a small, handoff-aware turn loop per QID."""
+        """plan debates via router and run a small, handoff-aware turn loop per qid.
+
+        parallelizes across qids so the backend can dynamically batch turns from different qids.
+        each qid still runs the same serial loop as before.
+        """
         plan: DebatePlan = self.router.plan(r1, self.rules)
         solicitations = sum(len(v) for v in plan.by_qid.values())
         disagreement_present = solicitations > 0
@@ -232,22 +264,14 @@ class Moderator:
             len(plan.by_qid),
         )
 
-        # helpers
+        # helpers shared by all qids
         all_ids = [eid for eid, _ in r1]
         r1_by_id = {eid: a for eid, a in r1}
 
-        def _append_turn(qid: str, turn_dict: Dict[str, Any]) -> None:
-            transcripts.setdefault(qid, []).append(turn_dict)
-
-        def _peer_history(qid: str) -> List[Dict[str, Any]]:
-            hist = transcripts.get(qid, [])
-            if self.max_history_turns <= 0:
-                return []
-            return hist[-self.max_history_turns :]
-
-        for qid, minority_ids in plan.by_qid.items():
-            if not minority_ids:
-                continue
+        def _run_one_qid(
+            qid: str, minority_ids: List[str]
+        ) -> tuple[str, List[Dict[str, Any]], str]:
+            """run the original serial loop for a single qid and return its transcript + mv text."""
             majority_ids = [eid for eid in all_ids if eid not in minority_ids]
 
             # status before collecting turns
@@ -265,8 +289,8 @@ class Moderator:
                 },
             )
 
-            # build a compact minority view text from r1
-            mv_lines = []
+            # build compact minority view text from r1
+            mv_lines: List[str] = []
             for eid in minority_ids:
                 a = r1_by_id.get(eid)
                 if not a:
@@ -275,7 +299,6 @@ class Moderator:
                 score = a.scores.get(qid, None)
                 mv_lines.append(f"{eid}: score={score} evidence={ev}")
             mv = "\n".join(mv_lines) or "minority perspective not available"
-            minority_views[qid] = mv
 
             # queue: minority_open (all), majority_rebuttal (all), then minority_followup (first minority)
             opener = minority_ids[0]
@@ -286,11 +309,10 @@ class Moderator:
                 queue.append(("majority_rebuttal", eid))
             queue.append(("minority_followup", opener))  # will be bubbled forward later
 
-            # per-qid tracking
+            # per-qid tracking (local state)
             turns_by_expert: Dict[str, int] = {eid: 0 for eid in all_ids}
             satisfied: set[str] = set()
 
-            # maintain current scores for this qid (seeded from r1; updated on revised_score)
             current_scores: Dict[str, int] = {}
             for eid in all_ids:
                 try:
@@ -299,6 +321,13 @@ class Moderator:
                     s = None
                 if isinstance(s, int) and 1 <= s <= 9:
                     current_scores[eid] = s
+
+            local_transcript: List[Dict[str, Any]] = []
+
+            def _peer_history() -> List[Dict[str, Any]]:
+                if self.max_history_turns <= 0:
+                    return []
+                return local_transcript[-self.max_history_turns :]
 
             def _bubble_minority_followup(front_offset: int = 0) -> None:
                 """move the opener's follow-up near the front (after any new handoff)."""
@@ -313,10 +342,8 @@ class Moderator:
                 item = queue.pop(idx)
                 queue.insert(0 + max(0, front_offset), item)
 
-            # main loop
-            while (
-                queue and len(transcripts.get(qid, [])) < self.max_total_turns_per_qid
-            ):
+            # main serial loop for this qid
+            while queue and len(local_transcript) < self.max_total_turns_per_qid:
                 role, eid = queue.pop(0)
 
                 # skip if capped or already satisfied
@@ -328,7 +355,7 @@ class Moderator:
 
                 # build ctx and call expert
                 e = self._expert_by_id(eid)
-                ctx = {"case": case, "peer_turns": _peer_history(qid), "role": role}
+                ctx = {"case": case, "peer_turns": _peer_history(), "role": role}
                 turn = e.debate(
                     qid=qid, round_no=2, clinical_context=ctx, minority_view=mv
                 )
@@ -345,11 +372,11 @@ class Moderator:
                     {
                         "expert_id": eid,
                         "qid": qid,
-                        "turn_index": len(transcripts.get(qid, [])),
+                        "turn_index": len(local_transcript),
                         "speaker_role": speaker_role,
                     }
                 )
-                _append_turn(qid, td)
+                local_transcript.append(td)
 
                 # update counters / satisfaction
                 turns_by_expert[eid] = turns_by_expert.get(eid, 0) + 1
@@ -379,10 +406,11 @@ class Moderator:
                     )
                     if idx_in_queue is not None:
                         planned_role, _ = queue.pop(idx_in_queue)
-                        if role == "minority_open" and idx_in_queue == 0:
-                            new_role = planned_role
-                        else:
-                            new_role = "participant"
+                        new_role = (
+                            planned_role
+                            if (role == "minority_open" and idx_in_queue == 0)
+                            else "participant"
+                        )
                         queue.insert(0, (new_role, target))
                         inserted_handoff = not (
                             role == "minority_open" and idx_in_queue == 0
@@ -395,7 +423,7 @@ class Moderator:
                 if role in ("majority_rebuttal", "participant"):
                     _bubble_minority_followup(front_offset=1 if inserted_handoff else 0)
 
-                # early-stop guard: stop once agreement reaches the questionnaire threshold
+                # early-stop guard based on current_scores
                 agree_frac, med = self._agreement_fraction(current_scores)
                 min_agree = self._min_agreement()
                 if agree_frac >= min_agree:
@@ -410,7 +438,7 @@ class Moderator:
                             "agreement": round(agree_frac, 3),
                             "minimum_agreement": min_agree,
                             "median_score": med,
-                            "turns_so_far": len(transcripts.get(qid, [])),
+                            "turns_so_far": len(local_transcript),
                         },
                     )
                     break
@@ -422,6 +450,20 @@ class Moderator:
                     for eid_ in set(minority_ids + majority_ids)
                 ):
                     break
+
+            return qid, local_transcript, mv
+
+        # run all qids concurrently; gather results
+        futs = []
+        with ThreadPoolExecutor(max_workers=self.debate_qid_max_workers) as ex:
+            for qid, minority_ids in plan.by_qid.items():
+                if not minority_ids:
+                    continue
+                futs.append(ex.submit(_run_one_qid, qid, minority_ids))
+            for fut in as_completed(futs):
+                qid, q_trans, mv_text = fut.result()
+                transcripts[qid] = q_trans
+                minority_views[qid] = mv_text
 
         # structured status: summary "end"
         log_debate_status(
@@ -516,7 +558,7 @@ class Moderator:
             a1 = expert.assess_round1(case, self.qpath)
             vd = self._validation_payload_with_ids(a1, expert, case)
             try:
-                # FIX: validators.validate_round1_payload no longer accepts 'required_evidence'
+                # fix: validators.validate_round1_payload no longer accepts 'required_evidence'
                 validate_round1_payload(vd, expected_qids=self.qids)
                 if attempt > 0:
                     self.logger.info(
@@ -621,7 +663,7 @@ class Moderator:
         """compact, model-friendly hint listing what failed and how to fix.
         works with pydantic.ValidationError or any duck-typed object exposing .errors().
         """
-        # collect msg/loc from any error-like payload.
+        # collect msg/loc from any error-like payload
         msgs: List[str] = []
         try:
             items = list(getattr(ve, "errors")() or [])
@@ -632,7 +674,7 @@ class Moderator:
             msg = err.get("msg", "invalid value")
             msgs.append(f"{loc}: {msg}")
 
-        # friendly, round-specific prefix.
+        # friendly, round-specific prefix
         if round_no == 1:
             prefix = (
                 "please fix: provide ≥200-char clinical_reasoning; non-empty primary_diagnosis; "
@@ -644,7 +686,7 @@ class Moderator:
                 "non-empty final_diagnosis; at least 1 recommendation.\n"
             )
 
-        # if we detect the common 'importance must sum to 100' case, add a very explicit instruction.
+        # common 'importance must sum to 100' case
         extra = ""
         if any("importance must sum to 100" in m for m in msgs):
             extra = (
