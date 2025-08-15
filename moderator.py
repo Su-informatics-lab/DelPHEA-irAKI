@@ -312,6 +312,7 @@ class Moderator:
             # per-qid tracking (local state)
             turns_by_expert: Dict[str, int] = {eid: 0 for eid in all_ids}
             satisfied: set[str] = set()
+            minority_followup_done = False  # NEW: guarantee opener follow-up once
 
             current_scores: Dict[str, int] = {}
             for eid in all_ids:
@@ -347,10 +348,21 @@ class Moderator:
                 role, eid = queue.pop(0)
 
                 # skip if capped or already satisfied
+                capped = turns_by_expert.get(eid, 0) >= self.max_turns_per_expert
+                # NEW: do NOT skip the opener's guaranteed follow-up just because they were satisfied earlier
                 if (
-                    eid in satisfied
-                    or turns_by_expert.get(eid, 0) >= self.max_turns_per_expert
+                    role == "minority_followup"
+                    and eid == opener
+                    and not minority_followup_done
                 ):
+                    skip = capped  # allow even if 'satisfied'
+                else:
+                    skip = capped or (eid in satisfied)
+
+                if skip:
+                    # mark as done if we just consumed the guaranteed slot
+                    if role == "minority_followup" and eid == opener:
+                        minority_followup_done = True  # avoid infinite loop if skipped
                     continue
 
                 # build ctx and call expert
@@ -371,7 +383,7 @@ class Moderator:
                 td.update(
                     {
                         "expert_id": eid,
-                        "qid": qid,
+                        "qid": qid,  # reinforce correct labeling
                         "turn_index": len(local_transcript),
                         "speaker_role": speaker_role,
                     }
@@ -382,6 +394,8 @@ class Moderator:
                 turns_by_expert[eid] = turns_by_expert.get(eid, 0) + 1
                 if bool(td.get("satisfied", False)):
                     satisfied.add(eid)
+                if role == "minority_followup" and eid == opener:
+                    minority_followup_done = True  # NEW: mark fulfilled
 
                 # apply revised score (if provided) to current scores for agreement checks
                 rs = td.get("revised_score", None)
@@ -426,7 +440,12 @@ class Moderator:
                 # early-stop guard based on current_scores
                 agree_frac, med = self._agreement_fraction(current_scores)
                 min_agree = self._min_agreement()
-                if agree_frac >= min_agree:
+
+                # NEW: do not early-stop until the opener has had their guaranteed follow-up opportunity
+                followup_pending = (not minority_followup_done) and any(
+                    (r == "minority_followup" and e_ == opener) for r, e_ in queue
+                )
+                if (agree_frac >= min_agree) and (not followup_pending):
                     log_debate_status(
                         logger=self.logger,
                         case_id=cid,
@@ -439,6 +458,7 @@ class Moderator:
                             "minimum_agreement": min_agree,
                             "median_score": med,
                             "turns_so_far": len(local_transcript),
+                            "minority_followup_done": minority_followup_done,
                         },
                     )
                     break
