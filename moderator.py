@@ -367,7 +367,23 @@ class Moderator:
 
                 # build ctx and call expert
                 e = self._expert_by_id(eid)
-                ctx = {"case": case, "peer_turns": _peer_history(), "role": role}
+                # steer HANDOFF + REVISED_SCORE usage via explicit context
+                eligible_handoff = [
+                    x
+                    for x in all_ids
+                    if x != eid
+                    and x not in satisfied
+                    and turns_by_expert.get(x, 0) < self.max_turns_per_expert
+                ]
+                ctx = {
+                    "case": case,
+                    "peer_turns": _peer_history(),
+                    "role": role,
+                    "eligible_handoff": eligible_handoff,
+                    "current_score": current_scores.get(
+                        eid, None
+                    ),  # speaker’s latest score for this QID)
+                }
                 turn = e.debate(
                     qid=qid, round_no=2, clinical_context=ctx, minority_view=mv
                 )

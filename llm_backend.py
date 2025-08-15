@@ -297,6 +297,34 @@ class LLMBackend:
         except Exception:
             pass
 
+        # NEW: eligible handoff targets + current score hint (to encourage usage)
+        eligible: List[str] = []
+        current_score_hint = ""
+        try:
+            if isinstance(clinical_context, dict):
+                eligible = [
+                    str(x)
+                    for x in (clinical_context.get("eligible_handoff") or [])
+                    if x
+                ]
+                cur = clinical_context.get("current_score", None)
+                if isinstance(cur, int):
+                    current_score_hint = f"Your current score on {qid}: {cur}."
+        except Exception:
+            pass
+
+        handoff_hint = (
+            f"Eligible HANDOFF targets (not satisfied, under turn cap): {', '.join(eligible)}.\n"
+            "Set HANDOFF to one of these expert_id values or 'none'. Do not invent IDs."
+            if eligible
+            else "No eligible HANDOFF targets now; set HANDOFF to 'none'."
+        )
+        rev_hint = (
+            f"{current_score_hint} If your view changed after the discussion so far, set REVISED_SCORE to a number 1–9; otherwise write 'same'."
+            if current_score_hint
+            else "If your view changed after the discussion so far, set REVISED_SCORE to a number 1–9; otherwise write 'same'."
+        )
+
         header = f"Debate turn for question {qid} (round {round_no})."
         role = f"Role: {expert_id} ({specialty})."
         stage = f"Turn type: {role_hint or 'participant'}."
@@ -317,6 +345,8 @@ class LLMBackend:
             "- If majority: directly rebut the minority’s strongest claims with specific evidence.\n"
             "- If minority (closing/followup): address rebuttals succinctly and clarify residual uncertainty.\n"
             "Avoid repetition. No lists, no markdown, no JSON. Return PLAIN TEXT only.\n\n"
+            f"{handoff_hint}\n"
+            f"{rev_hint}\n\n"
             "At the VERY END, append EXACTLY these 3 control lines (no extra words):\n"
             "SATISFIED: yes|no\n"
             "REVISED_SCORE: 1-9|same\n"
@@ -382,8 +412,16 @@ class LLMBackend:
                 if isinstance(rs, int) and 1 <= rs <= 9:
                     revised_score = rs
                 ht = obj.get("handoff_to", None)
-                if isinstance(ht, str) and ht.strip().lower() not in {"", "none"}:
-                    handoff_to = ht.strip()
+                if isinstance(ht, str):
+                    val = ht.strip()
+                    vlow = val.lower()
+                    # treat 'none', 'none|none', '', 'null', '-' as no handoff
+                    if ("none" in vlow) or (vlow in {"", "null", "-"}):
+                        handoff_to = None
+                    else:
+                        if "|" in val:
+                            val = val.split("|", 1)[0].strip()
+                        handoff_to = val if val else None
             except Exception:
                 # leave as original s
                 pass
@@ -394,26 +432,32 @@ class LLMBackend:
         for ln in lines:
             low = ln.strip().lower()
             if low.startswith("satisfied:"):
+                # use the original line to avoid case issues; value itself is normalized
                 val = low.split(":", 1)[1].strip()
                 if val in {"yes", "no"}:
                     satisfied = val == "yes"
                 continue
             if low.startswith("revised_score:"):
-                val = low.split(":", 1)[1].strip()
-                if val != "same":
+                # keep minimal parsing; allow 'same' or integer
+                raw_val = ln.split(":", 1)[1].strip()  # preserve original case/format
+                if raw_val.lower() != "same":
                     try:
-                        num = int(val)
+                        num = int(raw_val)
                         if 1 <= num <= 9:
                             revised_score = num
                     except Exception:
                         pass
                 continue
             if low.startswith("handoff:"):
-                val = low.split(":", 1)[1].strip()
-                if val and val.lower() not in {"none", "null", "-"}:
-                    handoff_to = val
-                else:
+                # robustly parse, preserving expert_id case; normalize weird forms
+                raw_val = ln.split(":", 1)[1].strip()
+                vlow = raw_val.lower()
+                if ("none" in vlow) or (vlow in {"", "null", "-"}):
                     handoff_to = None
+                else:
+                    if "|" in raw_val:
+                        raw_val = raw_val.split("|", 1)[0].strip()
+                    handoff_to = raw_val if raw_val else None
                 continue
             body.append(ln)
 
@@ -436,5 +480,6 @@ class LLMBackend:
         if handoff_to:
             result["handoff_to"] = handoff_to
 
+        # dump the normalized turn for debugging/auditing
         self._dump_json(dump_base, f"{subdir}/turn.json", result)
         return result
