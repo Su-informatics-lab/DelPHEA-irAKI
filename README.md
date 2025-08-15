@@ -260,6 +260,10 @@ python build_cohort_from_mentions.py \
 
 ```
 
+```bash
+bash run_delphea_batch.sh -f out/cohort_case_ids.txt
+```
+
 ---
 
 ## Developer notes
