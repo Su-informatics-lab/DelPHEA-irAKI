@@ -356,7 +356,9 @@ class LLMBackend:
                 prompt,
                 max_tokens=512,
                 temperature=temperature,
-                system="You are a clinical expert generating short, plain-text debate arguments. No markdown, no JSON.",
+                system=f"You are {expert_id}, a {specialty} expert. "
+                f"Generate short, plain-text debate arguments strictly from a {specialty} perspective. "
+                f"No markdown, no JSON.",
                 prefer_json=False,
             )
         except Exception:
