@@ -10,9 +10,10 @@ one-shot repair per expert, and returns a serializable run report.
 multi-turn debate (this version)
 --------------------------------
 For each QID with disagreement:
-  1) Minority opening (all experts selected by router for that QID)
-  2) Majority rebuttals (all other experts speak once)
-  3) Handoff-aware loop:
+  1) Moderator pre-brief (neutral stats: median/IQR, majority/minority, opener)
+  2) Minority opening (all experts selected by router for that QID)
+  3) Majority rebuttals (all other experts speak once)
+  4) Handoff-aware loop:
        - speakers may append control lines: SATISFIED / REVISED_SCORE / HANDOFF
        - moderator prioritizes requested HANDOFF targets if eligible
        - experts exit when SATISFIED; loop ends when all satisfied, quiet, or capped
@@ -34,6 +35,7 @@ import logging
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from datetime import datetime, timezone  # new: timestamps
 from statistics import median
 from typing import Any, Dict, List, Sequence, Tuple
 
@@ -163,7 +165,7 @@ class Moderator:
                 a3 = fut.result()
                 self._validate_qids_exact(a3)
                 results3[eid] = a3
-        return [(e.expert_id, results3[e.expert_id]) for e in self.experts]
+        return [(e.expert_id, results3[eid]) for e in self.experts]
 
     # --------- helpers: ids & logging ---------
 
@@ -206,6 +208,50 @@ class Moderator:
         med = int(round(median(vals)))
         agree = sum(1 for v in vals if abs(int(v) - med) <= 1) / len(vals)
         return agree, med
+
+    # --------- new: r1→r2 pre-brief summarizer ---------
+
+    def _prebrief_for_qid(
+        self, qid: str, r1_by_id: Dict[str, AssessmentR1]
+    ) -> Dict[str, Any]:
+        """compute a neutral, deterministic pre-brief for a qid.
+
+        returns:
+            dict with median_r1, iqr_r1, majority_ids, minority_ids, openers, n_experts.
+        """
+        scores: Dict[str, int] = {}
+        for eid, a in r1_by_id.items():
+            try:
+                s = int(a.scores[qid])
+                if 1 <= s <= 9:
+                    scores[eid] = s
+            except Exception:
+                continue
+        if not scores:
+            raise ValueError(f"no r1 scores for {qid}")
+
+        vals = sorted(scores.values())
+        n = len(vals)
+        med = vals[n // 2] if n % 2 else round((vals[n // 2 - 1] + vals[n // 2]) / 2)
+        # simple iqr approximation without numpy (yagni)
+        q1 = vals[max(0, n // 4)]
+        q3 = vals[min(n - 1, (3 * n) // 4)]
+        iqr = int(q3 - q1)
+
+        diffs = {eid: abs(v - med) for eid, v in scores.items()}
+        maxdiff = max(diffs.values())
+        minority_ids = sorted([eid for eid, d in diffs.items() if d == maxdiff])
+        majority_ids = sorted([eid for eid, v in scores.items() if abs(v - med) <= 1])
+
+        return {
+            "qid": qid,
+            "n_experts": n,
+            "median_r1": int(med),
+            "iqr_r1": int(iqr),
+            "minority_ids": minority_ids,
+            "majority_ids": majority_ids,
+            "openers": minority_ids[:1],
+        }
 
     # --------- debate orchestration ---------
 
@@ -271,7 +317,7 @@ class Moderator:
         def _run_one_qid(
             qid: str, minority_ids: List[str]
         ) -> tuple[str, List[Dict[str, Any]], str]:
-            """run the original serial loop for a single qid and return its transcript + mv text."""
+            """run the serial loop for a single qid and return its transcript + minority view text."""
             majority_ids = [eid for eid in all_ids if eid not in minority_ids]
 
             # status before collecting turns
@@ -285,11 +331,26 @@ class Moderator:
                 meta={
                     "asked_experts": minority_ids,
                     "majority_candidates": majority_ids,
-                    "pattern": "minority→majority(+handoff)→minority_followup",
+                    "pattern": "prebrief→minority→majority(+handoff)→minority_followup",
                 },
             )
 
-            # build compact minority view text from r1
+            # r2 pre-brief from r1 stats (deterministic, neutral)
+            pre = self._prebrief_for_qid(qid, r1_by_id)
+            opener = (
+                minority_ids[0]
+                if minority_ids
+                else (pre["openers"][0] if pre["openers"] else all_ids[0])
+            )
+            prelude = (
+                f"moderator pre-brief for {qid}:\n"
+                f"- experts: {pre['n_experts']}, r1 median={pre['median_r1']}, iqr={pre['iqr_r1']}\n"
+                f"- majority (±1 of median): {', '.join(pre['majority_ids']) or 'none'}\n"
+                f"- minority (farthest from median): {', '.join(pre['minority_ids']) or 'none'}\n"
+                f"- opener: {opener}"
+            )
+
+            # build compact minority view text from r1 (kept for continuity with existing prompts)
             mv_lines: List[str] = []
             for eid in minority_ids:
                 a = r1_by_id.get(eid)
@@ -300,19 +361,18 @@ class Moderator:
                 mv_lines.append(f"{eid}: score={score} evidence={ev}")
             mv = "\n".join(mv_lines) or "minority perspective not available"
 
-            # queue: minority_open (all), majority_rebuttal (all), then minority_followup (first minority)
-            opener = minority_ids[0]
+            # initial queue: minority_open (all), majority_rebuttal (all), then opener guaranteed follow-up
             queue: List[Tuple[str, str]] = []
             for eid in minority_ids:
                 queue.append(("minority_open", eid))
             for eid in majority_ids:
                 queue.append(("majority_rebuttal", eid))
-            queue.append(("minority_followup", opener))  # will be bubbled forward later
+            queue.append(("minority_followup", opener))  # guaranteed slot
 
             # per-qid tracking (local state)
             turns_by_expert: Dict[str, int] = {eid: 0 for eid in all_ids}
             satisfied: set[str] = set()
-            minority_followup_done = False  # NEW: guarantee opener follow-up once
+            minority_followup_done = False  # guarantee opener follow-up once
 
             current_scores: Dict[str, int] = {}
             for eid in all_ids:
@@ -324,6 +384,23 @@ class Moderator:
                     current_scores[eid] = s
 
             local_transcript: List[Dict[str, Any]] = []
+
+            # record the moderator pre-brief as a synthetic first row (turn_index = -1)
+            ts_now = datetime.now(timezone.utc).isoformat()
+            local_transcript.append(
+                {
+                    "expert_id": "moderator",
+                    "qid": qid,
+                    "round_no": 2,
+                    "text": prelude,
+                    "satisfied": True,
+                    "revised_score": None,
+                    "handoff_to": None,
+                    "turn_index": -1,
+                    "speaker_role": "moderator",
+                    "ts": ts_now,
+                }
+            )
 
             def _peer_history() -> List[Dict[str, Any]]:
                 if self.max_history_turns <= 0:
@@ -349,25 +426,23 @@ class Moderator:
 
                 # skip if capped or already satisfied
                 capped = turns_by_expert.get(eid, 0) >= self.max_turns_per_expert
-                # NEW: do NOT skip the opener's guaranteed follow-up just because they were satisfied earlier
+                # do not skip the opener's guaranteed follow-up just because they were satisfied earlier
                 if (
                     role == "minority_followup"
                     and eid == opener
                     and not minority_followup_done
                 ):
-                    skip = capped  # allow even if 'satisfied'
+                    skip = capped
                 else:
                     skip = capped or (eid in satisfied)
 
                 if skip:
-                    # mark as done if we just consumed the guaranteed slot
                     if role == "minority_followup" and eid == opener:
-                        minority_followup_done = True  # avoid infinite loop if skipped
+                        minority_followup_done = True
                     continue
 
                 # build ctx and call expert
                 e = self._expert_by_id(eid)
-                # steer HANDOFF + REVISED_SCORE usage via explicit context
                 eligible_handoff = [
                     x
                     for x in all_ids
@@ -380,9 +455,8 @@ class Moderator:
                     "peer_turns": _peer_history(),
                     "role": role,
                     "eligible_handoff": eligible_handoff,
-                    "current_score": current_scores.get(
-                        eid, None
-                    ),  # speaker’s latest score for this QID)
+                    "current_score": current_scores.get(eid, None),
+                    "moderator_prebrief": prelude,  # new: pass to backend prompt
                 }
                 turn = e.debate(
                     qid=qid, round_no=2, clinical_context=ctx, minority_view=mv
@@ -396,14 +470,23 @@ class Moderator:
                     if role.startswith("majority")
                     else "participant"
                 )
+
+                # stamp required ids, add ts, and autopatch any stray qid from backend
                 td.update(
                     {
                         "expert_id": eid,
-                        "qid": qid,  # reinforce correct labeling
+                        "qid": qid,
                         "turn_index": len(local_transcript),
                         "speaker_role": speaker_role,
+                        "ts": datetime.now(timezone.utc).isoformat(),  # new timestamp
                     }
                 )
+                if td.get("qid") != qid:
+                    td["qid"] = qid
+                    meta = td.get("meta") or {}
+                    meta["qid_autopatched"] = True
+                    td["meta"] = meta
+
                 local_transcript.append(td)
 
                 # update counters / satisfaction
@@ -411,9 +494,9 @@ class Moderator:
                 if bool(td.get("satisfied", False)):
                     satisfied.add(eid)
                 if role == "minority_followup" and eid == opener:
-                    minority_followup_done = True  # NEW: mark fulfilled
+                    minority_followup_done = True
 
-                # apply revised score (if provided) to current scores for agreement checks
+                # apply revised score to current scores for agreement checks
                 rs = td.get("revised_score", None)
                 if isinstance(rs, int) and 1 <= rs <= 9:
                     current_scores[eid] = rs
@@ -457,7 +540,6 @@ class Moderator:
                 agree_frac, med = self._agreement_fraction(current_scores)
                 min_agree = self._min_agreement()
 
-                # NEW: do not early-stop until the opener has had their guaranteed follow-up opportunity
                 followup_pending = (not minority_followup_done) and any(
                     (r == "minority_followup" and e_ == opener) for r, e_ in queue
                 )
@@ -594,7 +676,6 @@ class Moderator:
             a1 = expert.assess_round1(case, self.qpath)
             vd = self._validation_payload_with_ids(a1, expert, case)
             try:
-                # fix: validators.validate_round1_payload no longer accepts 'required_evidence'
                 validate_round1_payload(vd, expected_qids=self.qids)
                 if attempt > 0:
                     self.logger.info(
