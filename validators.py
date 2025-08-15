@@ -439,12 +439,14 @@ def _coerce_bool_from_freeform(v: Any) -> Optional[bool]:
 def _coerce_for_model_like_r1_r3(data: Dict[str, Any]) -> Dict[str, Any]:
     d = dict(data)
 
+    # numeric coercions commonly emitted as strings
     for key in ("p_iraki", "confidence", "confidence_in_verdict"):
         if key in d and not isinstance(d[key], (int, float)):
             f = _to_float(d[key])
             if f is not None:
                 d[key] = f
 
+    # ci_iraki as [lo, hi] floats
     if (
         "ci_iraki" in d
         and isinstance(d["ci_iraki"], (list, tuple))
@@ -461,16 +463,56 @@ def _coerce_for_model_like_r1_r3(data: Dict[str, Any]) -> Dict[str, Any]:
         if parsed is not None:
             d["verdict"] = parsed
 
+    # recommendations: accept string → list[str]
     recs = d.get("recommendations")
     if isinstance(recs, str):
         items = _split_lines_semicolons(recs)
         d["recommendations"] = items if items else ([])
 
-    # Allow dict or string for changes_from_round1; coerce string→dict
+    # changes_from_round1: robustly coerce to a dict
     ch = d.get("changes_from_round1")
-    if isinstance(ch, str):
+    if isinstance(ch, dict):
+        # keep as-is
+        pass
+    elif isinstance(ch, str):
         d["changes_from_round1"] = {"summary": ch}
-    elif ch is None:
+    elif isinstance(ch, (list, tuple)):
+        # list of strings -> join; list of dicts -> merge; otherwise -> stringify
+        try:
+            if all(isinstance(x, str) for x in ch):
+                joined = "; ".join(
+                    x.strip() for x in ch if isinstance(x, str) and x.strip()
+                )
+                d["changes_from_round1"] = {"summary": joined}
+            elif all(isinstance(x, dict) for x in ch):
+                merged: Dict[str, Any] = {}
+                for item in ch:  # type: ignore[assignment]
+                    for k, v in item.items():
+                        if (
+                            k in merged
+                            and isinstance(merged[k], str)
+                            and isinstance(v, str)
+                        ):
+                            merged[k] = f"{merged[k]}; {v}"
+                        else:
+                            merged[k] = v
+                # stringify any non-string leaf values for safety
+                for k, v in list(merged.items()):
+                    if not isinstance(v, str):
+                        merged[k] = json.dumps(v, ensure_ascii=False)
+                if "summary" not in merged:
+                    merged["summary"] = "; ".join(
+                        f"{k}: {merged[k]}" for k in merged.keys()
+                    )
+                d["changes_from_round1"] = merged
+            else:
+                d["changes_from_round1"] = {
+                    "summary": json.dumps(ch, ensure_ascii=False)
+                }
+        except Exception:
+            d["changes_from_round1"] = {"summary": ""}
+    else:
+        # None or unexpected -> minimal dict
         d["changes_from_round1"] = {"summary": ""}
 
     return d

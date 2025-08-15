@@ -897,7 +897,47 @@ class Moderator:
                 getattr(self, "current_expert_id", None) or "unknown_expert"
             )
 
-        ch = dict(patched.get("changes_from_round1") or {})
+        # robustly coerce changes_from_round1 into a dict
+        raw_ch = patched.get("changes_from_round1")
+        ch: Dict[str, Any]
+        if isinstance(raw_ch, dict):
+            ch = dict(raw_ch)
+        elif isinstance(raw_ch, str):
+            ch = {"summary": raw_ch}
+        elif isinstance(raw_ch, (list, tuple)):
+            try:
+                if all(isinstance(x, str) for x in raw_ch):
+                    joined = "; ".join(
+                        x.strip() for x in raw_ch if isinstance(x, str) and x.strip()
+                    )
+                    ch = {"summary": joined}
+                elif all(isinstance(x, dict) for x in raw_ch):
+                    merged: Dict[str, Any] = {}
+                    for item in raw_ch:  # type: ignore[assignment]
+                        for k, v in item.items():
+                            if (
+                                k in merged
+                                and isinstance(merged[k], str)
+                                and isinstance(v, str)
+                            ):
+                                merged[k] = f"{merged[k]}; {v}"
+                            else:
+                                merged[k] = v
+                    for k, v in list(merged.items()):
+                        if not isinstance(v, str):
+                            merged[k] = json.dumps(v, ensure_ascii=False)
+                    if "summary" not in merged:
+                        merged["summary"] = "; ".join(
+                            f"{k}: {merged[k]}" for k in merged.keys()
+                        )
+                    ch = merged
+                else:
+                    ch = {"summary": json.dumps(raw_ch, ensure_ascii=False)}
+            except Exception:
+                ch = {"summary": ""}
+        else:
+            ch = {}
+
         if (
             not isinstance(ch.get("summary", ""), str)
             or not ch.get("summary", "").strip()
